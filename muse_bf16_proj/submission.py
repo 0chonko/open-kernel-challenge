@@ -1,9 +1,9 @@
 # okc: problem=muse_bf16_proj
-"""Impl K: FP32 router split across the SMs, SM90 WGMMA for m=256, no-split nvjet on thin-m.
+"""l-m8-gate: keep the m<=8 FP32 router, drop the paths that sank the geomean.
 
-Router is a direct FP32 GEMM. 256 CTAs (4 K-splits x 64 N-blocks), x in smem, W via ld.cs,
-one FP32 reduce. m=256 qkv/pooler/unpooler use wgmma.m64n128k16; qkv's 72 tiles take a
-2-way K split (144 CTAs). Thin qkv/pooler m in {16,32} keep SPLITK_NUM<=1 nvjet.
+Custom router only for m<=8 (verify-1 2.9x). m>8 is the baseline hi/lo nvjet pair.
+No cublasLt SPLITK_NUM<=1 dispatch (pooler 32x64 tile was 0.63x). qkv m=1 GEMV unroll
+is 2 again. Unpooler m=1 N=1024 split-K stays. No WGMMA in this file.
 """
 
 from __future__ import annotations
@@ -20,14 +20,6 @@ ROUTER_FP32_MAX_TOKENS = 8
 # Same gates as sglang.kernels.ops.gemm.hopper_bf16_gemv
 _MAX_K = 17408
 _MAX_N = 65536
-
-# G profiles: nvjet + splitKreduce on these thin-m shapes (unpooler/o often have no reduce).
-_NOSPLIT_MS = {
-    "qkv_gate": (16, 32),
-    "pooler": (16, 32),
-}
-_WGMMA_M256 = frozenset({"qkv_gate", "pooler", "unpooler"})
-_H200_SMS = 132
 
 
 class Weights(TypedDict):
@@ -249,7 +241,7 @@ void hopper_bf16_gemv(torch::Tensor x, torch::Tensor w, torch::Tensor out, bool 
     return;                                                                   \
   } while (0)
 
-  if (N == 2304 && K == 8192) DISPATCH(2304, 8192, 1, 2, 8);
+  if (N == 2304 && K == 8192) DISPATCH(2304, 8192, 1, 2, 8);  // l-m8-gate: unroll 2 (unroll 4 was 0.91x)
   if (N == 8192 && K == 1024) DISPATCH(8192, 1024, 2, 2, 8);
   if (N == 4096 && K == 8192) DISPATCH(4096, 8192, 1, 2, 8);
   if (N == 1024 && K == 4096) DISPATCH(1024, 4096, 1, 2, 8);
@@ -257,275 +249,6 @@ void hopper_bf16_gemv(torch::Tensor x, torch::Tensor w, torch::Tensor out, bool 
 
   TORCH_CHECK(false, "hopper_bf16_gemv: unsupported Muse shape N=", N, " K=", K);
 #undef DISPATCH
-}
-
-// {{FP32 router, K-split across the SMs}}{{256 CTAs stream W once; register acc; one small FP32 reduce.}}
-__device__ __forceinline__ float dot8_bf16_f32(float4 w0, float4 w1, float4 xv) {
-  const bf16x2_t* x2 = reinterpret_cast<const bf16x2_t*>(&xv);
-  float acc = 0.f;
-  float2 a = __bfloat1622float2(x2[0]);
-  acc = fmaf(w0.x, a.x, acc);
-  acc = fmaf(w0.y, a.y, acc);
-  a = __bfloat1622float2(x2[1]);
-  acc = fmaf(w0.z, a.x, acc);
-  acc = fmaf(w0.w, a.y, acc);
-  a = __bfloat1622float2(x2[2]);
-  acc = fmaf(w1.x, a.x, acc);
-  acc = fmaf(w1.y, a.y, acc);
-  a = __bfloat1622float2(x2[3]);
-  acc = fmaf(w1.z, a.x, acc);
-  acc = fmaf(w1.w, a.y, acc);
-  return acc;
-}
-
-// N=256, K=8192. Grid (4, 64): K-chunk 2048, 4 rows/block. 256 CTAs on 132 SMs.
-__global__ void __launch_bounds__(128)
-router_fp32_splitk(float* __restrict__ partial, const bf16_t* __restrict__ x,
-                   const float* __restrict__ w, int M) {
-  constexpr int K = 8192;
-  constexpr int N = 256;
-  constexpr int Chunk = 2048;
-  constexpr int Unroll = 4;
-  constexpr int Vec = 8;
-  __shared__ __align__(16) bf16_t sx[Chunk];
-
-  const int tid = threadIdx.x;
-  const int lane = tid & 31;
-  const int warp = tid >> 5;
-  const int split = static_cast<int>(blockIdx.x);
-  const int n0 = static_cast<int>(blockIdx.y) * 4 + warp;
-  const int k0 = split * Chunk;
-  const float* wrow = w + (static_cast<size_t>(n0) * K + k0);
-
-  for (int mi = 0; mi < M; ++mi) {
-    const bf16_t* xrow = x + (static_cast<size_t>(mi) * K + k0);
-    for (int i = tid * Vec; i < Chunk; i += 128 * Vec) {
-      *reinterpret_cast<float4*>(sx + i) = *reinterpret_cast<const float4*>(xrow + i);
-    }
-    __syncthreads();
-    if (n0 < N) {
-      float acc = 0.f;
-      constexpr int step = 32 * Vec * Unroll;
-#pragma unroll
-      for (int k = lane * Vec * Unroll; k < Chunk; k += step) {
-        float4 xv[Unroll], a0[Unroll], a1[Unroll];
-#pragma unroll
-        for (int u = 0; u < Unroll; ++u) {
-          const int kk = k + u * Vec;
-          xv[u] = *reinterpret_cast<const float4*>(sx + kk);
-          a0[u] = __ldcs(reinterpret_cast<const float4*>(wrow + kk));
-          a1[u] = __ldcs(reinterpret_cast<const float4*>(wrow + kk + 4));
-        }
-#pragma unroll
-        for (int u = 0; u < Unroll; ++u) {
-          acc += dot8_bf16_f32(a0[u], a1[u], xv[u]);
-        }
-      }
-#pragma unroll
-      for (int off = 16; off > 0; off >>= 1) {
-        acc += __shfl_down_sync(0xffffffff, acc, off);
-      }
-      if (lane == 0) {
-        partial[(static_cast<size_t>(split) * M + mi) * N + n0] = acc;
-      }
-    }
-    __syncthreads();
-  }
-}
-
-__global__ void router_fp32_reduce(float* __restrict__ out, const float* __restrict__ partial, int M) {
-  constexpr int N = 256;
-  constexpr int Splits = 4;
-  const int total = M * N;
-  for (int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); i < total;
-       i += static_cast<int>(blockDim.x * gridDim.x)) {
-    const int m = i / N;
-    const int n = i - m * N;
-    float a = 0.f;
-#pragma unroll
-    for (int s = 0; s < Splits; ++s) {
-      a += partial[(static_cast<size_t>(s) * M + m) * N + n];
-    }
-    out[i] = a;
-  }
-}
-
-void router_fp32(torch::Tensor x, torch::Tensor w, torch::Tensor out, torch::Tensor partial) {
-  TORCH_CHECK(x.is_cuda() && w.is_cuda() && out.is_cuda() && partial.is_cuda());
-  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && w.scalar_type() == at::kFloat);
-  TORCH_CHECK(out.scalar_type() == at::kFloat && partial.scalar_type() == at::kFloat);
-  const int M = static_cast<int>(x.size(0));
-  const int K = static_cast<int>(x.size(1));
-  const int N = static_cast<int>(w.size(0));
-  TORCH_CHECK(K == 8192 && N == 256 && w.size(1) == K);
-  TORCH_CHECK(out.size(0) == M && out.size(1) == N);
-  TORCH_CHECK(partial.numel() >= static_cast<int64_t>(4) * M * N);
-  TORCH_CHECK(x.is_contiguous() && w.is_contiguous() && out.is_contiguous() && partial.is_contiguous());
-  auto stream = at::cuda::getCurrentCUDAStream();
-  router_fp32_splitk<<<dim3(4, N / 4), 128, 0, stream>>>(
-      partial.data_ptr<float>(), reinterpret_cast<const bf16_t*>(x.data_ptr()), w.data_ptr<float>(), M);
-  const int threads = 256;
-  const int total = M * N;
-  int blocks = (total + threads - 1) / threads;
-  if (blocks > 1024) blocks = 1024;
-  router_fp32_reduce<<<blocks, threads, 0, stream>>>(out.data_ptr<float>(), partial.data_ptr<float>(), M);
-}
-
-#define WGMMA_FMA(acc, da, db, scale_d) \
-  asm volatile( \
-    "{\n" \
-    ".reg .pred p;\n" \
-    "setp.ne.b32 p, %66, 0;\n" \
-    "wgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 " \
-    "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, %64, %65, p, 1, 1, 0, 0;\n" \
-    "}\n" \
-    : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3]), "+f"(acc[4]), "+f"(acc[5]), "+f"(acc[6]), "+f"(acc[7]), "+f"(acc[8]), "+f"(acc[9]), "+f"(acc[10]), "+f"(acc[11]), "+f"(acc[12]), "+f"(acc[13]), "+f"(acc[14]), "+f"(acc[15]), "+f"(acc[16]), "+f"(acc[17]), "+f"(acc[18]), "+f"(acc[19]), "+f"(acc[20]), "+f"(acc[21]), "+f"(acc[22]), "+f"(acc[23]), "+f"(acc[24]), "+f"(acc[25]), "+f"(acc[26]), "+f"(acc[27]), "+f"(acc[28]), "+f"(acc[29]), "+f"(acc[30]), "+f"(acc[31]), "+f"(acc[32]), "+f"(acc[33]), "+f"(acc[34]), "+f"(acc[35]), "+f"(acc[36]), "+f"(acc[37]), "+f"(acc[38]), "+f"(acc[39]), "+f"(acc[40]), "+f"(acc[41]), "+f"(acc[42]), "+f"(acc[43]), "+f"(acc[44]), "+f"(acc[45]), "+f"(acc[46]), "+f"(acc[47]), "+f"(acc[48]), "+f"(acc[49]), "+f"(acc[50]), "+f"(acc[51]), "+f"(acc[52]), "+f"(acc[53]), "+f"(acc[54]), "+f"(acc[55]), "+f"(acc[56]), "+f"(acc[57]), "+f"(acc[58]), "+f"(acc[59]), "+f"(acc[60]), "+f"(acc[61]), "+f"(acc[62]), "+f"(acc[63]) \
-    : "l"(da), "l"(db), "r"(scale_d));
-
-// {{SM90 WGMMA m64n128k16}}{{m=256 BF16. cp.async into K-major smem (no TMA: tensor-map addr is capture-baked). qkv uses 2-way K split.}}
-__device__ __forceinline__ void cp_async_16(void* smem, const void* gmem) {
-  unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(smem));
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(addr), "l"(gmem));
-}
-
-// K-major INTERLEAVE: groups of 8 K, each group is rows*8 packed (CuTe Layout_K_INTER_Atom).
-__device__ __forceinline__ void cp_tile(bf16_t* smem, const bf16_t* row0, int rows, int ld, int k0, int tid) {
-  constexpr int BK = 64;
-  constexpr int G = 8;
-  const int chunks = BK / G;
-  const int total = rows * chunks;
-  for (int i = tid; i < total; i += 128) {
-    const int r = i / chunks;
-    const int g = i - r * chunks;
-    cp_async_16(smem + (g * rows + r) * G, row0 + static_cast<size_t>(r) * ld + k0 + g * G);
-  }
-}
-
-// Field values are CuTe make_gmma_desc<Major::K> on that layout: leading=rows, stride=8, type=0.
-__device__ __forceinline__ uint64_t desc_kmajor(const bf16_t* smem, int rows) {
-  const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
-  uint64_t d = 0;
-  d |= static_cast<uint64_t>(addr >> 4) & 0x3fff;
-  d |= (static_cast<uint64_t>(rows) & 0x3fff) << 16;
-  d |= static_cast<uint64_t>(8) << 32;
-  return d;
-}
-
-__global__ void wgmma_split_reduce(bf16_t* __restrict__ c, const float* __restrict__ partial, int M, int N) {
-  const int total = M * N;
-  for (int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); i < total;
-       i += static_cast<int>(blockDim.x * gridDim.x)) {
-    c[i] = __float2bfloat16(partial[i] + partial[total + i]);
-  }
-}
-
-template <int kSplits>
-__global__ void __launch_bounds__(128)
-bf16_wgmma_64x128(bf16_t* __restrict__ c, const bf16_t* __restrict__ a, const bf16_t* __restrict__ b,
-                  float* __restrict__ partial, int M, int N, int K) {
-#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
-  constexpr int BM = 64;
-  constexpr int BN = 128;
-  constexpr int BK = 64;
-  __shared__ __align__(128) bf16_t As[BM * BK];
-  __shared__ __align__(128) bf16_t Bs[BN * BK];
-
-  const int tid = threadIdx.x;
-  const int split = static_cast<int>(blockIdx.z);
-  const int m0 = static_cast<int>(blockIdx.y) * BM;
-  const int n0 = static_cast<int>(blockIdx.x) * BN;
-  const int k_per = K / kSplits;
-  const int k_begin = split * k_per;
-  const int k_end = k_begin + k_per;
-
-  float acc[64];
-#pragma unroll
-  for (int i = 0; i < 64; ++i) acc[i] = 0.f;
-
-  int scale = 0;
-  for (int k0 = k_begin; k0 < k_end; k0 += BK) {
-    cp_tile(As, a + static_cast<size_t>(m0) * K, BM, K, k0, tid);
-    cp_tile(Bs, b + static_cast<size_t>(n0) * K, BN, K, k0, tid);
-    asm volatile("cp.async.commit_group;\n" ::);
-    asm volatile("cp.async.wait_group 0;\n" ::);
-    __syncthreads();
-    asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
-#pragma unroll
-    for (int kk = 0; kk < BK; kk += 16) {
-      const uint64_t da = desc_kmajor(As + kk * BM, BM);
-      const uint64_t db = desc_kmajor(Bs + kk * BN, BN);
-      WGMMA_FMA(acc, da, db, scale);
-      scale = 1;
-    }
-    asm volatile("wgmma.commit_group.sync.aligned;\n" ::);
-    asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(0) : "memory");
-#pragma unroll
-    for (int i = 0; i < 64; ++i) {
-      asm volatile("" : "+f"(acc[i])::"memory");
-    }
-    __syncthreads();
-  }
-
-  const int lane = tid & 31;
-  const int warp = tid >> 5;
-  const int group = lane >> 2;
-  const int inner = lane & 3;
-#pragma unroll
-  for (int i = 0; i < 64; ++i) {
-    const int quad = i >> 2;
-    const int sub = i & 3;
-    const int r = group + ((sub >> 1) << 3) + (warp << 4);
-    const int col = (quad << 3) + (sub & 1) + (inner << 1);
-    const float v = acc[i];
-    if constexpr (kSplits == 1) {
-      c[(static_cast<size_t>(m0 + r) * N) + n0 + col] = __float2bfloat16(v);
-    } else {
-      partial[(static_cast<size_t>(split) * M + (m0 + r)) * N + n0 + col] = v;
-    }
-  }
-#else
-  (void)c;
-  (void)a;
-  (void)b;
-  (void)partial;
-  (void)M;
-  (void)N;
-  (void)K;
-#endif
-}
-
-void bf16_wgmma_m256(torch::Tensor a, torch::Tensor b, torch::Tensor c, torch::Tensor partial, int64_t splits) {
-  TORCH_CHECK(a.is_cuda() && b.is_cuda() && c.is_cuda());
-  TORCH_CHECK(a.scalar_type() == at::kBFloat16 && b.scalar_type() == at::kBFloat16 && c.scalar_type() == at::kBFloat16);
-  TORCH_CHECK(a.is_contiguous() && b.is_contiguous() && c.is_contiguous());
-  const int M = static_cast<int>(a.size(0));
-  const int K = static_cast<int>(a.size(1));
-  const int N = static_cast<int>(b.size(0));
-  TORCH_CHECK(b.size(1) == K && c.size(0) == M && c.size(1) == N);
-  TORCH_CHECK(M % 64 == 0 && N % 128 == 0 && K % 64 == 0);
-  TORCH_CHECK(splits == 1 || splits == 2);
-  TORCH_CHECK(K % (static_cast<int>(splits) * 64) == 0);
-  float* pp = nullptr;
-  if (splits == 2) {
-    TORCH_CHECK(partial.is_cuda() && partial.scalar_type() == at::kFloat && partial.is_contiguous());
-    TORCH_CHECK(partial.numel() >= static_cast<int64_t>(2) * M * N);
-    pp = partial.data_ptr<float>();
-  }
-  auto* ap = reinterpret_cast<const bf16_t*>(a.data_ptr());
-  auto* bp = reinterpret_cast<const bf16_t*>(b.data_ptr());
-  auto* cp = reinterpret_cast<bf16_t*>(c.data_ptr());
-  auto stream = at::cuda::getCurrentCUDAStream();
-  const dim3 grid(N / 128, M / 64, static_cast<unsigned>(splits));
-  if (splits == 2) {
-    bf16_wgmma_64x128<2><<<grid, 128, 0, stream>>>(cp, ap, bp, pp, M, N, K);
-    const int threads = 256;
-    const int total = M * N;
-    int blocks = (total + threads - 1) / threads;
-    if (blocks > 2048) blocks = 2048;
-    wgmma_split_reduce<<<blocks, threads, 0, stream>>>(cp, pp, M, N);
-  } else {
-    bf16_wgmma_64x128<1><<<grid, 128, 0, stream>>>(cp, ap, bp, nullptr, M, N, K);
-  }
 }
 
 // {{cuBLASLt split-K filter}}{{Prefer SPLITK_NUM≤1 heuristics to drop splitKreduce while keeping nvjet mainloop.}}
@@ -629,14 +352,206 @@ void bf16_mm_run_nosplit(torch::Tensor A, torch::Tensor B, torch::Tensor C, torc
           g_lt, e.op, &alpha, A.data_ptr(), e.Ad, B.data_ptr(), e.Bd, &beta, C.data_ptr(), e.Cd, C.data_ptr(), e.Cd,
           &e.algo, ws, ws_bytes, stream) == CUBLAS_STATUS_SUCCESS);
 }
+
+// {{serving GEMV}}{{FP32 router: K-split grid (~512 CTAs), stage W tile, one FP32 reduce. N=256 cannot fill 132 SMs otherwise.}}
+constexpr int kRouterN = 256;
+constexpr int kRouterK = 8192;
+constexpr int kRouterSplits = 8;
+constexpr int kRouterWarps = 4;
+constexpr int kRouterKChunk = kRouterK / kRouterSplits;  // 1024
+
+template <int BM>
+__global__ void __launch_bounds__(kRouterWarps * 32)
+    router_fp32_splitk_kernel(float* __restrict__ partial, const bf16_t* __restrict__ x,
+                              const float* __restrict__ w, int M) {
+  constexpr int kVecIters = (kRouterKChunk / 4) / 32;  // 8
+  static_assert(kRouterKChunk / 8 == kRouterWarps * 32, "one x float4 per thread");
+  extern __shared__ __align__(16) char smem[];
+  float* sw = reinterpret_cast<float*>(smem);
+  bf16_t* sx = reinterpret_cast<bf16_t*>(sw + kRouterWarps * kRouterKChunk);
+
+  const int split = static_cast<int>(blockIdx.y);
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int row = static_cast<int>(blockIdx.x) * kRouterWarps + warp;
+  const int k0 = split * kRouterKChunk;
+
+  const float4* wrow4 = reinterpret_cast<const float4*>(w + (static_cast<size_t>(row) * kRouterK + k0));
+  float4* srow4 = reinterpret_cast<float4*>(sw + warp * kRouterKChunk);
+  float4 wreg[kVecIters];
+#pragma unroll
+  for (int s = 0; s < kVecIters; ++s) wreg[s] = __ldcs(wrow4 + lane + s * 32);
+#pragma unroll
+  for (int s = 0; s < kVecIters; ++s) srow4[lane + s * 32] = wreg[s];
+  __syncthreads();
+
+  for (int m0 = 0; m0 < M; m0 += BM) {
+#pragma unroll
+    for (int t = 0; t < BM; ++t) {
+      const bf16_t* src = x + (static_cast<size_t>(m0 + t) * kRouterK + k0);
+      bf16_t* dst = sx + t * kRouterKChunk;
+      *reinterpret_cast<float4*>(dst + tid * 8) = *reinterpret_cast<const float4*>(src + tid * 8);
+    }
+    __syncthreads();
+
+    float acc[BM];
+#pragma unroll
+    for (int t = 0; t < BM; ++t) acc[t] = 0.f;
+
+    const float* myw = sw + warp * kRouterKChunk;
+#pragma unroll 1
+    for (int s = 0; s < kVecIters; ++s) {
+      int v = lane + s * 32;
+      float4 wv = reinterpret_cast<const float4*>(myw)[v];
+      int kk = v * 4;
+#pragma unroll
+      for (int t = 0; t < BM; ++t) {
+        const bf16x2_t* xp = reinterpret_cast<const bf16x2_t*>(sx + t * kRouterKChunk + kk);
+        float2 a = __bfloat1622float2(xp[0]);
+        float2 b = __bfloat1622float2(xp[1]);
+        acc[t] = __fmaf_rn(wv.x, a.x, acc[t]);
+        acc[t] = __fmaf_rn(wv.y, a.y, acc[t]);
+        acc[t] = __fmaf_rn(wv.z, b.x, acc[t]);
+        acc[t] = __fmaf_rn(wv.w, b.y, acc[t]);
+      }
+    }
+#pragma unroll
+    for (int t = 0; t < BM; ++t) {
+      float a = acc[t];
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) a += __shfl_down_sync(0xffffffff, a, off);
+      if (lane == 0) {
+        partial[(static_cast<size_t>(split) * static_cast<size_t>(M) + static_cast<size_t>(m0 + t)) * kRouterN +
+                row] = a;
+      }
+    }
+    __syncthreads();
+  }
+}
+
+__global__ void router_fp32_reduce_kernel(float* __restrict__ out, const float* __restrict__ partial, int M, int splits) {
+  int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  int total = M * kRouterN;
+  if (idx >= total) return;
+  float s = 0.f;
+  for (int sp = 0; sp < splits; ++sp) s += partial[static_cast<size_t>(sp) * total + idx];
+  out[idx] = s;
+}
+
+template <int BM>
+void launch_router_fp32(float* partial, const bf16_t* x, const float* w, float* out, int M, cudaStream_t stream) {
+  int smem = kRouterWarps * kRouterKChunk * static_cast<int>(sizeof(float)) +
+             BM * kRouterKChunk * static_cast<int>(sizeof(bf16_t));
+  dim3 grid(kRouterN / kRouterWarps, kRouterSplits);
+  router_fp32_splitk_kernel<BM><<<grid, kRouterWarps * 32, smem, stream>>>(partial, x, w, M);
+  int total = M * kRouterN;
+  constexpr int threads = 256;
+  int blocks = (total + threads - 1) / threads;
+  router_fp32_reduce_kernel<<<blocks, threads, 0, stream>>>(out, partial, M, kRouterSplits);
+}
+
+void router_fp32_splitk(torch::Tensor x, torch::Tensor w, torch::Tensor partial, torch::Tensor out) {
+  TORCH_CHECK(x.is_cuda() && w.is_cuda() && partial.is_cuda() && out.is_cuda());
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && w.scalar_type() == at::kFloat && out.scalar_type() == at::kFloat);
+  const int M = static_cast<int>(x.size(0));
+  const int K = static_cast<int>(x.size(1));
+  const int N = static_cast<int>(w.size(0));
+  TORCH_CHECK(N == kRouterN && K == kRouterK && w.size(1) == K);
+  TORCH_CHECK(M >= 1 && M <= 8);  // l-m8-gate: scalar FP32 is the wrong machine past m=8
+  TORCH_CHECK(out.size(0) == M && out.size(1) == N);
+  TORCH_CHECK(partial.numel() >= static_cast<int64_t>(kRouterSplits) * M * N);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto* pp = reinterpret_cast<float*>(partial.data_ptr());
+  auto* xp = reinterpret_cast<const bf16_t*>(x.data_ptr());
+  auto* wp = reinterpret_cast<const float*>(w.data_ptr());
+  auto* op = reinterpret_cast<float*>(out.data_ptr());
+  if (M % 8 == 0) launch_router_fp32<8>(pp, xp, wp, op, M, stream);
+  else launch_router_fp32<1>(pp, xp, wp, op, M, stream);
+}
+
+// Unpooler m=1 N=1024 is 128 CTAs. Split K by 4 → 512 CTAs; fp32 partials, one bf16 reduce.
+template <uint32_t N, uint32_t K, uint32_t SPLITS, uint32_t kRows, uint32_t kUnroll, uint32_t kNumWarps>
+__global__ void __launch_bounds__(kNumWarps * 32)
+    gemv_splitk_kernel(float* __restrict__ partial, const bf16_t* __restrict__ x, const bf16_t* __restrict__ w) {
+  constexpr uint32_t KCHUNK = K / SPLITS;
+  __shared__ bf16_t sx[KCHUNK];
+  const uint32_t split = blockIdx.y;
+  const uint32_t k0 = split * KCHUNK;
+  const uint32_t tid = threadIdx.x;
+  for (uint32_t i = tid * kGemvVecSize; i < KCHUNK; i += kNumWarps * 32 * kGemvVecSize) {
+    *reinterpret_cast<float4*>(sx + i) = *reinterpret_cast<const float4*>(x + k0 + i);
+  }
+  __syncthreads();
+
+  const uint32_t warp = tid / 32;
+  const uint32_t lane = tid % 32;
+  const uint32_t r0 = (blockIdx.x * kNumWarps + warp) * kRows;
+  if (r0 >= N) return;
+
+  float acc[kRows];
+#pragma unroll
+  for (uint32_t r = 0; r < kRows; ++r) acc[r] = 0.f;
+
+  constexpr uint32_t kStep = 32 * kGemvVecSize * kUnroll;
+  for (uint32_t k = lane * kGemvVecSize * kUnroll; k < KCHUNK; k += kStep) {
+    float4 xv[kUnroll];
+#pragma unroll
+    for (uint32_t u = 0; u < kUnroll; ++u) xv[u] = *reinterpret_cast<const float4*>(sx + k + u * kGemvVecSize);
+#pragma unroll
+    for (uint32_t r = 0; r < kRows; ++r) {
+      const bf16_t* wr = w + static_cast<size_t>(r0 + r) * K + k0 + k;
+      float4 wv[kUnroll];
+#pragma unroll
+      for (uint32_t u = 0; u < kUnroll; ++u)
+        wv[u] = __ldcs(reinterpret_cast<const float4*>(wr + u * kGemvVecSize));
+#pragma unroll
+      for (uint32_t u = 0; u < kUnroll; ++u) acc[r] += dot8_f32(wv[u], xv[u]);
+    }
+  }
+#pragma unroll
+  for (uint32_t r = 0; r < kRows; ++r) {
+#pragma unroll
+    for (uint32_t off = 16; off > 0; off >>= 1) acc[r] += __shfl_down_sync(0xffffffff, acc[r], off);
+  }
+  if (lane == 0) {
+#pragma unroll
+    for (uint32_t r = 0; r < kRows; ++r) partial[split * N + r0 + r] = acc[r];
+  }
+}
+
+__global__ void gemv_splitk_reduce(bf16_t* __restrict__ out, const float* __restrict__ partial, int n, int splits) {
+  int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (row >= n) return;
+  float s = 0.f;
+  for (int sp = 0; sp < splits; ++sp) s += partial[static_cast<size_t>(sp) * n + row];
+  out[row] = cast<bf16_t>(s);
+}
+
+void hopper_bf16_gemv_splitk(torch::Tensor x, torch::Tensor w, torch::Tensor out, torch::Tensor partial) {
+  TORCH_CHECK(x.is_cuda() && w.is_cuda() && out.is_cuda() && partial.is_cuda());
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.size(0) == 1);
+  constexpr int N = 1024, K = 4096, SPLITS = 4;
+  TORCH_CHECK(w.size(0) == N && w.size(1) == K && out.numel() == N);
+  TORCH_CHECK(partial.numel() >= SPLITS * N);
+  auto* xp = reinterpret_cast<const bf16_t*>(x.data_ptr());
+  auto* wp = reinterpret_cast<const bf16_t*>(w.data_ptr());
+  auto* op = reinterpret_cast<bf16_t*>(out.data_ptr());
+  auto* pp = reinterpret_cast<float*>(partial.data_ptr());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  constexpr int warps = 8;
+  constexpr int blocks_n = N / warps;  // rows=1
+  gemv_splitk_kernel<N, K, SPLITS, 1, 4, warps><<<dim3(blocks_n, SPLITS), warps * 32, 0, stream>>>(pp, xp, wp);
+  gemv_splitk_reduce<<<(N + 255) / 256, 256, 0, stream>>>(op, pp, N, SPLITS);
+}
 """
 
 _CPP_DECL = r"""
 void hopper_bf16_gemv(torch::Tensor x, torch::Tensor w, torch::Tensor out, bool use_pdl);
+void hopper_bf16_gemv_splitk(torch::Tensor x, torch::Tensor w, torch::Tensor out, torch::Tensor partial);
+void router_fp32_splitk(torch::Tensor x, torch::Tensor w, torch::Tensor partial, torch::Tensor out);
 int64_t bf16_mm_pick_nosplit(int64_t M, int64_t N, int64_t K);
 void bf16_mm_run_nosplit(torch::Tensor A, torch::Tensor B, torch::Tensor C, torch::Tensor workspace);
-void router_fp32(torch::Tensor x, torch::Tensor w, torch::Tensor out, torch::Tensor partial);
-void bf16_wgmma_m256(torch::Tensor a, torch::Tensor b, torch::Tensor c, torch::Tensor partial, int64_t splits);
 """
 
 
@@ -663,26 +578,38 @@ def _align16(t: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _find_cutlass_include() -> str | None:
+    candidates: list[Path] = []
+    try:
+        import tilelang  # noqa: F401
+
+        candidates.append(Path(tilelang.__file__).resolve().parent / "3rdparty" / "cutlass" / "include")
+    except Exception:
+        pass
+    for sp in __import__("site").getsitepackages():
+        candidates.append(Path(sp) / "tilelang" / "3rdparty" / "cutlass" / "include")
+    for c in candidates:
+        if (c / "cutlass" / "cutlass.h").is_file():
+            return str(c)
+    return None
+
+
 def _build_ext(device: torch.device):
     major, minor = torch.cuda.get_device_capability(device)
-    if major >= 9:
-        arch = "sm_90a"
-        gencode = "-gencode=arch=compute_90a,code=sm_90a"
-    else:
-        arch = f"sm_{major}{minor}"
-        gencode = f"-gencode=arch=compute_{major}{minor},code={arch}"
-    build_dir = Path.home() / ".cache" / "muse_bf16_impl_k" / arch
+    arch = f"sm_{major}{minor}"
+    gencode = f"-gencode=arch=compute_{major}{minor},code={arch}"
+    build_dir = Path.home() / ".cache" / "muse_bf16_impl_l" / arch
     build_dir.mkdir(parents=True, exist_ok=True)
     return load_inline(
-        name=f"muse_bf16_impl_k_{arch}",
+        name=f"muse_bf16_impl_l_{arch}",
         cpp_sources=[_CPP_DECL],
         cuda_sources=[_CUDA_SRC],
         functions=[
             "hopper_bf16_gemv",
+            "hopper_bf16_gemv_splitk",
+            "router_fp32_splitk",
             "bf16_mm_pick_nosplit",
             "bf16_mm_run_nosplit",
-            "router_fp32",
-            "bf16_wgmma_m256",
         ],
         extra_cuda_cflags=[
             "-O3",
@@ -695,6 +622,25 @@ def _build_ext(device: torch.device):
         build_directory=str(build_dir),
         verbose=False,
     )
+
+
+def _probe_mm_bf16_backend(device: torch.device) -> str | None:
+    # {{FlashInfer: Efficient and Customizable Attention Engine for LLM Inference Serving}}{{Pick first SM90-capable mm_bf16 backend that runs on thin-m Muse shapes.}}
+    try:
+        from flashinfer.gemm import mm_bf16
+    except ImportError:
+        return None
+    x = torch.zeros(8, 1024, dtype=torch.bfloat16, device=device)
+    b = torch.zeros(1024, 1024, dtype=torch.bfloat16, device=device)
+    for backend in ("tgv", "cute-dsl", "cutlass", "cublaslt", "auto"):
+        try:
+            y = mm_bf16(x, b, backend=backend)
+            torch.cuda.synchronize(device)
+            if y.shape == (8, 1024):
+                return backend
+        except Exception:
+            continue
+    return None
 
 
 def prepare(weights: Weights) -> dict[str, Any]:
@@ -712,59 +658,42 @@ def prepare(weights: Weights) -> dict[str, Any]:
     device = router.device
     state["ext"] = None
     state["use_pdl"] = False
-    state["sm90"] = False
-    state["nosplit"] = {}
-    state["nosplit_ws"] = None
-    state["wgmma_partial"] = None
+    state["mm_backend"] = None
+    state["mm_bf16"] = None
+    state["router_partial"] = None
+    state["gemv_partial"] = None
+    state["cutlass_inc"] = _find_cutlass_include()
     if device.type == "cuda":
         major, _ = torch.cuda.get_device_capability(device)
         state["use_pdl"] = major >= 9
-        state["sm90"] = major >= 9
-        state["ext"] = _build_ext(device)
+        try:
+            state["ext"] = _build_ext(device)
+        except Exception:
+            state["ext"] = None
+        state["mm_backend"] = _probe_mm_bf16_backend(device)
+        if state["mm_backend"] is not None:
+            from flashinfer.gemm import mm_bf16
+
+            state["mm_bf16"] = mm_bf16
         ext = state["ext"]
         if ext is not None:
-            max_ws = 0
-            for layer, ms in _NOSPLIT_MS.items():
-                Wt = state[f"{layer}_t"]
-                k, n = Wt.shape
-                for m in ms:
-                    ws = int(ext.bf16_mm_pick_nosplit(m, n, k))
-                    if ws < 0:
-                        continue
-                    state["nosplit"][(layer, m)] = True
-                    max_ws = max(max_ws, ws)
-            if state["nosplit"]:
-                state["nosplit_ws"] = torch.empty(max(max_ws, 1), dtype=torch.uint8, device=device)
-                for (layer, m) in state["nosplit"]:
-                    Wt = state[f"{layer}_t"]
-                    xw = torch.zeros(m, Wt.shape[0], dtype=torch.bfloat16, device=device)
-                    out = torch.empty(m, Wt.shape[1], dtype=torch.bfloat16, device=device)
-                    ext.bf16_mm_run_nosplit(xw, Wt, out, state["nosplit_ws"])
-            xw = torch.zeros(8, 8192, dtype=torch.bfloat16, device=device)
-            out = torch.empty(8, 256, dtype=torch.float32, device=device)
-            partial = torch.empty(4 * 8 * 256, dtype=torch.float32, device=device)
-            ext.router_fp32(xw, state["router"], out, partial)
-            if state["sm90"]:
-                state["wgmma_partial"] = torch.empty(2 * 256 * 2304, dtype=torch.float32, device=device)
-            torch.cuda.synchronize(device)
+            state["router_partial"] = torch.empty(8 * 1024 * 256, dtype=torch.float32, device=device)
+            state["gemv_partial"] = torch.empty(4 * 1024, dtype=torch.float32, device=device)
     return state
 
 
 def kernel_fn(data: Inputs, state: dict[str, Any]) -> torch.Tensor:
     x, layer = data["x"], data["config"]["layer"]
-    ext = state["ext"]
     if layer == "router":
-        m = x.shape[0]
-        k = x.shape[-1]
-        w = state["router"]
-        if ext is not None and tuple(w.shape) == (256, 8192) and k == 8192:
-            x2 = _align16(x.reshape(m, k).contiguous())
-            out = torch.empty((m, 256), dtype=torch.float32, device=x.device)
-            partial = torch.empty((4, m, 256), dtype=torch.float32, device=x.device)
-            ext.router_fp32(x2, w, out, partial.view(-1))
-            return out.view(*x.shape[:-1], 256)
+        m = x.numel() // x.shape[-1]
+        ext = state["ext"]
+        if ext is not None and state["router_partial"] is not None and 1 <= m <= ROUTER_FP32_MAX_TOKENS:
+            x2 = _align16(x.view(m, -1))
+            out = torch.empty((m, state["router"].shape[0]), dtype=torch.float32, device=x.device)
+            ext.router_fp32_splitk(x2, state["router"], state["router_partial"], out)
+            return out
         if m <= ROUTER_FP32_MAX_TOKENS:
-            return F.linear(x.float(), w)
+            return F.linear(x.float(), state["router"])
         acc = torch.mm(x, state["router_hi_t"], out_dtype=torch.float32)
         acc += torch.mm(x, state["router_lo_t"], out_dtype=torch.float32)
         return acc
@@ -772,6 +701,7 @@ def kernel_fn(data: Inputs, state: dict[str, Any]) -> torch.Tensor:
     n = data["config"]["n"]
     W = state[layer][:n]
     m = x.numel() // x.shape[-1]
+    ext = state["ext"]
     if (
         ext is not None
         and _use_hopper_bf16_gemv(m, W.shape[0], W.shape[1])
@@ -782,38 +712,26 @@ def kernel_fn(data: Inputs, state: dict[str, Any]) -> torch.Tensor:
     ):
         x1 = _align16(x.view(-1, x.shape[-1]))
         out = torch.empty((1, W.shape[0]), dtype=x.dtype, device=x.device)
-        ext.hopper_bf16_gemv(x1, W, out, bool(state["use_pdl"]))
+        if W.shape[0] == 1024 and W.shape[1] == 4096 and state["gemv_partial"] is not None:
+            ext.hopper_bf16_gemv_splitk(x1, W, out, state["gemv_partial"])
+        else:
+            ext.hopper_bf16_gemv(x1, W, out, bool(state["use_pdl"]))
         return out.view(*x.shape[:-1], -1)
 
-    k = x.shape[-1]
-    if (
-        ext is not None
-        and state["sm90"]
-        and m == 256
-        and layer in _WGMMA_M256
-        and n % 128 == 0
-        and k % 64 == 0
-        and W.is_contiguous()
-    ):
-        tiles = (m // 64) * (n // 128)
-        splits = 1 if tiles >= _H200_SMS else 2
-        if k % (splits * 64) == 0:
-            x2 = _align16(x.view(m, k).contiguous())
-            out = torch.empty((m, n), dtype=x.dtype, device=x.device)
-            if splits == 2:
-                need = 2 * m * n
-                buf = state["wgmma_partial"]
-                if buf is None or buf.numel() < need:
-                    buf = torch.empty(need, dtype=torch.float32, device=x.device)
-                ext.bf16_wgmma_m256(x2, W, out, buf, splits)
-            else:
-                ext.bf16_wgmma_m256(x2, W, out, out, splits)
-            return out.view(*x.shape[:-1], n)
-
-    if state["nosplit"].get((layer, m)) and ext is not None:
-        x2 = x.view(-1, x.shape[-1])
-        out = torch.empty(x2.shape[0], n, dtype=x.dtype, device=x.device)
-        state["ext"].bf16_mm_run_nosplit(x2, state[f"{layer}_t"][:, :n], out, state["nosplit_ws"])
-        return out.view(*x.shape[:-1], n)
+    mm = state["mm_bf16"]
+    backend = state["mm_backend"]
+    # Shape allow-list from E/F profiles: keep FI only where it beat nvjet.
+    use_fi = False
+    if mm is not None and backend is not None:
+        if layer == "pooler" and m in (8, 16, 32):
+            use_fi = True
+        elif layer == "unpooler" and m in (16, 32):
+            use_fi = True
+        elif layer == "qkv_gate" and m in (16, 32):
+            use_fi = True
+    if use_fi:
+        return mm(x.view(-1, x.shape[-1]), state[f"{layer}_t"][:, :n], backend=backend).view(
+            *x.shape[:-1], n
+        )
 
     return F.linear(x, W, None)
