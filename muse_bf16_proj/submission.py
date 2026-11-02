@@ -1,8 +1,9 @@
 # okc: problem=muse_bf16_proj
-"""Impl J ThunderKittens-structure: G stack (GEMV+FI+router); TK WMMA thin-m kept compiled but off.
+"""Impl K: FP32 router split across the SMs, SM90 WGMMA for m=256, no-split nvjet on thin-m.
 
-Keep proven G hopper_bf16_gemv (m=1) + FlashInfer allow-list + F.linear (nvjet). Thin-m TK
-WMMA path disabled after profile (0.197×); kernel retained for a future SM90 WGMMA port.
+Router is a direct FP32 GEMM. 256 CTAs (4 K-splits x 64 N-blocks), x in smem, W via ld.cs,
+one FP32 reduce. m=256 qkv/pooler/unpooler use wgmma.m64n128k16; qkv's 72 tiles take a
+2-way K split (144 CTAs). Thin qkv/pooler m in {16,32} keep SPLITK_NUM<=1 nvjet.
 """
 
 from __future__ import annotations
@@ -20,27 +21,13 @@ ROUTER_FP32_MAX_TOKENS = 8
 _MAX_K = 17408
 _MAX_N = 65536
 
-# tk: profile submission-implementation-j.3d89ad3046f14f47: speedup 0.197×; m=1 GEMV fine.
-# tk: Muse m=16 A@Wt→C shapes — qkv_gate M=16,K=8192,N=2304; pooler M=16,K=8192,N=4096;
-# tk: unpooler M=16,K=4096,N=8192; o stays F.linear (nvjet, not TK).
-# tk: m=16 WMMA (16,128,64) catastrophic on SM90/H200: qkv_gate 826µs (kernel 654µs) vs sglang
-# tk: 13.7µs; pooler 840µs (845µs) vs 21.7µs; unpooler 420µs (418µs) vs 18.6µs — WMMA not WGMMA,
-# tk: BN=128 ignores exact N divisors (2304/128=18, 4096/128=32, 8192/128=64), full-K scalar smem.
-# tk: tile plan kept commented for a future WGMMA port; do not dispatch thin-m to TK.
-TK_TILE_PLAN: dict[tuple[str, int], tuple[int, int, int]] = {
-    # ("qkv_gate", 8): (16, 128, 64),  # tk: was pad m=8→BM=16; off — same broken WMMA path
-    # ("qkv_gate", 16): (16, 128, 64),  # tk: was native BM=16; off — Muse N=2304 K=8192
-    # ("qkv_gate", 32): (32, 128, 64),  # tk: was two WMMA rows; off — share WMMA catastrophe
-    # ("pooler", 8): (16, 128, 64),  # tk: off — thin-m → FI/nvjet
-    # ("pooler", 16): (16, 128, 64),  # tk: off — Muse N=4096 K=8192
-    # ("pooler", 32): (32, 128, 64),  # tk: off — share WMMA path
-    # ("unpooler", 8): (16, 128, 64),  # tk: off — thin-m → FI/nvjet
-    # ("unpooler", 16): (16, 128, 64),  # tk: off — Muse N=8192 K=4096
-    # ("unpooler", 32): (32, 128, 64),  # tk: off — share WMMA path
-}  # tk: empty — no thin-m TK dispatch
-
-TK_THIN_M = frozenset()  # tk: was {8,16,32}; emptied so kernel_fn falls through to FI / F.linear
-TK_LAYERS = frozenset({"qkv_gate", "pooler", "unpooler"})  # tk: former TK layers; GEMV m=1 unchanged
+# G profiles: nvjet + splitKreduce on these thin-m shapes (unpooler/o often have no reduce).
+_NOSPLIT_MS = {
+    "qkv_gate": (16, 32),
+    "pooler": (16, 32),
+}
+_WGMMA_M256 = frozenset({"qkv_gate", "pooler", "unpooler"})
+_H200_SMS = 132
 
 
 class Weights(TypedDict):
@@ -68,12 +55,13 @@ class Inputs(TypedDict):
 _CUDA_SRC = r"""
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <cublasLt.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <mma.h>  // tk: warp-level WMMA (SM86 stand-in for WGMMA)
 
 #include <cstdint>
+#include <unordered_map>
 #include <utility>
 
 using bf16_t = __nv_bfloat16;
@@ -271,98 +259,384 @@ void hopper_bf16_gemv(torch::Tensor x, torch::Tensor w, torch::Tensor out, bool 
 #undef DISPATCH
 }
 
-// ---- tk: ThunderKittens-structure BF16 GEMM (SM86 WMMA ≈ H100 WGMMA roles) ----
-constexpr int TK_WM = 16;  // tk: WMMA M
-constexpr int TK_WN = 16;  // tk: WMMA N
-constexpr int TK_WK = 16;  // tk: WMMA K
+// {{FP32 router, K-split across the SMs}}{{256 CTAs stream W once; register acc; one small FP32 reduce.}}
+__device__ __forceinline__ float dot8_bf16_f32(float4 w0, float4 w1, float4 xv) {
+  const bf16x2_t* x2 = reinterpret_cast<const bf16x2_t*>(&xv);
+  float acc = 0.f;
+  float2 a = __bfloat1622float2(x2[0]);
+  acc = fmaf(w0.x, a.x, acc);
+  acc = fmaf(w0.y, a.y, acc);
+  a = __bfloat1622float2(x2[1]);
+  acc = fmaf(w0.z, a.x, acc);
+  acc = fmaf(w0.w, a.y, acc);
+  a = __bfloat1622float2(x2[2]);
+  acc = fmaf(w1.x, a.x, acc);
+  acc = fmaf(w1.y, a.y, acc);
+  a = __bfloat1622float2(x2[3]);
+  acc = fmaf(w1.z, a.x, acc);
+  acc = fmaf(w1.w, a.y, acc);
+  return acc;
+}
 
-template <int BM, int BN, int BK>
-__global__ void __launch_bounds__((BM / TK_WM) * (BN / TK_WN) * 32)
-tk_bf16_gemm_wmma_kernel(  // tk: staged-smem + warp MMA full-K
-    bf16_t* __restrict__ C, const bf16_t* __restrict__ A, const bf16_t* __restrict__ B,  // tk: C=A@B
-    int M, int N, int K) {  // tk: runtime bounds for partial tiles
-  constexpr int WARPS_M = BM / TK_WM;  // tk: warps along M
-  constexpr int WARPS_N = BN / TK_WN;  // tk: warps along N
-  constexpr int NWARPS = WARPS_M * WARPS_N;  // tk: CTA warp count
-  constexpr int NTHREADS = NWARPS * 32;  // tk: exact CTA size
-  const int tid = threadIdx.x;  // tk: linear tid
-  const int warp = tid / 32;  // tk: warp id (= consumer role)
-  const int warp_m = warp / WARPS_N;  // tk: warp row tile
-  const int warp_n = warp % WARPS_N;  // tk: warp col tile
-  const int block_m = blockIdx.y * BM;  // tk: CTA M origin
-  const int block_n = blockIdx.x * BN;  // tk: CTA N origin
+// N=256, K=8192. Grid (4, 64): K-chunk 2048, 4 rows/block. 256 CTAs on 132 SMs.
+__global__ void __launch_bounds__(128)
+router_fp32_splitk(float* __restrict__ partial, const bf16_t* __restrict__ x,
+                   const float* __restrict__ w, int M) {
+  constexpr int K = 8192;
+  constexpr int N = 256;
+  constexpr int Chunk = 2048;
+  constexpr int Unroll = 4;
+  constexpr int Vec = 8;
+  __shared__ __align__(16) bf16_t sx[Chunk];
 
-  // tk: single-stage panels + Cs (fits 48KB; local-frag store trapped on this toolchain)
-  __shared__ bf16_t As[BM * BK];  // tk: staged A smem panel
-  __shared__ bf16_t Bs[BK * BN];  // tk: staged B smem panel
-  __shared__ float Cs[BM * BN];  // tk: FP32 C tile epilogue
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int split = static_cast<int>(blockIdx.x);
+  const int n0 = static_cast<int>(blockIdx.y) * 4 + warp;
+  const int k0 = split * Chunk;
+  const float* wrow = w + (static_cast<size_t>(n0) * K + k0);
 
-  nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, TK_WM, TK_WN, TK_WK, bf16_t, nvcuda::wmma::row_major> a_frag;  // tk: A frag
-  nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, TK_WM, TK_WN, TK_WK, bf16_t, nvcuda::wmma::row_major> b_frag;  // tk: B frag
-  nvcuda::wmma::fragment<nvcuda::wmma::accumulator, TK_WM, TK_WN, TK_WK, float> c_frag;  // tk: acc frag
-  nvcuda::wmma::fill_fragment(c_frag, 0.0f);  // tk: zero acc
-
-  for (int k0 = 0; k0 < K; k0 += BK) {  // tk: full-K single launch (no splitK)
-    for (int i = tid; i < BM * BK; i += NTHREADS) {  // tk: producer fill A
-      int r = i / BK, c = i % BK;  // tk: panel coords
-      int gm = block_m + r, gk = k0 + c;  // tk: global A idx
-      As[i] = (gm < M && gk < K) ? A[(size_t)gm * K + gk] : __float2bfloat16(0.f);  // tk: zero-pad
+  for (int mi = 0; mi < M; ++mi) {
+    const bf16_t* xrow = x + (static_cast<size_t>(mi) * K + k0);
+    for (int i = tid * Vec; i < Chunk; i += 128 * Vec) {
+      *reinterpret_cast<float4*>(sx + i) = *reinterpret_cast<const float4*>(xrow + i);
     }
-    for (int i = tid; i < BK * BN; i += NTHREADS) {  // tk: producer fill B
-      int r = i / BN, c = i % BN;  // tk: panel coords
-      int gk = k0 + r, gn = block_n + c;  // tk: global B idx
-      Bs[i] = (gk < K && gn < N) ? B[(size_t)gk * N + gn] : __float2bfloat16(0.f);  // tk: zero-pad
-    }
-    __syncthreads();  // tk: publish panels to consumers
+    __syncthreads();
+    if (n0 < N) {
+      float acc = 0.f;
+      constexpr int step = 32 * Vec * Unroll;
 #pragma unroll
-    for (int kk = 0; kk < BK; kk += TK_WK) {  // tk: WMMA K slices inside BK
-      nvcuda::wmma::load_matrix_sync(  // tk: warp load A
-          a_frag, &As[(warp_m * TK_WM) * BK + kk], BK);  // tk: lda=BK
-      nvcuda::wmma::load_matrix_sync(  // tk: warp load B
-          b_frag, &Bs[kk * BN + warp_n * TK_WN], BN);  // tk: ldb=BN
-      nvcuda::wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);  // tk: warp MMA
+      for (int k = lane * Vec * Unroll; k < Chunk; k += step) {
+        float4 xv[Unroll], a0[Unroll], a1[Unroll];
+#pragma unroll
+        for (int u = 0; u < Unroll; ++u) {
+          const int kk = k + u * Vec;
+          xv[u] = *reinterpret_cast<const float4*>(sx + kk);
+          a0[u] = __ldcs(reinterpret_cast<const float4*>(wrow + kk));
+          a1[u] = __ldcs(reinterpret_cast<const float4*>(wrow + kk + 4));
+        }
+#pragma unroll
+        for (int u = 0; u < Unroll; ++u) {
+          acc += dot8_bf16_f32(a0[u], a1[u], xv[u]);
+        }
+      }
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+      }
+      if (lane == 0) {
+        partial[(static_cast<size_t>(split) * M + mi) * N + n0] = acc;
+      }
     }
-    __syncthreads();  // tk: reuse smem for next K panel
-  }
-
-  nvcuda::wmma::store_matrix_sync(  // tk: dump warp C to smem
-      &Cs[(warp_m * TK_WM) * BN + warp_n * TK_WN], c_frag, BN, nvcuda::wmma::mem_row_major);  // tk: row-major
-  __syncthreads();  // tk: all warps wrote C
-  for (int i = tid; i < BM * BN; i += NTHREADS) {  // tk: guarded global store
-    int r = i / BN, c = i % BN;  // tk: tile coords
-    int gm = block_m + r, gn = block_n + c;  // tk: global C idx
-    if (gm < M && gn < N) C[(size_t)gm * N + gn] = __float2bfloat16(Cs[i]);  // tk: bf16 out
+    __syncthreads();
   }
 }
 
-template <int BM, int BN, int BK>
-void launch_tk_gemm(bf16_t* C, const bf16_t* A, const bf16_t* B, int M, int N, int K, cudaStream_t stream) {  // tk: host launch helper
-  dim3 block((BM / TK_WM) * (BN / TK_WN) * 32);  // tk: one thread per lane of tile warps
-  dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);  // tk: CTA grid over N x M
-  tk_bf16_gemm_wmma_kernel<BM, BN, BK><<<grid, block, 0, stream>>>(C, A, B, M, N, K);  // tk: fire kernel
+__global__ void router_fp32_reduce(float* __restrict__ out, const float* __restrict__ partial, int M) {
+  constexpr int N = 256;
+  constexpr int Splits = 4;
+  const int total = M * N;
+  for (int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); i < total;
+       i += static_cast<int>(blockDim.x * gridDim.x)) {
+    const int m = i / N;
+    const int n = i - m * N;
+    float a = 0.f;
+#pragma unroll
+    for (int s = 0; s < Splits; ++s) {
+      a += partial[(static_cast<size_t>(s) * M + m) * N + n];
+    }
+    out[i] = a;
+  }
 }
 
-void tk_bf16_gemm(torch::Tensor x, torch::Tensor wt, torch::Tensor out, int bm, int bn, int bk) {  // tk: torch binding
-  TORCH_CHECK(x.is_cuda() && wt.is_cuda() && out.is_cuda());  // tk: device check
-  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && wt.scalar_type() == at::kBFloat16);  // tk: bf16 only
-  TORCH_CHECK(x.dim() == 2 && wt.dim() == 2 && out.dim() == 2);  // tk: rank-2 GEMM
-  const int M = x.size(0), K = x.size(1), N = wt.size(1);  // tk: shapes
-  TORCH_CHECK(wt.size(0) == K && out.size(0) == M && out.size(1) == N);  // tk: match dims
-  TORCH_CHECK(x.is_contiguous() && wt.is_contiguous() && out.is_contiguous());  // tk: contig loads
-  auto* Ap = reinterpret_cast<const bf16_t*>(x.data_ptr());  // tk: A ptr
-  auto* Bp = reinterpret_cast<const bf16_t*>(wt.data_ptr());  // tk: B=W.T ptr
-  auto* Cp = reinterpret_cast<bf16_t*>(out.data_ptr());  // tk: C ptr
-  auto stream = at::cuda::getCurrentCUDAStream();  // tk: current stream
-  // tk: instantiate tile plan combos used by Muse thin-m
-  if (bm == 16 && bn == 128 && bk == 64) { launch_tk_gemm<16, 128, 64>(Cp, Ap, Bp, M, N, K, stream); return; }  // tk: M16 tile
-  if (bm == 32 && bn == 128 && bk == 64) { launch_tk_gemm<32, 128, 64>(Cp, Ap, Bp, M, N, K, stream); return; }  // tk: M32 tile
-  TORCH_CHECK(false, "tk_bf16_gemm: unsupported tile BM=", bm, " BN=", bn, " BK=", bk);  // tk: refuse unknown
+void router_fp32(torch::Tensor x, torch::Tensor w, torch::Tensor out, torch::Tensor partial) {
+  TORCH_CHECK(x.is_cuda() && w.is_cuda() && out.is_cuda() && partial.is_cuda());
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && w.scalar_type() == at::kFloat);
+  TORCH_CHECK(out.scalar_type() == at::kFloat && partial.scalar_type() == at::kFloat);
+  const int M = static_cast<int>(x.size(0));
+  const int K = static_cast<int>(x.size(1));
+  const int N = static_cast<int>(w.size(0));
+  TORCH_CHECK(K == 8192 && N == 256 && w.size(1) == K);
+  TORCH_CHECK(out.size(0) == M && out.size(1) == N);
+  TORCH_CHECK(partial.numel() >= static_cast<int64_t>(4) * M * N);
+  TORCH_CHECK(x.is_contiguous() && w.is_contiguous() && out.is_contiguous() && partial.is_contiguous());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  router_fp32_splitk<<<dim3(4, N / 4), 128, 0, stream>>>(
+      partial.data_ptr<float>(), reinterpret_cast<const bf16_t*>(x.data_ptr()), w.data_ptr<float>(), M);
+  const int threads = 256;
+  const int total = M * N;
+  int blocks = (total + threads - 1) / threads;
+  if (blocks > 1024) blocks = 1024;
+  router_fp32_reduce<<<blocks, threads, 0, stream>>>(out.data_ptr<float>(), partial.data_ptr<float>(), M);
+}
+
+#define WGMMA_FMA(acc, da, db, scale_d) \
+  asm volatile( \
+    "{\n" \
+    ".reg .pred p;\n" \
+    "setp.ne.b32 p, %66, 0;\n" \
+    "wgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 " \
+    "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, %64, %65, p, 1, 1, 0, 0;\n" \
+    "}\n" \
+    : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3]), "+f"(acc[4]), "+f"(acc[5]), "+f"(acc[6]), "+f"(acc[7]), "+f"(acc[8]), "+f"(acc[9]), "+f"(acc[10]), "+f"(acc[11]), "+f"(acc[12]), "+f"(acc[13]), "+f"(acc[14]), "+f"(acc[15]), "+f"(acc[16]), "+f"(acc[17]), "+f"(acc[18]), "+f"(acc[19]), "+f"(acc[20]), "+f"(acc[21]), "+f"(acc[22]), "+f"(acc[23]), "+f"(acc[24]), "+f"(acc[25]), "+f"(acc[26]), "+f"(acc[27]), "+f"(acc[28]), "+f"(acc[29]), "+f"(acc[30]), "+f"(acc[31]), "+f"(acc[32]), "+f"(acc[33]), "+f"(acc[34]), "+f"(acc[35]), "+f"(acc[36]), "+f"(acc[37]), "+f"(acc[38]), "+f"(acc[39]), "+f"(acc[40]), "+f"(acc[41]), "+f"(acc[42]), "+f"(acc[43]), "+f"(acc[44]), "+f"(acc[45]), "+f"(acc[46]), "+f"(acc[47]), "+f"(acc[48]), "+f"(acc[49]), "+f"(acc[50]), "+f"(acc[51]), "+f"(acc[52]), "+f"(acc[53]), "+f"(acc[54]), "+f"(acc[55]), "+f"(acc[56]), "+f"(acc[57]), "+f"(acc[58]), "+f"(acc[59]), "+f"(acc[60]), "+f"(acc[61]), "+f"(acc[62]), "+f"(acc[63]) \
+    : "l"(da), "l"(db), "r"(scale_d));
+
+// {{SM90 WGMMA m64n128k16}}{{m=256 BF16. cp.async into K-major smem (no TMA: tensor-map addr is capture-baked). qkv uses 2-way K split.}}
+__device__ __forceinline__ void cp_async_16(void* smem, const void* gmem) {
+  unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(addr), "l"(gmem));
+}
+
+// K-major INTERLEAVE: groups of 8 K, each group is rows*8 packed (CuTe Layout_K_INTER_Atom).
+__device__ __forceinline__ void cp_tile(bf16_t* smem, const bf16_t* row0, int rows, int ld, int k0, int tid) {
+  constexpr int BK = 64;
+  constexpr int G = 8;
+  const int chunks = BK / G;
+  const int total = rows * chunks;
+  for (int i = tid; i < total; i += 128) {
+    const int r = i / chunks;
+    const int g = i - r * chunks;
+    cp_async_16(smem + (g * rows + r) * G, row0 + static_cast<size_t>(r) * ld + k0 + g * G);
+  }
+}
+
+// Field values are CuTe make_gmma_desc<Major::K> on that layout: leading=rows, stride=8, type=0.
+__device__ __forceinline__ uint64_t desc_kmajor(const bf16_t* smem, int rows) {
+  const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+  uint64_t d = 0;
+  d |= static_cast<uint64_t>(addr >> 4) & 0x3fff;
+  d |= (static_cast<uint64_t>(rows) & 0x3fff) << 16;
+  d |= static_cast<uint64_t>(8) << 32;
+  return d;
+}
+
+__global__ void wgmma_split_reduce(bf16_t* __restrict__ c, const float* __restrict__ partial, int M, int N) {
+  const int total = M * N;
+  for (int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); i < total;
+       i += static_cast<int>(blockDim.x * gridDim.x)) {
+    c[i] = __float2bfloat16(partial[i] + partial[total + i]);
+  }
+}
+
+template <int kSplits>
+__global__ void __launch_bounds__(128)
+bf16_wgmma_64x128(bf16_t* __restrict__ c, const bf16_t* __restrict__ a, const bf16_t* __restrict__ b,
+                  float* __restrict__ partial, int M, int N, int K) {
+#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
+  constexpr int BM = 64;
+  constexpr int BN = 128;
+  constexpr int BK = 64;
+  __shared__ __align__(128) bf16_t As[BM * BK];
+  __shared__ __align__(128) bf16_t Bs[BN * BK];
+
+  const int tid = threadIdx.x;
+  const int split = static_cast<int>(blockIdx.z);
+  const int m0 = static_cast<int>(blockIdx.y) * BM;
+  const int n0 = static_cast<int>(blockIdx.x) * BN;
+  const int k_per = K / kSplits;
+  const int k_begin = split * k_per;
+  const int k_end = k_begin + k_per;
+
+  float acc[64];
+#pragma unroll
+  for (int i = 0; i < 64; ++i) acc[i] = 0.f;
+
+  int scale = 0;
+  for (int k0 = k_begin; k0 < k_end; k0 += BK) {
+    cp_tile(As, a + static_cast<size_t>(m0) * K, BM, K, k0, tid);
+    cp_tile(Bs, b + static_cast<size_t>(n0) * K, BN, K, k0, tid);
+    asm volatile("cp.async.commit_group;\n" ::);
+    asm volatile("cp.async.wait_group 0;\n" ::);
+    __syncthreads();
+    asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+#pragma unroll
+    for (int kk = 0; kk < BK; kk += 16) {
+      const uint64_t da = desc_kmajor(As + kk * BM, BM);
+      const uint64_t db = desc_kmajor(Bs + kk * BN, BN);
+      WGMMA_FMA(acc, da, db, scale);
+      scale = 1;
+    }
+    asm volatile("wgmma.commit_group.sync.aligned;\n" ::);
+    asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(0) : "memory");
+#pragma unroll
+    for (int i = 0; i < 64; ++i) {
+      asm volatile("" : "+f"(acc[i])::"memory");
+    }
+    __syncthreads();
+  }
+
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int group = lane >> 2;
+  const int inner = lane & 3;
+#pragma unroll
+  for (int i = 0; i < 64; ++i) {
+    const int quad = i >> 2;
+    const int sub = i & 3;
+    const int r = group + ((sub >> 1) << 3) + (warp << 4);
+    const int col = (quad << 3) + (sub & 1) + (inner << 1);
+    const float v = acc[i];
+    if constexpr (kSplits == 1) {
+      c[(static_cast<size_t>(m0 + r) * N) + n0 + col] = __float2bfloat16(v);
+    } else {
+      partial[(static_cast<size_t>(split) * M + (m0 + r)) * N + n0 + col] = v;
+    }
+  }
+#else
+  (void)c;
+  (void)a;
+  (void)b;
+  (void)partial;
+  (void)M;
+  (void)N;
+  (void)K;
+#endif
+}
+
+void bf16_wgmma_m256(torch::Tensor a, torch::Tensor b, torch::Tensor c, torch::Tensor partial, int64_t splits) {
+  TORCH_CHECK(a.is_cuda() && b.is_cuda() && c.is_cuda());
+  TORCH_CHECK(a.scalar_type() == at::kBFloat16 && b.scalar_type() == at::kBFloat16 && c.scalar_type() == at::kBFloat16);
+  TORCH_CHECK(a.is_contiguous() && b.is_contiguous() && c.is_contiguous());
+  const int M = static_cast<int>(a.size(0));
+  const int K = static_cast<int>(a.size(1));
+  const int N = static_cast<int>(b.size(0));
+  TORCH_CHECK(b.size(1) == K && c.size(0) == M && c.size(1) == N);
+  TORCH_CHECK(M % 64 == 0 && N % 128 == 0 && K % 64 == 0);
+  TORCH_CHECK(splits == 1 || splits == 2);
+  TORCH_CHECK(K % (static_cast<int>(splits) * 64) == 0);
+  float* pp = nullptr;
+  if (splits == 2) {
+    TORCH_CHECK(partial.is_cuda() && partial.scalar_type() == at::kFloat && partial.is_contiguous());
+    TORCH_CHECK(partial.numel() >= static_cast<int64_t>(2) * M * N);
+    pp = partial.data_ptr<float>();
+  }
+  auto* ap = reinterpret_cast<const bf16_t*>(a.data_ptr());
+  auto* bp = reinterpret_cast<const bf16_t*>(b.data_ptr());
+  auto* cp = reinterpret_cast<bf16_t*>(c.data_ptr());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const dim3 grid(N / 128, M / 64, static_cast<unsigned>(splits));
+  if (splits == 2) {
+    bf16_wgmma_64x128<2><<<grid, 128, 0, stream>>>(cp, ap, bp, pp, M, N, K);
+    const int threads = 256;
+    const int total = M * N;
+    int blocks = (total + threads - 1) / threads;
+    if (blocks > 2048) blocks = 2048;
+    wgmma_split_reduce<<<blocks, threads, 0, stream>>>(cp, pp, M, N);
+  } else {
+    bf16_wgmma_64x128<1><<<grid, 128, 0, stream>>>(cp, ap, bp, nullptr, M, N, K);
+  }
+}
+
+// {{cuBLASLt split-K filter}}{{Prefer SPLITK_NUM≤1 heuristics to drop splitKreduce while keeping nvjet mainloop.}}
+
+static cublasLtHandle_t g_lt = nullptr;
+
+struct NosplitEntry {
+  cublasLtMatmulDesc_t op{};
+  cublasLtMatrixLayout_t Ad{}, Bd{}, Cd{};
+  cublasLtMatmulAlgo_t algo{};
+  size_t ws = 0;
+};
+
+static std::unordered_map<uint64_t, NosplitEntry> g_nosplit;
+
+static uint64_t nosplit_key(int64_t M, int64_t N, int64_t K) {
+  return (static_cast<uint64_t>(M) << 40) | (static_cast<uint64_t>(N) << 16) | static_cast<uint64_t>(K & 0xffff);
+}
+
+static void ensure_lt() {
+  if (!g_lt) {
+    TORCH_CHECK(cublasLtCreate(&g_lt) == CUBLAS_STATUS_SUCCESS);
+  }
+}
+
+static cublasStatus_t make_row_layout(cublasLtMatrixLayout_t* layout, cudaDataType_t dt, int rows, int cols) {
+  auto st = cublasLtMatrixLayoutCreate(layout, dt, rows, cols, cols);
+  if (st != CUBLAS_STATUS_SUCCESS) return st;
+  cublasLtOrder_t ord = CUBLASLT_ORDER_ROW;
+  return cublasLtMatrixLayoutSetAttribute(*layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &ord, sizeof(ord));
+}
+
+// Returns workspace bytes (>=0) on success; -1 if no nosplit algo. Caches descs for graph-safe run.
+int64_t bf16_mm_pick_nosplit(int64_t M, int64_t N, int64_t K) {
+  ensure_lt();
+  const uint64_t key = nosplit_key(M, N, K);
+  if (g_nosplit.count(key)) {
+    return static_cast<int64_t>(g_nosplit[key].ws);
+  }
+
+  NosplitEntry e;
+  TORCH_CHECK(cublasLtMatmulDescCreate(&e.op, CUBLAS_COMPUTE_32F, CUDA_R_32F) == CUBLAS_STATUS_SUCCESS);
+  cublasOperation_t t = CUBLAS_OP_N;
+  cublasLtMatmulDescSetAttribute(e.op, CUBLASLT_MATMUL_DESC_TRANSA, &t, sizeof(t));
+  cublasLtMatmulDescSetAttribute(e.op, CUBLASLT_MATMUL_DESC_TRANSB, &t, sizeof(t));
+  TORCH_CHECK(make_row_layout(&e.Ad, CUDA_R_16BF, (int)M, (int)K) == CUBLAS_STATUS_SUCCESS);
+  TORCH_CHECK(make_row_layout(&e.Bd, CUDA_R_16BF, (int)K, (int)N) == CUBLAS_STATUS_SUCCESS);
+  TORCH_CHECK(make_row_layout(&e.Cd, CUDA_R_16BF, (int)M, (int)N) == CUBLAS_STATUS_SUCCESS);
+
+  cublasLtMatmulPreference_t pref;
+  TORCH_CHECK(cublasLtMatmulPreferenceCreate(&pref) == CUBLAS_STATUS_SUCCESS);
+  size_t ws_cap = 64ull << 20;
+  cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_cap, sizeof(ws_cap));
+
+  cublasLtMatmulHeuristicResult_t heur[64];
+  int nres = 0;
+  auto st = cublasLtMatmulAlgoGetHeuristic(g_lt, e.op, e.Ad, e.Bd, e.Cd, e.Cd, pref, 64, heur, &nres);
+  int64_t out_ws = -1;
+  if (st == CUBLAS_STATUS_SUCCESS) {
+    for (int i = 0; i < nres; ++i) {
+      if (heur[i].state != CUBLAS_STATUS_SUCCESS) continue;
+      int splitk = 0;
+      size_t written = 0;
+      cublasLtMatmulAlgoConfigGetAttribute(
+          &heur[i].algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &splitk, sizeof(splitk), &written);
+      if (splitk <= 1) {
+        e.algo = heur[i].algo;
+        e.ws = heur[i].workspaceSize;
+        out_ws = static_cast<int64_t>(e.ws);
+        g_nosplit.emplace(key, e);
+        break;
+      }
+    }
+  }
+  cublasLtMatmulPreferenceDestroy(pref);
+  if (out_ws < 0) {
+    cublasLtMatrixLayoutDestroy(e.Ad);
+    cublasLtMatrixLayoutDestroy(e.Bd);
+    cublasLtMatrixLayoutDestroy(e.Cd);
+    cublasLtMatmulDescDestroy(e.op);
+  }
+  return out_ws;
+}
+
+void bf16_mm_run_nosplit(torch::Tensor A, torch::Tensor B, torch::Tensor C, torch::Tensor workspace) {
+  TORCH_CHECK(A.is_cuda() && B.is_cuda() && C.is_cuda());
+  TORCH_CHECK(A.scalar_type() == at::kBFloat16 && B.scalar_type() == at::kBFloat16 && C.scalar_type() == at::kBFloat16);
+  TORCH_CHECK(A.dim() == 2 && B.dim() == 2 && C.dim() == 2);
+  const int M = A.size(0), K = A.size(1), N = B.size(1);
+  TORCH_CHECK(B.size(0) == K && C.size(0) == M && C.size(1) == N);
+  ensure_lt();
+  auto it = g_nosplit.find(nosplit_key(M, N, K));
+  TORCH_CHECK(it != g_nosplit.end(), "bf16_mm_run_nosplit: missing prepare pick");
+  const NosplitEntry& e = it->second;
+  float alpha = 1.f, beta = 0.f;
+  void* ws = workspace.defined() && workspace.numel() > 0 ? workspace.data_ptr() : nullptr;
+  size_t ws_bytes = workspace.defined() ? static_cast<size_t>(workspace.numel() * workspace.element_size()) : 0;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  TORCH_CHECK(
+      cublasLtMatmul(
+          g_lt, e.op, &alpha, A.data_ptr(), e.Ad, B.data_ptr(), e.Bd, &beta, C.data_ptr(), e.Cd, C.data_ptr(), e.Cd,
+          &e.algo, ws, ws_bytes, stream) == CUBLAS_STATUS_SUCCESS);
 }
 """
 
 _CPP_DECL = r"""
 void hopper_bf16_gemv(torch::Tensor x, torch::Tensor w, torch::Tensor out, bool use_pdl);
-void tk_bf16_gemm(torch::Tensor x, torch::Tensor wt, torch::Tensor out, int bm, int bn, int bk);  // tk: export TK GEMM
+int64_t bf16_mm_pick_nosplit(int64_t M, int64_t N, int64_t K);
+void bf16_mm_run_nosplit(torch::Tensor A, torch::Tensor B, torch::Tensor C, torch::Tensor workspace);
+void router_fp32(torch::Tensor x, torch::Tensor w, torch::Tensor out, torch::Tensor partial);
+void bf16_wgmma_m256(torch::Tensor a, torch::Tensor b, torch::Tensor c, torch::Tensor partial, int64_t splits);
 """
 
 
@@ -391,47 +665,36 @@ def _align16(t: torch.Tensor) -> torch.Tensor:
 
 def _build_ext(device: torch.device):
     major, minor = torch.cuda.get_device_capability(device)
-    arch = f"sm_{major}{minor}"
-    build_dir = Path.home() / ".cache" / "muse_bf16_tk_j" / arch  # tk: separate cache from G
+    if major >= 9:
+        arch = "sm_90a"
+        gencode = "-gencode=arch=compute_90a,code=sm_90a"
+    else:
+        arch = f"sm_{major}{minor}"
+        gencode = f"-gencode=arch=compute_{major}{minor},code={arch}"
+    build_dir = Path.home() / ".cache" / "muse_bf16_impl_k" / arch
     build_dir.mkdir(parents=True, exist_ok=True)
     return load_inline(
-        name=f"muse_bf16_tk_j_{arch}",  # tk: unique ext name for J
+        name=f"muse_bf16_impl_k_{arch}",
         cpp_sources=[_CPP_DECL],
         cuda_sources=[_CUDA_SRC],
-        functions=["hopper_bf16_gemv", "tk_bf16_gemm"],  # tk: export both kernels
+        functions=[
+            "hopper_bf16_gemv",
+            "bf16_mm_pick_nosplit",
+            "bf16_mm_run_nosplit",
+            "router_fp32",
+            "bf16_wgmma_m256",
+        ],
         extra_cuda_cflags=[
             "-O3",
             "--use_fast_math",
-            "-std=c++20",  # tk: judge ATen requires C++20 (c++17 failed okc setup)
-            f"-arch={arch}",  # tk: real SASS arch so HMMA emits
+            "-std=c++20",
             "--expt-relaxed-constexpr",
+            gencode,
         ],
+        extra_ldflags=["-lcublasLt"],
         build_directory=str(build_dir),
         verbose=False,
     )
-
-
-def _probe_mm_bf16_backend(device: torch.device) -> str | None:
-    # {{FlashInfer: Efficient and Customizable Attention Engine for LLM Inference Serving}}{{Pick first SM90-capable mm_bf16 backend that runs on thin-m Muse shapes.}}
-    try:
-        from flashinfer.gemm import mm_bf16
-    except ImportError:
-        return None
-    x = torch.zeros(8, 1024, dtype=torch.bfloat16, device=device)
-    b = torch.zeros(1024, 1024, dtype=torch.bfloat16, device=device)
-    for backend in ("tgv", "cute-dsl", "cutlass", "cublaslt", "auto"):
-        try:
-            y = mm_bf16(x, b, backend=backend)
-            torch.cuda.synchronize(device)
-            if y.shape == (8, 1024):
-                return backend
-        except Exception:
-            continue
-    return None
-
-
-def _tk_tile_for(layer: str, m: int) -> tuple[int, int, int]:  # tk: plan lookup
-    return TK_TILE_PLAN[(layer, m)]  # tk: exact allow-list key
 
 
 def prepare(weights: Weights) -> dict[str, Any]:
@@ -449,39 +712,59 @@ def prepare(weights: Weights) -> dict[str, Any]:
     device = router.device
     state["ext"] = None
     state["use_pdl"] = False
-    state["mm_backend"] = None
-    state["mm_bf16"] = None
-    state["tk_tile_plan"] = TK_TILE_PLAN  # tk: expose tile plan in state
-    state["unpooler_t_1024"] = state["unpooler_t"][:, :1024].contiguous()  # tk: contig B for sliced N
+    state["sm90"] = False
+    state["nosplit"] = {}
+    state["nosplit_ws"] = None
+    state["wgmma_partial"] = None
     if device.type == "cuda":
         major, _ = torch.cuda.get_device_capability(device)
         state["use_pdl"] = major >= 9
+        state["sm90"] = major >= 9
         state["ext"] = _build_ext(device)
-        state["mm_backend"] = _probe_mm_bf16_backend(device)
-        if state["mm_backend"] is not None:
-            from flashinfer.gemm import mm_bf16
-
-            state["mm_bf16"] = mm_bf16
-        # tk: warm TK kernels so first graph capture is cold-free
-        ext = state["ext"]  # tk: compiled ext
-        if ext is not None:  # tk: only when CUDA ext built
-            for layer, m in TK_TILE_PLAN:  # tk: each allow-listed shape
-                W = state[layer]  # tk: weight rows
-                n = 1024 if (layer == "unpooler" and m <= ROUTER_FP32_MAX_TOKENS) else W.shape[0]  # tk: unpool slice
-                bm, bn, bk = _tk_tile_for(layer, m)  # tk: tile from plan
-                x = torch.zeros((m, W.shape[1]), dtype=torch.bfloat16, device=device)  # tk: warm A
-                out = torch.empty((m, n), dtype=torch.bfloat16, device=device)  # tk: warm C
-                wt = state["unpooler_t_1024"] if (layer == "unpooler" and n == 1024) else state[f"{layer}_t"][:, :n]  # tk: contig B
-                ext.tk_bf16_gemm(x, wt, out, bm, bn, bk)  # tk: warm launch
-            torch.cuda.synchronize(device)  # tk: finish warm
+        ext = state["ext"]
+        if ext is not None:
+            max_ws = 0
+            for layer, ms in _NOSPLIT_MS.items():
+                Wt = state[f"{layer}_t"]
+                k, n = Wt.shape
+                for m in ms:
+                    ws = int(ext.bf16_mm_pick_nosplit(m, n, k))
+                    if ws < 0:
+                        continue
+                    state["nosplit"][(layer, m)] = True
+                    max_ws = max(max_ws, ws)
+            if state["nosplit"]:
+                state["nosplit_ws"] = torch.empty(max(max_ws, 1), dtype=torch.uint8, device=device)
+                for (layer, m) in state["nosplit"]:
+                    Wt = state[f"{layer}_t"]
+                    xw = torch.zeros(m, Wt.shape[0], dtype=torch.bfloat16, device=device)
+                    out = torch.empty(m, Wt.shape[1], dtype=torch.bfloat16, device=device)
+                    ext.bf16_mm_run_nosplit(xw, Wt, out, state["nosplit_ws"])
+            xw = torch.zeros(8, 8192, dtype=torch.bfloat16, device=device)
+            out = torch.empty(8, 256, dtype=torch.float32, device=device)
+            partial = torch.empty(4 * 8 * 256, dtype=torch.float32, device=device)
+            ext.router_fp32(xw, state["router"], out, partial)
+            if state["sm90"]:
+                state["wgmma_partial"] = torch.empty(2 * 256 * 2304, dtype=torch.float32, device=device)
+            torch.cuda.synchronize(device)
     return state
 
 
 def kernel_fn(data: Inputs, state: dict[str, Any]) -> torch.Tensor:
     x, layer = data["x"], data["config"]["layer"]
+    ext = state["ext"]
     if layer == "router":
-        if x.shape[0] <= ROUTER_FP32_MAX_TOKENS:
-            return F.linear(x.float(), state["router"])
+        m = x.shape[0]
+        k = x.shape[-1]
+        w = state["router"]
+        if ext is not None and tuple(w.shape) == (256, 8192) and k == 8192:
+            x2 = _align16(x.reshape(m, k).contiguous())
+            out = torch.empty((m, 256), dtype=torch.float32, device=x.device)
+            partial = torch.empty((4, m, 256), dtype=torch.float32, device=x.device)
+            ext.router_fp32(x2, w, out, partial.view(-1))
+            return out.view(*x.shape[:-1], 256)
+        if m <= ROUTER_FP32_MAX_TOKENS:
+            return F.linear(x.float(), w)
         acc = torch.mm(x, state["router_hi_t"], out_dtype=torch.float32)
         acc += torch.mm(x, state["router_lo_t"], out_dtype=torch.float32)
         return acc
@@ -489,7 +772,6 @@ def kernel_fn(data: Inputs, state: dict[str, Any]) -> torch.Tensor:
     n = data["config"]["n"]
     W = state[layer][:n]
     m = x.numel() // x.shape[-1]
-    ext = state["ext"]
     if (
         ext is not None
         and _use_hopper_bf16_gemv(m, W.shape[0], W.shape[1])
@@ -503,30 +785,35 @@ def kernel_fn(data: Inputs, state: dict[str, Any]) -> torch.Tensor:
         ext.hopper_bf16_gemv(x1, W, out, bool(state["use_pdl"]))
         return out.view(*x.shape[:-1], -1)
 
-    # tk: thin-m TK GEMM disabled (TK_THIN_M empty); kernel still compiled for future WGMMA.
-    # tk: was: if ext and layer in TK_LAYERS and m in {8,16,32}: tk_bf16_gemm(...(16|32),128,64)
-    if ext is not None and layer in TK_LAYERS and m in TK_THIN_M:  # tk: dead until WGMMA plan refilled
-        bm, bn, bk = _tk_tile_for(layer, m)  # tk: tile plan
-        x2 = _align16(x.view(-1, x.shape[-1]).contiguous())  # tk: contig A
-        wt = state["unpooler_t_1024"] if (layer == "unpooler" and n == 1024) else state[f"{layer}_t"][:, :n]  # tk: contig B
-        out = torch.empty((x2.shape[0], n), dtype=x.dtype, device=x.device)  # tk: alloc C (graph-safe shape)
-        ext.tk_bf16_gemm(x2, wt, out, int(bm), int(bn), int(bk))  # tk: single-launch full-K (unused)
-        return out.view(*x.shape[:-1], n)  # tk: restore leading dims
+    k = x.shape[-1]
+    if (
+        ext is not None
+        and state["sm90"]
+        and m == 256
+        and layer in _WGMMA_M256
+        and n % 128 == 0
+        and k % 64 == 0
+        and W.is_contiguous()
+    ):
+        tiles = (m // 64) * (n // 128)
+        splits = 1 if tiles >= _H200_SMS else 2
+        if k % (splits * 64) == 0:
+            x2 = _align16(x.view(m, k).contiguous())
+            out = torch.empty((m, n), dtype=x.dtype, device=x.device)
+            if splits == 2:
+                need = 2 * m * n
+                buf = state["wgmma_partial"]
+                if buf is None or buf.numel() < need:
+                    buf = torch.empty(need, dtype=torch.float32, device=x.device)
+                ext.bf16_wgmma_m256(x2, W, out, buf, splits)
+            else:
+                ext.bf16_wgmma_m256(x2, W, out, out, splits)
+            return out.view(*x.shape[:-1], n)
 
-    mm = state["mm_bf16"]
-    backend = state["mm_backend"]
-    # Shape allow-list from E/F profiles: keep FI only where it beat nvjet.
-    use_fi = False
-    if mm is not None and backend is not None:
-        if layer == "pooler" and m in (8, 16, 32):
-            use_fi = True
-        elif layer == "unpooler" and m in (16, 32):
-            use_fi = True
-        elif layer == "qkv_gate" and m in (16, 32):
-            use_fi = True
-    if use_fi:
-        return mm(x.view(-1, x.shape[-1]), state[f"{layer}_t"][:, :n], backend=backend).view(
-            *x.shape[:-1], n
-        )
+    if state["nosplit"].get((layer, m)) and ext is not None:
+        x2 = x.view(-1, x.shape[-1])
+        out = torch.empty(x2.shape[0], n, dtype=x.dtype, device=x.device)
+        state["ext"].bf16_mm_run_nosplit(x2, state[f"{layer}_t"][:, :n], out, state["nosplit_ws"])
+        return out.view(*x.shape[:-1], n)
 
     return F.linear(x, W, None)
