@@ -1,9 +1,8 @@
 # okc: problem=muse_bf16_proj
-# streamk: docstring — Impl I Stream-K identity
-"""Impl I: Stream-K.
+"""Impl J ThunderKittens-structure: G stack (GEMV+FI+router); TK WMMA thin-m kept compiled but off.
 
-Keep G hopper_bf16_gemv (m=1) + router + FI allow-list; thin-m qkv_gate/pooler/unpooler
-m in {8,16,32} use one-launch WMMA Stream-K BF16 GEMM with in-kernel partial reduce.
+Keep proven G hopper_bf16_gemv (m=1) + FlashInfer allow-list + F.linear (nvjet). Thin-m TK
+WMMA path disabled after profile (0.197×); kernel retained for a future SM90 WGMMA port.
 """
 
 from __future__ import annotations
@@ -21,14 +20,27 @@ ROUTER_FP32_MAX_TOKENS = 8
 _MAX_K = 17408
 _MAX_N = 65536
 
-# streamk: tile — WMMA 16x16 panels; BN wide for N coverage
-BM, BN, BK = 16, 128, 16
-# streamk: dispatch — thin-m shapes that skip cublasLt splitKreduce via fused Stream-K
-_STREAMK_ALLOW = {
-    "qkv_gate": (8, 16, 32),
-    "pooler": (8, 16, 32),
-    "unpooler": (8, 16, 32),
-}
+# tk: profile submission-implementation-j.3d89ad3046f14f47: speedup 0.197×; m=1 GEMV fine.
+# tk: Muse m=16 A@Wt→C shapes — qkv_gate M=16,K=8192,N=2304; pooler M=16,K=8192,N=4096;
+# tk: unpooler M=16,K=4096,N=8192; o stays F.linear (nvjet, not TK).
+# tk: m=16 WMMA (16,128,64) catastrophic on SM90/H200: qkv_gate 826µs (kernel 654µs) vs sglang
+# tk: 13.7µs; pooler 840µs (845µs) vs 21.7µs; unpooler 420µs (418µs) vs 18.6µs — WMMA not WGMMA,
+# tk: BN=128 ignores exact N divisors (2304/128=18, 4096/128=32, 8192/128=64), full-K scalar smem.
+# tk: tile plan kept commented for a future WGMMA port; do not dispatch thin-m to TK.
+TK_TILE_PLAN: dict[tuple[str, int], tuple[int, int, int]] = {
+    # ("qkv_gate", 8): (16, 128, 64),  # tk: was pad m=8→BM=16; off — same broken WMMA path
+    # ("qkv_gate", 16): (16, 128, 64),  # tk: was native BM=16; off — Muse N=2304 K=8192
+    # ("qkv_gate", 32): (32, 128, 64),  # tk: was two WMMA rows; off — share WMMA catastrophe
+    # ("pooler", 8): (16, 128, 64),  # tk: off — thin-m → FI/nvjet
+    # ("pooler", 16): (16, 128, 64),  # tk: off — Muse N=4096 K=8192
+    # ("pooler", 32): (32, 128, 64),  # tk: off — share WMMA path
+    # ("unpooler", 8): (16, 128, 64),  # tk: off — thin-m → FI/nvjet
+    # ("unpooler", 16): (16, 128, 64),  # tk: off — Muse N=8192 K=4096
+    # ("unpooler", 32): (32, 128, 64),  # tk: off — share WMMA path
+}  # tk: empty — no thin-m TK dispatch
+
+TK_THIN_M = frozenset()  # tk: was {8,16,32}; emptied so kernel_fn falls through to FI / F.linear
+TK_LAYERS = frozenset({"qkv_gate", "pooler", "unpooler"})  # tk: former TK layers; GEMV m=1 unchanged
 
 
 class Weights(TypedDict):
@@ -59,8 +71,7 @@ _CUDA_SRC = r"""
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <mma.h>  // streamk: WMMA tensor cores on SM86+
-#include <algorithm>  // streamk: grid = min(work, sms*2) occupancy
+#include <mma.h>  // tk: warp-level WMMA (SM86 stand-in for WGMMA)
 
 #include <cstdint>
 #include <utility>
@@ -260,198 +271,98 @@ void hopper_bf16_gemv(torch::Tensor x, torch::Tensor w, torch::Tensor out, bool 
 #undef DISPATCH
 }
 
-// streamk: section — one-launch WMMA Stream-K; in-kernel partial reduce (no cublasLt::splitKreduce)
-namespace ns = nvcuda::wmma;  // streamk: WMMA namespace alias (not a type)
-using sk_bf16 = __nv_bfloat16;  // streamk: local alias; keep G bf16_t untouched
+// ---- tk: ThunderKittens-structure BF16 GEMM (SM86 WMMA ≈ H100 WGMMA roles) ----
+constexpr int TK_WM = 16;  // tk: WMMA M
+constexpr int TK_WN = 16;  // tk: WMMA N
+constexpr int TK_WK = 16;  // tk: WMMA K
 
-static __device__ __forceinline__ sk_bf16 sk_f32_bf16(float v) {  // streamk: store C as bf16
-  return __float2bfloat16(v);  // streamk: rn convert for C writeback
-}  // streamk: end helper
+template <int BM, int BN, int BK>
+__global__ void __launch_bounds__((BM / TK_WM) * (BN / TK_WN) * 32)
+tk_bf16_gemm_wmma_kernel(  // tk: staged-smem + warp MMA full-K
+    bf16_t* __restrict__ C, const bf16_t* __restrict__ A, const bf16_t* __restrict__ B,  // tk: C=A@B
+    int M, int N, int K) {  // tk: runtime bounds for partial tiles
+  constexpr int WARPS_M = BM / TK_WM;  // tk: warps along M
+  constexpr int WARPS_N = BN / TK_WN;  // tk: warps along N
+  constexpr int NWARPS = WARPS_M * WARPS_N;  // tk: CTA warp count
+  constexpr int NTHREADS = NWARPS * 32;  // tk: exact CTA size
+  const int tid = threadIdx.x;  // tk: linear tid
+  const int warp = tid / 32;  // tk: warp id (= consumer role)
+  const int warp_m = warp / WARPS_N;  // tk: warp row tile
+  const int warp_n = warp % WARPS_N;  // tk: warp col tile
+  const int block_m = blockIdx.y * BM;  // tk: CTA M origin
+  const int block_n = blockIdx.x * BN;  // tk: CTA N origin
 
-constexpr int kBM = 16;  // streamk: tile M (WMMA)
-constexpr int kBN = 128;  // streamk: tile N (8 warps * 16)
-constexpr int kBK = 16;  // streamk: tile K (WMMA)
-constexpr int kWarps = 8;  // streamk: BN/16 warps for occupancy
-constexpr int kThreads = kWarps * 32;  // streamk: block threads
+  // tk: single-stage panels + Cs (fits 48KB; local-frag store trapped on this toolchain)
+  __shared__ bf16_t As[BM * BK];  // tk: staged A smem panel
+  __shared__ bf16_t Bs[BK * BN];  // tk: staged B smem panel
+  __shared__ float Cs[BM * BN];  // tk: FP32 C tile epilogue
 
-__device__ __forceinline__ void load_a_panel(  // streamk: A panel with zero-fill edges
-    sk_bf16* __restrict__ As,  // streamk: smem [16*16]
-    const sk_bf16* __restrict__ A,  // streamk: global A[M,K]
-    int M, int K, int m0, int kk, int tid) {  // streamk: tile origin + k slice
-  for (int i = tid; i < 16 * 16; i += kThreads) {  // streamk: coop fill
-    const int r = i >> 4;  // streamk: row in panel
-    const int c = i & 15;  // streamk: col in panel
-    const int mr = m0 + r;  // streamk: global m
-    As[i] = (mr < M) ? A[static_cast<size_t>(mr) * K + kk + c] : sk_bf16{};  // streamk: edge zero-fill
-  }  // streamk: end A load loop
-}  // streamk: end load_a_panel
+  nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, TK_WM, TK_WN, TK_WK, bf16_t, nvcuda::wmma::row_major> a_frag;  // tk: A frag
+  nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, TK_WM, TK_WN, TK_WK, bf16_t, nvcuda::wmma::row_major> b_frag;  // tk: B frag
+  nvcuda::wmma::fragment<nvcuda::wmma::accumulator, TK_WM, TK_WN, TK_WK, float> c_frag;  // tk: acc frag
+  nvcuda::wmma::fill_fragment(c_frag, 0.0f);  // tk: zero acc
 
-__device__ __forceinline__ void load_b_panel(  // streamk: B panel for one warp cols
-    sk_bf16* __restrict__ Bs,  // streamk: smem [16*16]
-    const sk_bf16* __restrict__ B,  // streamk: global B[K,N]
-    int N, int K_unused, int nw, int kk, int lane) {  // streamk: n-origin + k
-  (void)K_unused;  // streamk: B stride is N not K
-  for (int i = lane; i < 16 * 16; i += 32) {  // streamk: warp-coop fill
-    const int r = i >> 4;  // streamk: k in panel
-    const int c = i & 15;  // streamk: n in panel
-    const int nc = nw + c;  // streamk: global n
-    Bs[i] = (nc < N) ? B[static_cast<size_t>(kk + r) * N + nc] : sk_bf16{};  // streamk: edge zero-fill
-  }  // streamk: end B load loop
-}  // streamk: end load_b_panel
+  for (int k0 = 0; k0 < K; k0 += BK) {  // tk: full-K single launch (no splitK)
+    for (int i = tid; i < BM * BK; i += NTHREADS) {  // tk: producer fill A
+      int r = i / BK, c = i % BK;  // tk: panel coords
+      int gm = block_m + r, gk = k0 + c;  // tk: global A idx
+      As[i] = (gm < M && gk < K) ? A[(size_t)gm * K + gk] : __float2bfloat16(0.f);  // tk: zero-pad
+    }
+    for (int i = tid; i < BK * BN; i += NTHREADS) {  // tk: producer fill B
+      int r = i / BN, c = i % BN;  // tk: panel coords
+      int gk = k0 + r, gn = block_n + c;  // tk: global B idx
+      Bs[i] = (gk < K && gn < N) ? B[(size_t)gk * N + gn] : __float2bfloat16(0.f);  // tk: zero-pad
+    }
+    __syncthreads();  // tk: publish panels to consumers
+#pragma unroll
+    for (int kk = 0; kk < BK; kk += TK_WK) {  // tk: WMMA K slices inside BK
+      nvcuda::wmma::load_matrix_sync(  // tk: warp load A
+          a_frag, &As[(warp_m * TK_WM) * BK + kk], BK);  // tk: lda=BK
+      nvcuda::wmma::load_matrix_sync(  // tk: warp load B
+          b_frag, &Bs[kk * BN + warp_n * TK_WN], BN);  // tk: ldb=BN
+      nvcuda::wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);  // tk: warp MMA
+    }
+    __syncthreads();  // tk: reuse smem for next K panel
+  }
 
-__global__ void streamk_bf16_kernel(  // streamk: unified full-K / Stream-K launch
-    const sk_bf16* __restrict__ A,  // streamk: [M,K]
-    const sk_bf16* __restrict__ B,  // streamk: [K,N] = W[:n].T
-    sk_bf16* __restrict__ C,  // streamk: [M,N]
-    float* __restrict__ partials,  // streamk: workspace for split partials
-    int* __restrict__ flags,  // streamk: per-tile arrival counts
-    int M, int N, int K,  // streamk: gemm dims
-    int splits,  // streamk: K-split count (1 => full-K write)
-    int tile_stride) {  // streamk: partials middle dim (=max tiles) for shared workspace
-  const int tiles_m = (M + kBM - 1) / kBM;  // streamk: M tiles
-  const int tiles_n = (N + kBN - 1) / kBN;  // streamk: N tiles
-  const int num_tiles = tiles_m * tiles_n;  // streamk: MN tile count
-  const int work = num_tiles * splits;  // streamk: total stream-k work items
-  const int tid = threadIdx.x;  // streamk: linear tid
-  const int warp = tid >> 5;  // streamk: warp id
-  const int lane = tid & 31;  // streamk: lane id
+  nvcuda::wmma::store_matrix_sync(  // tk: dump warp C to smem
+      &Cs[(warp_m * TK_WM) * BN + warp_n * TK_WN], c_frag, BN, nvcuda::wmma::mem_row_major);  // tk: row-major
+  __syncthreads();  // tk: all warps wrote C
+  for (int i = tid; i < BM * BN; i += NTHREADS) {  // tk: guarded global store
+    int r = i / BN, c = i % BN;  // tk: tile coords
+    int gm = block_m + r, gn = block_n + c;  // tk: global C idx
+    if (gm < M && gn < N) C[(size_t)gm * N + gn] = __float2bfloat16(Cs[i]);  // tk: bf16 out
+  }
+}
 
-  __shared__ sk_bf16 As[16 * 16];  // streamk: A panel smem
-  __shared__ sk_bf16 Bs[kWarps * 16 * 16];  // streamk: per-warp B panels
-  __shared__ float Cs[kWarps * 16 * 16];  // streamk: per-warp acc stage
+template <int BM, int BN, int BK>
+void launch_tk_gemm(bf16_t* C, const bf16_t* A, const bf16_t* B, int M, int N, int K, cudaStream_t stream) {  // tk: host launch helper
+  dim3 block((BM / TK_WM) * (BN / TK_WN) * 32);  // tk: one thread per lane of tile warps
+  dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);  // tk: CTA grid over N x M
+  tk_bf16_gemm_wmma_kernel<BM, BN, BK><<<grid, block, 0, stream>>>(C, A, B, M, N, K);  // tk: fire kernel
+}
 
-  for (int wid = static_cast<int>(blockIdx.x); wid < work; wid += static_cast<int>(gridDim.x)) {  // streamk: grid-stride work
-    const int tile = wid / splits;  // streamk: MN tile index
-    const int split = wid - tile * splits;  // streamk: K-split index
-    const int tm = tile / tiles_n;  // streamk: tile m
-    const int tn = tile - tm * tiles_n;  // streamk: tile n
-    const int m0 = tm * kBM;  // streamk: m origin
-    const int n0 = tn * kBN;  // streamk: n origin
-    const int nw = n0 + warp * 16;  // streamk: warp n origin
-
-    const int k_iters = (K + kBK - 1) / kBK;  // streamk: K iterations
-    const int iters_per = (k_iters + splits - 1) / splits;  // streamk: iters per split
-    const int it0 = split * iters_per;  // streamk: split start
-    const int it1 = min(it0 + iters_per, k_iters);  // streamk: split end
-
-    ns::fragment<ns::matrix_a, 16, 16, 16, sk_bf16, ns::row_major> a_frag;  // streamk: A frag
-    ns::fragment<ns::matrix_b, 16, 16, 16, sk_bf16, ns::row_major> b_frag;  // streamk: B frag
-    ns::fragment<ns::accumulator, 16, 16, 16, float> c_frag;  // streamk: fp32 acc
-    ns::fill_fragment(c_frag, 0.f);  // streamk: clear acc
-
-    const bool active = (m0 < M) && (nw < N);  // streamk: skip OOB warps
-    for (int it = it0; it < it1; ++it) {  // streamk: K mainloop for this split
-      const int kk = it * kBK;  // streamk: k origin
-      load_a_panel(As, A, M, K, m0, kk, tid);  // streamk: stage A
-      __syncthreads();  // streamk: A visible
-      if (active) {  // streamk: compute path
-        ns::load_matrix_sync(a_frag, As, 16);  // streamk: A -> frag
-        load_b_panel(Bs + warp * 16 * 16, B, N, K, nw, kk, lane);  // streamk: stage B
-        __syncwarp();  // streamk: B visible in warp
-        ns::load_matrix_sync(b_frag, Bs + warp * 16 * 16, 16);  // streamk: B -> frag
-        ns::mma_sync(c_frag, a_frag, b_frag, c_frag);  // streamk: WMMA mma
-      }  // streamk: end active
-      __syncthreads();  // streamk: next iter barrier
-    }  // streamk: end K loop
-    if (active) {  // streamk: stage acc to smem
-      ns::store_matrix_sync(Cs + warp * 16 * 16, c_frag, 16, ns::mem_row_major);  // streamk: acc -> Cs
-    }  // streamk: end store
-    __syncthreads();  // streamk: Cs ready for write/reduce
-
-    if (splits == 1) {  // streamk: full-K path — direct C write
-      if (m0 < M && nw < N) {  // streamk: bounds
-        const float* sp = Cs + warp * 16 * 16;  // streamk: warp acc
-        for (int i = lane; i < 16 * 16; i += 32) {  // streamk: coop store
-          const int r = i >> 4;  // streamk: r
-          const int c = i & 15;  // streamk: c
-          const int mr = m0 + r;  // streamk: global m
-          const int nc = nw + c;  // streamk: global n
-          if (mr < M && nc < N) {  // streamk: edge guard
-            C[static_cast<size_t>(mr) * N + nc] = sk_f32_bf16(sp[i]);  // streamk: write C
-          }  // streamk: end guard
-        }  // streamk: end store loop
-      }  // streamk: end bounds
-    } else {  // streamk: fused reduce path — avoid host splitKreduce
-      float* part = partials + (static_cast<size_t>(split) * tile_stride + tile) * (kBM * kBN);  // streamk: partial slot (max-stride)
-      if (m0 < M && nw < N) {  // streamk: write partial
-        const float* sp = Cs + warp * 16 * 16;  // streamk: warp acc
-        for (int i = lane; i < 16 * 16; i += 32) {  // streamk: coop partial store
-          const int r = i >> 4;  // streamk: r
-          const int c = i & 15;  // streamk: c
-          part[r * kBN + warp * 16 + c] =  // streamk: layout [BM,BN]
-              (m0 + r < M && nw + c < N) ? sp[i] : 0.f;  // streamk: zero pad
-        }  // streamk: end partial store
-      }  // streamk: end partial write
-      __syncthreads();  // streamk: partials settled in-block
-      if (tid == 0) {  // streamk: one thread reduces when last split arrives
-        __threadfence();  // streamk: publish partials before arrival flag (cross-block)
-        const int old = atomicAdd(flags + tile, 1);  // streamk: arrival count
-        if (old == splits - 1) {  // streamk: last split does fused reduce
-          for (int r = 0; r < kBM; ++r) {  // streamk: reduce rows
-            const int mr = m0 + r;  // streamk: global m
-            if (mr >= M) break;  // streamk: m edge
-            for (int c = 0; c < kBN; ++c) {  // streamk: reduce cols
-              const int nc = n0 + c;  // streamk: global n
-              if (nc >= N) break;  // streamk: n edge
-              float sum = 0.f;  // streamk: acc
-              for (int s = 0; s < splits; ++s) {  // streamk: sum splits
-                sum += partials[(static_cast<size_t>(s) * tile_stride + tile) * (kBM * kBN)  // streamk: max-stride idx
-                                + r * kBN + c];  // streamk: element
-              }  // streamk: end sum
-              C[static_cast<size_t>(mr) * N + nc] = sk_f32_bf16(sum);  // streamk: write reduced C
-            }  // streamk: end c
-          }  // streamk: end r
-        }  // streamk: end last-split
-      }  // streamk: end tid0
-      __syncthreads();  // streamk: before next work item
-    }  // streamk: end split branch
-  }  // streamk: end grid-stride
-}  // streamk: end kernel
-
-void streamk_bf16(  // streamk: host launch
-    torch::Tensor A,  // streamk: [M,K]
-    torch::Tensor B,  // streamk: [K,N]
-    torch::Tensor C,  // streamk: [M,N]
-    torch::Tensor partials,  // streamk: workspace
-    torch::Tensor flags,  // streamk: flags
-    int64_t splits,  // streamk: split count
-    int64_t tile_stride) {  // streamk: partials stride (=max tiles)
-  TORCH_CHECK(A.is_cuda() && B.is_cuda() && C.is_cuda());  // streamk: device check
-  const int M = A.size(0);  // streamk: M
-  const int K = A.size(1);  // streamk: K
-  const int N = B.size(1);  // streamk: N
-  TORCH_CHECK(B.size(0) == K);  // streamk: K match
-  TORCH_CHECK(K % 16 == 0);  // streamk: WMMA K align
-  const int sp = static_cast<int>(splits);  // streamk: splits
-  TORCH_CHECK(sp >= 1);  // streamk: valid splits
-  const int tstride = static_cast<int>(tile_stride);  // streamk: workspace stride
-  TORCH_CHECK(tstride >= 1 || sp == 1);  // streamk: stride unused when full-K
-
-  const int tiles_m = (M + kBM - 1) / kBM;  // streamk: tiles m
-  const int tiles_n = (N + kBN - 1) / kBN;  // streamk: tiles n
-  const int num_tiles = tiles_m * tiles_n;  // streamk: MN tiles
-  const int work = num_tiles * sp;  // streamk: work items
-
-  cudaDeviceProp prop{};  // streamk: query SMs for grid
-  cudaGetDeviceProperties(&prop, A.get_device());  // streamk: device props
-  int grid = std::min(work, std::max(1, prop.multiProcessorCount * 2));  // streamk: occupancy ~2 blocks/SM
-
-  auto stream = at::cuda::getCurrentCUDAStream();  // streamk: current stream (graph-safe)
-  streamk_bf16_kernel<<<grid, kThreads, 0, stream>>>(  // streamk: one launch
-      reinterpret_cast<const sk_bf16*>(A.data_ptr()),  // streamk: A
-      reinterpret_cast<const sk_bf16*>(B.data_ptr()),  // streamk: B
-      reinterpret_cast<sk_bf16*>(C.data_ptr()),  // streamk: C
-      partials.data_ptr<float>(),  // streamk: partials
-      flags.data_ptr<int>(),  // streamk: flags
-      M, N, K, sp, tstride);  // streamk: dims + splits + stride
-}  // streamk: end host
+void tk_bf16_gemm(torch::Tensor x, torch::Tensor wt, torch::Tensor out, int bm, int bn, int bk) {  // tk: torch binding
+  TORCH_CHECK(x.is_cuda() && wt.is_cuda() && out.is_cuda());  // tk: device check
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && wt.scalar_type() == at::kBFloat16);  // tk: bf16 only
+  TORCH_CHECK(x.dim() == 2 && wt.dim() == 2 && out.dim() == 2);  // tk: rank-2 GEMM
+  const int M = x.size(0), K = x.size(1), N = wt.size(1);  // tk: shapes
+  TORCH_CHECK(wt.size(0) == K && out.size(0) == M && out.size(1) == N);  // tk: match dims
+  TORCH_CHECK(x.is_contiguous() && wt.is_contiguous() && out.is_contiguous());  // tk: contig loads
+  auto* Ap = reinterpret_cast<const bf16_t*>(x.data_ptr());  // tk: A ptr
+  auto* Bp = reinterpret_cast<const bf16_t*>(wt.data_ptr());  // tk: B=W.T ptr
+  auto* Cp = reinterpret_cast<bf16_t*>(out.data_ptr());  // tk: C ptr
+  auto stream = at::cuda::getCurrentCUDAStream();  // tk: current stream
+  // tk: instantiate tile plan combos used by Muse thin-m
+  if (bm == 16 && bn == 128 && bk == 64) { launch_tk_gemm<16, 128, 64>(Cp, Ap, Bp, M, N, K, stream); return; }  // tk: M16 tile
+  if (bm == 32 && bn == 128 && bk == 64) { launch_tk_gemm<32, 128, 64>(Cp, Ap, Bp, M, N, K, stream); return; }  // tk: M32 tile
+  TORCH_CHECK(false, "tk_bf16_gemm: unsupported tile BM=", bm, " BN=", bn, " BK=", bk);  // tk: refuse unknown
+}
 """
 
 _CPP_DECL = r"""
 void hopper_bf16_gemv(torch::Tensor x, torch::Tensor w, torch::Tensor out, bool use_pdl);
-void streamk_bf16(torch::Tensor A, torch::Tensor B, torch::Tensor C,  // streamk: decl
-                  torch::Tensor partials, torch::Tensor flags, int64_t splits,  // streamk: workspace
-                  int64_t tile_stride);  // streamk: max-tiles stride
+void tk_bf16_gemm(torch::Tensor x, torch::Tensor wt, torch::Tensor out, int bm, int bn, int bk);  // tk: export TK GEMM
 """
 
 
@@ -478,43 +389,22 @@ def _align16(t: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _choose_splits(m: int, n: int, k: int, sms: int) -> int:  # streamk: splits heuristic
-    tiles = ((m + BM - 1) // BM) * ((n + BN - 1) // BN)  # streamk: MN tiles
-    k_iters = (k + BK - 1) // BK  # streamk: K iters
-    if tiles >= sms or m >= 64:  # streamk: enough MN parallelism → full-K
-        return 1  # streamk: no partials
-    target = sms * 2  # streamk: aim ~2 blocks/SM
-    sp = (target + tiles - 1) // tiles  # streamk: splits to fill SMs
-    return max(1, min(k_iters, sp, 32))  # streamk: clamp splits
-
-
-def _use_streamk(layer: str, m: int) -> bool:  # streamk: allow-list gate
-    return m in _STREAMK_ALLOW.get(layer, ())  # streamk: dispatch
-
-
-def _out_n(layer: str, m: int, n_full: int) -> int:  # streamk: unpooler slice at m<=8
-    if layer == "unpooler" and m <= 8:  # streamk: match reference out_features
-        return 1024  # streamk: sliced N
-    return n_full  # streamk: full N
-
-
 def _build_ext(device: torch.device):
     major, minor = torch.cuda.get_device_capability(device)
     arch = f"sm_{major}{minor}"
-    gencode = f"-gencode=arch=compute_{major}{minor},code={arch}"
-    build_dir = Path.home() / ".cache" / "muse_bf16_impl_i_streamk" / arch  # streamk: isolate build cache
+    build_dir = Path.home() / ".cache" / "muse_bf16_tk_j" / arch  # tk: separate cache from G
     build_dir.mkdir(parents=True, exist_ok=True)
     return load_inline(
-        name=f"muse_bf16_impl_i_streamk_{arch}",  # streamk: distinct ext name
+        name=f"muse_bf16_tk_j_{arch}",  # tk: unique ext name for J
         cpp_sources=[_CPP_DECL],
         cuda_sources=[_CUDA_SRC],
-        functions=["hopper_bf16_gemv", "streamk_bf16"],  # streamk: export Stream-K + G gemv
+        functions=["hopper_bf16_gemv", "tk_bf16_gemm"],  # tk: export both kernels
         extra_cuda_cflags=[
             "-O3",
             "--use_fast_math",
-            "-std=c++20",
+            "-std=c++20",  # tk: judge ATen requires C++20 (c++17 failed okc setup)
+            f"-arch={arch}",  # tk: real SASS arch so HMMA emits
             "--expt-relaxed-constexpr",
-            gencode,
         ],
         build_directory=str(build_dir),
         verbose=False,
@@ -540,6 +430,10 @@ def _probe_mm_bf16_backend(device: torch.device) -> str | None:
     return None
 
 
+def _tk_tile_for(layer: str, m: int) -> tuple[int, int, int]:  # tk: plan lookup
+    return TK_TILE_PLAN[(layer, m)]  # tk: exact allow-list key
+
+
 def prepare(weights: Weights) -> dict[str, Any]:
     state: dict[str, Any] = {
         name: _align16(w.contiguous()) for name, w in weights.items()
@@ -557,11 +451,8 @@ def prepare(weights: Weights) -> dict[str, Any]:
     state["use_pdl"] = False
     state["mm_backend"] = None
     state["mm_bf16"] = None
-    state["sk_splits"] = {}  # streamk: per (layer,m) split plan
-    state["sk_out"] = {}  # streamk: prealloc outs (graph-safe)
-    state["sk_B"] = {}  # streamk: contiguous B=W[:n].T (slice of _t may be non-contig)
-    state["sk_partials"] = None  # streamk: max-size partials workspace
-    state["sk_flags"] = None  # streamk: max-size flags workspace
+    state["tk_tile_plan"] = TK_TILE_PLAN  # tk: expose tile plan in state
+    state["unpooler_t_1024"] = state["unpooler_t"][:, :1024].contiguous()  # tk: contig B for sliced N
     if device.type == "cuda":
         major, _ = torch.cuda.get_device_capability(device)
         state["use_pdl"] = major >= 9
@@ -571,57 +462,18 @@ def prepare(weights: Weights) -> dict[str, Any]:
             from flashinfer.gemm import mm_bf16
 
             state["mm_bf16"] = mm_bf16
-
-        sms = torch.cuda.get_device_properties(device).multi_processor_count  # streamk: for splits
-        max_sp, max_tiles = 1, 0  # streamk: workspace bounds
-        for layer, ms in _STREAMK_ALLOW.items():  # streamk: plan each allow-list shape
-            n_full = state[layer].shape[0]  # streamk: full N
-            k = state[layer].shape[1]  # streamk: K
-            for m in ms:  # streamk: per-m splits
-                n = _out_n(layer, m, n_full)  # streamk: effective N
-                sp = _choose_splits(m, n, k, sms)  # streamk: choose splits
-                key = (layer, m)  # streamk: key
-                state["sk_splits"][key] = sp  # streamk: store splits
-                state["sk_out"][key] = torch.empty(  # streamk: prealloc out
-                    (m, n), device=device, dtype=torch.bfloat16  # streamk: graph-safe buffer
-                )  # streamk: end out alloc
-                bkey = (layer, n)  # streamk: pack B once per (layer,n)
-                if bkey not in state["sk_B"]:  # streamk: avoid duplicate packs
-                    state["sk_B"][bkey] = state[f"{layer}_t"][:, :n].contiguous()  # streamk: force contig for kernel
-                state["sk_B"][key] = state["sk_B"][bkey]  # streamk: alias by (layer,m)
-                tiles = ((m + BM - 1) // BM) * ((n + BN - 1) // BN)  # streamk: tile count
-                max_sp = max(max_sp, sp)  # streamk: max splits
-                max_tiles = max(max_tiles, tiles)  # streamk: max tiles
-        if max_tiles > 0:  # streamk: alloc once at max size
-            state["sk_partials"] = torch.empty(  # streamk: partials workspace
-                (max_sp, max_tiles, BM * BN), device=device, dtype=torch.float32  # streamk: [sp,tiles,BM*BN]
-            )  # streamk: end partials
-            state["sk_flags"] = torch.zeros(  # streamk: flags workspace
-                (max_tiles,), device=device, dtype=torch.int32  # streamk: one flag/tile
-            )  # streamk: end flags
-            state["sk_tile_stride"] = max_tiles  # streamk: middle-dim stride for shared buf
-        # streamk: optional warm launch (untimed prepare)
-        ext = state["ext"]
-        if ext is not None and state["sk_partials"] is not None:  # streamk: warm path
-            for layer, m in (("qkv_gate", 8), ("pooler", 16), ("unpooler", 8)):  # streamk: sample warm incl sliced N
-                key = (layer, m)  # streamk: key
-                if key not in state["sk_out"]:  # streamk: skip missing
-                    continue  # streamk: continue
-                k = state[layer].shape[1]  # streamk: K
-                x = torch.zeros((m, k), device=device, dtype=torch.bfloat16)  # streamk: dummy x
-                sp = int(state["sk_splits"][key])  # streamk: splits
-                if sp > 1:  # streamk: reset flags for fused reduce
-                    state["sk_flags"].zero_()  # streamk: clear flags
-                ext.streamk_bf16(  # streamk: warm launch
-                    x,  # streamk: A
-                    state["sk_B"][key],  # streamk: contig B
-                    state["sk_out"][key],  # streamk: C
-                    state["sk_partials"],  # streamk: partials
-                    state["sk_flags"],  # streamk: flags
-                    sp,  # streamk: splits
-                    int(state["sk_tile_stride"]),  # streamk: max-tiles stride
-                )  # streamk: end warm
-            torch.cuda.synchronize(device)  # streamk: settle JIT (prepare only)
+        # tk: warm TK kernels so first graph capture is cold-free
+        ext = state["ext"]  # tk: compiled ext
+        if ext is not None:  # tk: only when CUDA ext built
+            for layer, m in TK_TILE_PLAN:  # tk: each allow-listed shape
+                W = state[layer]  # tk: weight rows
+                n = 1024 if (layer == "unpooler" and m <= ROUTER_FP32_MAX_TOKENS) else W.shape[0]  # tk: unpool slice
+                bm, bn, bk = _tk_tile_for(layer, m)  # tk: tile from plan
+                x = torch.zeros((m, W.shape[1]), dtype=torch.bfloat16, device=device)  # tk: warm A
+                out = torch.empty((m, n), dtype=torch.bfloat16, device=device)  # tk: warm C
+                wt = state["unpooler_t_1024"] if (layer == "unpooler" and n == 1024) else state[f"{layer}_t"][:, :n]  # tk: contig B
+                ext.tk_bf16_gemm(x, wt, out, bm, bn, bk)  # tk: warm launch
+            torch.cuda.synchronize(device)  # tk: finish warm
     return state
 
 
@@ -651,27 +503,15 @@ def kernel_fn(data: Inputs, state: dict[str, Any]) -> torch.Tensor:
         ext.hopper_bf16_gemv(x1, W, out, bool(state["use_pdl"]))
         return out.view(*x.shape[:-1], -1)
 
-    if (  # streamk: Stream-K dispatch before FI
-        ext is not None  # streamk: ext ready
-        and _use_streamk(layer, m)  # streamk: allow-list
-        and state["sk_partials"] is not None  # streamk: workspace ready
-    ):  # streamk: enter Stream-K
-        key = (layer, m)  # streamk: lookup key
-        out = state["sk_out"][key]  # streamk: prealloc out (no alloc in kernel_fn)
-        sp = int(state["sk_splits"][key])  # streamk: planned splits
-        x2 = x.view(-1, x.shape[-1])  # streamk: [M,K]
-        if sp > 1:  # streamk: fused reduce needs clear flags (async, no host sync)
-            state["sk_flags"].zero_()  # streamk: reset arrivals
-        ext.streamk_bf16(  # streamk: one launch
-            x2,  # streamk: A
-            state["sk_B"][key],  # streamk: contig B from prepare
-            out,  # streamk: C
-            state["sk_partials"],  # streamk: max-size partials
-            state["sk_flags"],  # streamk: max-size flags
-            sp,  # streamk: splits
-            int(state["sk_tile_stride"]),  # streamk: workspace stride
-        )  # streamk: end launch
-        return out.view(*x.shape[:-1], n)  # streamk: reshape like input batching
+    # tk: thin-m TK GEMM disabled (TK_THIN_M empty); kernel still compiled for future WGMMA.
+    # tk: was: if ext and layer in TK_LAYERS and m in {8,16,32}: tk_bf16_gemm(...(16|32),128,64)
+    if ext is not None and layer in TK_LAYERS and m in TK_THIN_M:  # tk: dead until WGMMA plan refilled
+        bm, bn, bk = _tk_tile_for(layer, m)  # tk: tile plan
+        x2 = _align16(x.view(-1, x.shape[-1]).contiguous())  # tk: contig A
+        wt = state["unpooler_t_1024"] if (layer == "unpooler" and n == 1024) else state[f"{layer}_t"][:, :n]  # tk: contig B
+        out = torch.empty((x2.shape[0], n), dtype=x.dtype, device=x.device)  # tk: alloc C (graph-safe shape)
+        ext.tk_bf16_gemm(x2, wt, out, int(bm), int(bn), int(bk))  # tk: single-launch full-K (unused)
+        return out.view(*x.shape[:-1], n)  # tk: restore leading dims
 
     mm = state["mm_bf16"]
     backend = state["mm_backend"]
