@@ -1,9 +1,9 @@
 # okc: problem=muse_bf16_proj
-"""l-m8-gate: keep the m<=8 FP32 router, drop the paths that sank the geomean.
+"""l-m16-qkv: m=16 FP32 router, and qkv m=16/32 no-split only when a replay wins.
 
-Custom router only for m<=8 (verify-1 2.9x). m>8 is the baseline hi/lo nvjet pair.
-No cublasLt SPLITK_NUM<=1 dispatch (pooler 32x64 tile was 0.63x). qkv m=1 GEMV unroll
-is 2 again. Unpooler m=1 N=1024 split-K stays. No WGMMA in this file.
+Custom router for m<=8 and m==16 (m=16 was 1.14x; m>=32 stays hi/lo). qkv no-split
+is graph-timed against torch.mm in prepare and kept only when it is strictly faster.
+Pooler stays on nvjet. qkv m=1 GEMV unroll is 2. Unpooler m=1 split-K stays.
 """
 
 from __future__ import annotations
@@ -95,16 +95,54 @@ __device__ __forceinline__ void PDLTriggerSecondary() {
 // ---- from sglang hopper_bf16_gemv.cuh ----
 constexpr uint32_t kGemvVecSize = 16 / sizeof(bf16_t);  // 8 bf16 per 16B load
 
-__device__ __forceinline__ float dot8_f32(const float4 wv, const float4 xv) {
-  const bf16x2_t* w2 = reinterpret_cast<const bf16x2_t*>(&wv);
-  const bf16x2_t* x2 = reinterpret_cast<const bf16x2_t*>(&xv);
-  float acc = 0.0f;
+// .cg: L2 resident, L1 bypass. __ldcs is evict-first and drops W before the next graph replay.
+__device__ __forceinline__ float4 ldg16_cg(const void* p) {
+  float4 r;
+  asm volatile("ld.global.cg.v4.f32 {%0, %1, %2, %3}, [%4];\n"
+               : "=f"(r.x), "=f"(r.y), "=f"(r.z), "=f"(r.w)
+               : "l"(p));
+  return r;
+}
+
+__device__ __forceinline__ float4 lds16(const void* p) {
+  float4 r;
+  unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(p));
+  asm volatile("ld.shared.v4.f32 {%0, %1, %2, %3}, [%4];\n"
+               : "=f"(r.x), "=f"(r.y), "=f"(r.z), "=f"(r.w)
+               : "r"(addr));
+  return r;
+}
+
+__device__ __forceinline__ void sts16(void* p, float4 v) {
+  unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(p));
+  asm volatile("st.shared.v4.f32 [%0], {%1, %2, %3, %4};\n" ::"r"(addr), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w));
+}
+
+__device__ __forceinline__ float2 cvt_bf16x2(unsigned v) {
+  float a, b;
+  asm volatile("{\n\t.reg .b16 lo, hi;\n\tmov.b32 {lo, hi}, %2;\n\t"
+               "cvt.rn.f32.bf16 %0, lo;\n\tcvt.rn.f32.bf16 %1, hi;\n\t}\n"
+               : "=f"(a), "=f"(b)
+               : "r"(v));
+  return float2{a, b};
+}
+
+__device__ __forceinline__ float fma_rn(float a, float b, float c) {
+  float d;
+  asm volatile("fma.rn.f32 %0, %1, %2, %3;\n" : "=f"(d) : "f"(a), "f"(b), "f"(c));
+  return d;
+}
+
+__device__ __forceinline__ float dot8_f32(float4 wv, float4 xv) {
+  unsigned w[4] = {__float_as_uint(wv.x), __float_as_uint(wv.y), __float_as_uint(wv.z), __float_as_uint(wv.w)};
+  unsigned x[4] = {__float_as_uint(xv.x), __float_as_uint(xv.y), __float_as_uint(xv.z), __float_as_uint(xv.w)};
+  float acc = 0.f;
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
-    const auto [w0, w1] = cast<fp32x2_t>(w2[i]);
-    const auto [x0, x1] = cast<fp32x2_t>(x2[i]);
-    acc = fmaf(w0, x0, acc);
-    acc = fmaf(w1, x1, acc);
+    float2 wf = cvt_bf16x2(w[i]);
+    float2 xf = cvt_bf16x2(x[i]);
+    acc = fma_rn(wf.x, xf.x, acc);
+    acc = fma_rn(wf.y, xf.y, acc);
   }
   return acc;
 }
@@ -112,13 +150,13 @@ __device__ __forceinline__ float dot8_f32(const float4 wv, const float4 xv) {
 template <uint32_t N, uint32_t K, uint32_t kRows, uint32_t kUnroll, uint32_t kNumWarps, bool kUsePDL>
 __global__ void __launch_bounds__(kNumWarps * 32)
     hopper_bf16_gemv_kernel(bf16_t* __restrict__ out, const bf16_t* __restrict__ x, const bf16_t* __restrict__ w) {
-  __shared__ bf16_t sx[K];
+  __shared__ __align__(16) bf16_t sx[K];
 
   PDLTriggerSecondary<kUsePDL>();
   const uint32_t tid = threadIdx.x;
   PDLWaitPrimary<kUsePDL>();
   for (uint32_t i = tid * kGemvVecSize; i < K; i += kNumWarps * 32 * kGemvVecSize) {
-    *reinterpret_cast<float4*>(sx + i) = *reinterpret_cast<const float4*>(x + i);
+    sts16(sx + i, ldg16_cg(x + i));
   }
   __syncthreads();
 
@@ -140,20 +178,13 @@ __global__ void __launch_bounds__(kNumWarps * 32)
     for (uint32_t k = lane * kGemvVecSize * kUnroll; k < K; k += kStep) {
       float4 xv[kUnroll];
 #pragma unroll
-      for (uint32_t u = 0; u < kUnroll; ++u) {
-        xv[u] = *reinterpret_cast<const float4*>(sx + k + u * kGemvVecSize);
-      }
+      for (uint32_t u = 0; u < kUnroll; ++u) xv[u] = lds16(sx + k + u * kGemvVecSize);
 #pragma unroll
       for (uint32_t r = 0; r < kRows; ++r) {
         const bf16_t* wr = w + static_cast<size_t>(r0 + r) * K + k;
-        float4 wv[kUnroll];
 #pragma unroll
         for (uint32_t u = 0; u < kUnroll; ++u) {
-          wv[u] = __ldcs(reinterpret_cast<const float4*>(wr + u * kGemvVecSize));
-        }
-#pragma unroll
-        for (uint32_t u = 0; u < kUnroll; ++u) {
-          acc[r] += dot8_f32(wv[u], xv[u]);
+          acc[r] += dot8_f32(ldg16_cg(wr + u * kGemvVecSize), xv[u]);
         }
       }
     }
@@ -165,9 +196,7 @@ __global__ void __launch_bounds__(kNumWarps * 32)
           const bf16_t* wr = w + static_cast<size_t>(r0 + r) * K + k;
 #pragma unroll
           for (uint32_t u = 0; u < kUnroll; ++u) {
-            float4 wv = __ldcs(reinterpret_cast<const float4*>(wr + u * kGemvVecSize));
-            float4 xv = *reinterpret_cast<const float4*>(sx + k + u * kGemvVecSize);
-            acc[r] += dot8_f32(wv, xv);
+            acc[r] += dot8_f32(ldg16_cg(wr + u * kGemvVecSize), lds16(sx + k + u * kGemvVecSize));
           }
         }
       }
@@ -381,7 +410,7 @@ __global__ void __launch_bounds__(kRouterWarps * 32)
   float4* srow4 = reinterpret_cast<float4*>(sw + warp * kRouterKChunk);
   float4 wreg[kVecIters];
 #pragma unroll
-  for (int s = 0; s < kVecIters; ++s) wreg[s] = __ldcs(wrow4 + lane + s * 32);
+  for (int s = 0; s < kVecIters; ++s) wreg[s] = ldg16_cg(wrow4 + lane + s * 32);
 #pragma unroll
   for (int s = 0; s < kVecIters; ++s) srow4[lane + s * 32] = wreg[s];
   __syncthreads();
@@ -407,13 +436,13 @@ __global__ void __launch_bounds__(kRouterWarps * 32)
       int kk = v * 4;
 #pragma unroll
       for (int t = 0; t < BM; ++t) {
-        const bf16x2_t* xp = reinterpret_cast<const bf16x2_t*>(sx + t * kRouterKChunk + kk);
-        float2 a = __bfloat1622float2(xp[0]);
-        float2 b = __bfloat1622float2(xp[1]);
-        acc[t] = __fmaf_rn(wv.x, a.x, acc[t]);
-        acc[t] = __fmaf_rn(wv.y, a.y, acc[t]);
-        acc[t] = __fmaf_rn(wv.z, b.x, acc[t]);
-        acc[t] = __fmaf_rn(wv.w, b.y, acc[t]);
+        const unsigned* xp = reinterpret_cast<const unsigned*>(sx + t * kRouterKChunk + kk);
+        float2 a = cvt_bf16x2(xp[0]);
+        float2 b = cvt_bf16x2(xp[1]);
+        acc[t] = fma_rn(wv.x, a.x, acc[t]);
+        acc[t] = fma_rn(wv.y, a.y, acc[t]);
+        acc[t] = fma_rn(wv.z, b.x, acc[t]);
+        acc[t] = fma_rn(wv.w, b.y, acc[t]);
       }
     }
 #pragma unroll
@@ -458,7 +487,7 @@ void router_fp32_splitk(torch::Tensor x, torch::Tensor w, torch::Tensor partial,
   const int K = static_cast<int>(x.size(1));
   const int N = static_cast<int>(w.size(0));
   TORCH_CHECK(N == kRouterN && K == kRouterK && w.size(1) == K);
-  TORCH_CHECK(M >= 1 && M <= 8);  // l-m8-gate: scalar FP32 is the wrong machine past m=8
+  TORCH_CHECK((M >= 1 && M <= 8) || M == 16);
   TORCH_CHECK(out.size(0) == M && out.size(1) == N);
   TORCH_CHECK(partial.numel() >= static_cast<int64_t>(kRouterSplits) * M * N);
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -475,12 +504,12 @@ template <uint32_t N, uint32_t K, uint32_t SPLITS, uint32_t kRows, uint32_t kUnr
 __global__ void __launch_bounds__(kNumWarps * 32)
     gemv_splitk_kernel(float* __restrict__ partial, const bf16_t* __restrict__ x, const bf16_t* __restrict__ w) {
   constexpr uint32_t KCHUNK = K / SPLITS;
-  __shared__ bf16_t sx[KCHUNK];
+  __shared__ __align__(16) bf16_t sx[KCHUNK];
   const uint32_t split = blockIdx.y;
   const uint32_t k0 = split * KCHUNK;
   const uint32_t tid = threadIdx.x;
   for (uint32_t i = tid * kGemvVecSize; i < KCHUNK; i += kNumWarps * 32 * kGemvVecSize) {
-    *reinterpret_cast<float4*>(sx + i) = *reinterpret_cast<const float4*>(x + k0 + i);
+    sts16(sx + i, ldg16_cg(x + k0 + i));
   }
   __syncthreads();
 
@@ -497,16 +526,12 @@ __global__ void __launch_bounds__(kNumWarps * 32)
   for (uint32_t k = lane * kGemvVecSize * kUnroll; k < KCHUNK; k += kStep) {
     float4 xv[kUnroll];
 #pragma unroll
-    for (uint32_t u = 0; u < kUnroll; ++u) xv[u] = *reinterpret_cast<const float4*>(sx + k + u * kGemvVecSize);
+    for (uint32_t u = 0; u < kUnroll; ++u) xv[u] = lds16(sx + k + u * kGemvVecSize);
 #pragma unroll
     for (uint32_t r = 0; r < kRows; ++r) {
       const bf16_t* wr = w + static_cast<size_t>(r0 + r) * K + k0 + k;
-      float4 wv[kUnroll];
 #pragma unroll
-      for (uint32_t u = 0; u < kUnroll; ++u)
-        wv[u] = __ldcs(reinterpret_cast<const float4*>(wr + u * kGemvVecSize));
-#pragma unroll
-      for (uint32_t u = 0; u < kUnroll; ++u) acc[r] += dot8_f32(wv[u], xv[u]);
+      for (uint32_t u = 0; u < kUnroll; ++u) acc[r] += dot8_f32(ldg16_cg(wr + u * kGemvVecSize), xv[u]);
     }
   }
 #pragma unroll
@@ -643,6 +668,31 @@ def _probe_mm_bf16_backend(device: torch.device) -> str | None:
     return None
 
 
+def _graph_median_ms(fn) -> float | None:
+    try:
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            fn()
+            fn()
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            fn()
+        start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+        samples = []
+        for _ in range(7):
+            start.record()
+            graph.replay()
+            end.record()
+            end.synchronize()
+            samples.append(start.elapsed_time(end))
+        samples.sort()
+        return samples[len(samples) // 2]
+    except Exception:
+        return None
+
+
 def prepare(weights: Weights) -> dict[str, Any]:
     state: dict[str, Any] = {
         name: _align16(w.contiguous()) for name, w in weights.items()
@@ -662,6 +712,8 @@ def prepare(weights: Weights) -> dict[str, Any]:
     state["mm_bf16"] = None
     state["router_partial"] = None
     state["gemv_partial"] = None
+    state["nosplit_qkv"] = set()
+    state["nosplit_ws"] = None
     state["cutlass_inc"] = _find_cutlass_include()
     if device.type == "cuda":
         major, _ = torch.cuda.get_device_capability(device)
@@ -679,6 +731,24 @@ def prepare(weights: Weights) -> dict[str, Any]:
         if ext is not None:
             state["router_partial"] = torch.empty(8 * 1024 * 256, dtype=torch.float32, device=device)
             state["gemv_partial"] = torch.empty(4 * 1024, dtype=torch.float32, device=device)
+            Wt = state["qkv_gate_t"]
+            k, n = Wt.shape
+            picks = [(m, int(ext.bf16_mm_pick_nosplit(m, n, k))) for m in (16, 32)]
+            picks = [(m, ws) for m, ws in picks if ws >= 0]
+            if picks:
+                buf = torch.empty(max(ws for _, ws in picks), dtype=torch.uint8, device=device)
+                kept = set()
+                for m, _ws in picks:
+                    xw = torch.randn(m, k, dtype=torch.bfloat16, device=device)
+                    ref = torch.empty(m, n, dtype=torch.bfloat16, device=device)
+                    alt = torch.empty(m, n, dtype=torch.bfloat16, device=device)
+                    ref_us = _graph_median_ms(lambda: torch.mm(xw, Wt, out=ref))
+                    alt_us = _graph_median_ms(lambda: ext.bf16_mm_run_nosplit(xw, Wt, alt, buf))
+                    if ref_us is not None and alt_us is not None and alt_us < ref_us:
+                        kept.add(m)
+                if kept:
+                    state["nosplit_qkv"] = kept
+                    state["nosplit_ws"] = buf
     return state
 
 
@@ -687,7 +757,9 @@ def kernel_fn(data: Inputs, state: dict[str, Any]) -> torch.Tensor:
     if layer == "router":
         m = x.numel() // x.shape[-1]
         ext = state["ext"]
-        if ext is not None and state["router_partial"] is not None and 1 <= m <= ROUTER_FP32_MAX_TOKENS:
+        if ext is not None and state["router_partial"] is not None and (
+            1 <= m <= ROUTER_FP32_MAX_TOKENS or m == 16
+        ):
             x2 = _align16(x.view(m, -1))
             out = torch.empty((m, state["router"].shape[0]), dtype=torch.float32, device=x.device)
             ext.router_fp32_splitk(x2, state["router"], state["router_partial"], out)
@@ -717,6 +789,12 @@ def kernel_fn(data: Inputs, state: dict[str, Any]) -> torch.Tensor:
         else:
             ext.hopper_bf16_gemv(x1, W, out, bool(state["use_pdl"]))
         return out.view(*x.shape[:-1], -1)
+
+    if layer == "qkv_gate" and m in state["nosplit_qkv"]:
+        x2 = x.view(-1, x.shape[-1])
+        out = torch.empty(x2.shape[0], n, dtype=x.dtype, device=x.device)
+        state["ext"].bf16_mm_run_nosplit(x2, state["qkv_gate_t"][:, :n], out, state["nosplit_ws"])
+        return out.view(*x.shape[:-1], n)
 
     mm = state["mm_bf16"]
     backend = state["mm_backend"]
