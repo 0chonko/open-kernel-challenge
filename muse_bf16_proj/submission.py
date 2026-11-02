@@ -1,7 +1,8 @@
 # okc: problem=muse_bf16_proj
-"""Impl G: hopper GEMV m=1 + FlashInfer mm_bf16 (tensor-core backends) for thin-m.
+"""Impl H: G + cublasLt no-split-K algo filter for qkv/pooler m∈{16,32}.
 
-Scalar thin-m GEMV (impl D) lost ~10x vs nvjet. FlashInfer mm_bf16 for m in {8,16,32} on qkv/pooler/unpooler only (E: o m=16/32 regressed).
+CUTLASS SM90 Stream-K JIT skipped (prepare ≤300s / prior art too heavy). Keeps nvjet-class
+mainloop; picks first heuristic with SPLITK_NUM≤1 to kill splitKreduce. o stays F.linear.
 """
 
 from __future__ import annotations
@@ -18,6 +19,12 @@ ROUTER_FP32_MAX_TOKENS = 8
 # Same gates as sglang.kernels.ops.gemm.hopper_bf16_gemv
 _MAX_K = 17408
 _MAX_N = 65536
+
+# G profiles: nvjet + splitKreduce on these thin-m shapes (unpooler/o often have no reduce).
+_NOSPLIT_MS = {
+    "qkv_gate": (16, 32),
+    "pooler": (16, 32),
+}
 
 
 class Weights(TypedDict):
@@ -45,11 +52,13 @@ class Inputs(TypedDict):
 _CUDA_SRC = r"""
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <cublasLt.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <unordered_map>
 #include <utility>
 
 using bf16_t = __nv_bfloat16;
@@ -246,10 +255,114 @@ void hopper_bf16_gemv(torch::Tensor x, torch::Tensor w, torch::Tensor out, bool 
   TORCH_CHECK(false, "hopper_bf16_gemv: unsupported Muse shape N=", N, " K=", K);
 #undef DISPATCH
 }
+
+// {{cuBLASLt split-K filter}}{{Prefer SPLITK_NUM≤1 heuristics to drop splitKreduce while keeping nvjet mainloop.}}
+
+static cublasLtHandle_t g_lt = nullptr;
+
+struct NosplitEntry {
+  cublasLtMatmulDesc_t op{};
+  cublasLtMatrixLayout_t Ad{}, Bd{}, Cd{};
+  cublasLtMatmulAlgo_t algo{};
+  size_t ws = 0;
+};
+
+static std::unordered_map<uint64_t, NosplitEntry> g_nosplit;
+
+static uint64_t nosplit_key(int64_t M, int64_t N, int64_t K) {
+  return (static_cast<uint64_t>(M) << 40) | (static_cast<uint64_t>(N) << 16) | static_cast<uint64_t>(K & 0xffff);
+}
+
+static void ensure_lt() {
+  if (!g_lt) {
+    TORCH_CHECK(cublasLtCreate(&g_lt) == CUBLAS_STATUS_SUCCESS);
+  }
+}
+
+static cublasStatus_t make_row_layout(cublasLtMatrixLayout_t* layout, cudaDataType_t dt, int rows, int cols) {
+  auto st = cublasLtMatrixLayoutCreate(layout, dt, rows, cols, cols);
+  if (st != CUBLAS_STATUS_SUCCESS) return st;
+  cublasLtOrder_t ord = CUBLASLT_ORDER_ROW;
+  return cublasLtMatrixLayoutSetAttribute(*layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &ord, sizeof(ord));
+}
+
+// Returns workspace bytes (>=0) on success; -1 if no nosplit algo. Caches descs for graph-safe run.
+int64_t bf16_mm_pick_nosplit(int64_t M, int64_t N, int64_t K) {
+  ensure_lt();
+  const uint64_t key = nosplit_key(M, N, K);
+  if (g_nosplit.count(key)) {
+    return static_cast<int64_t>(g_nosplit[key].ws);
+  }
+
+  NosplitEntry e;
+  TORCH_CHECK(cublasLtMatmulDescCreate(&e.op, CUBLAS_COMPUTE_32F, CUDA_R_32F) == CUBLAS_STATUS_SUCCESS);
+  cublasOperation_t t = CUBLAS_OP_N;
+  cublasLtMatmulDescSetAttribute(e.op, CUBLASLT_MATMUL_DESC_TRANSA, &t, sizeof(t));
+  cublasLtMatmulDescSetAttribute(e.op, CUBLASLT_MATMUL_DESC_TRANSB, &t, sizeof(t));
+  TORCH_CHECK(make_row_layout(&e.Ad, CUDA_R_16BF, (int)M, (int)K) == CUBLAS_STATUS_SUCCESS);
+  TORCH_CHECK(make_row_layout(&e.Bd, CUDA_R_16BF, (int)K, (int)N) == CUBLAS_STATUS_SUCCESS);
+  TORCH_CHECK(make_row_layout(&e.Cd, CUDA_R_16BF, (int)M, (int)N) == CUBLAS_STATUS_SUCCESS);
+
+  cublasLtMatmulPreference_t pref;
+  TORCH_CHECK(cublasLtMatmulPreferenceCreate(&pref) == CUBLAS_STATUS_SUCCESS);
+  size_t ws_cap = 64ull << 20;
+  cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_cap, sizeof(ws_cap));
+
+  cublasLtMatmulHeuristicResult_t heur[64];
+  int nres = 0;
+  auto st = cublasLtMatmulAlgoGetHeuristic(g_lt, e.op, e.Ad, e.Bd, e.Cd, e.Cd, pref, 64, heur, &nres);
+  int64_t out_ws = -1;
+  if (st == CUBLAS_STATUS_SUCCESS) {
+    for (int i = 0; i < nres; ++i) {
+      if (heur[i].state != CUBLAS_STATUS_SUCCESS) continue;
+      int splitk = 0;
+      size_t written = 0;
+      cublasLtMatmulAlgoConfigGetAttribute(
+          &heur[i].algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &splitk, sizeof(splitk), &written);
+      if (splitk <= 1) {
+        e.algo = heur[i].algo;
+        e.ws = heur[i].workspaceSize;
+        out_ws = static_cast<int64_t>(e.ws);
+        g_nosplit.emplace(key, e);
+        break;
+      }
+    }
+  }
+  cublasLtMatmulPreferenceDestroy(pref);
+  if (out_ws < 0) {
+    cublasLtMatrixLayoutDestroy(e.Ad);
+    cublasLtMatrixLayoutDestroy(e.Bd);
+    cublasLtMatrixLayoutDestroy(e.Cd);
+    cublasLtMatmulDescDestroy(e.op);
+  }
+  return out_ws;
+}
+
+void bf16_mm_run_nosplit(torch::Tensor A, torch::Tensor B, torch::Tensor C, torch::Tensor workspace) {
+  TORCH_CHECK(A.is_cuda() && B.is_cuda() && C.is_cuda());
+  TORCH_CHECK(A.scalar_type() == at::kBFloat16 && B.scalar_type() == at::kBFloat16 && C.scalar_type() == at::kBFloat16);
+  TORCH_CHECK(A.dim() == 2 && B.dim() == 2 && C.dim() == 2);
+  const int M = A.size(0), K = A.size(1), N = B.size(1);
+  TORCH_CHECK(B.size(0) == K && C.size(0) == M && C.size(1) == N);
+  ensure_lt();
+  auto it = g_nosplit.find(nosplit_key(M, N, K));
+  TORCH_CHECK(it != g_nosplit.end(), "bf16_mm_run_nosplit: missing prepare pick");
+  const NosplitEntry& e = it->second;
+  float alpha = 1.f, beta = 0.f;
+  void* ws = workspace.defined() && workspace.numel() > 0 ? workspace.data_ptr() : nullptr;
+  size_t ws_bytes = workspace.defined() ? static_cast<size_t>(workspace.numel() * workspace.element_size()) : 0;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  TORCH_CHECK(
+      cublasLtMatmul(
+          g_lt, e.op, &alpha, A.data_ptr(), e.Ad, B.data_ptr(), e.Bd, &beta, C.data_ptr(), e.Cd, C.data_ptr(), e.Cd,
+          &e.algo, ws, ws_bytes, stream) == CUBLAS_STATUS_SUCCESS);
+}
 """
 
 _CPP_DECL = r"""
 void hopper_bf16_gemv(torch::Tensor x, torch::Tensor w, torch::Tensor out, bool use_pdl);
+int64_t bf16_mm_pick_nosplit(int64_t M, int64_t N, int64_t K);
+void bf16_mm_run_nosplit(torch::Tensor A, torch::Tensor B, torch::Tensor C, torch::Tensor workspace);
 """
 
 
@@ -276,17 +389,33 @@ def _align16(t: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _find_cutlass_include() -> str | None:
+    candidates: list[Path] = []
+    try:
+        import tilelang  # noqa: F401
+
+        candidates.append(Path(tilelang.__file__).resolve().parent / "3rdparty" / "cutlass" / "include")
+    except Exception:
+        pass
+    for sp in __import__("site").getsitepackages():
+        candidates.append(Path(sp) / "tilelang" / "3rdparty" / "cutlass" / "include")
+    for c in candidates:
+        if (c / "cutlass" / "cutlass.h").is_file():
+            return str(c)
+    return None
+
+
 def _build_ext(device: torch.device):
     major, minor = torch.cuda.get_device_capability(device)
     arch = f"sm_{major}{minor}"
     gencode = f"-gencode=arch=compute_{major}{minor},code={arch}"
-    build_dir = Path.home() / ".cache" / "muse_bf16_naive_gemv" / arch
+    build_dir = Path.home() / ".cache" / "muse_bf16_impl_h" / arch
     build_dir.mkdir(parents=True, exist_ok=True)
     return load_inline(
-        name=f"muse_bf16_naive_gemv_{arch}",
+        name=f"muse_bf16_impl_h_{arch}",
         cpp_sources=[_CPP_DECL],
         cuda_sources=[_CUDA_SRC],
-        functions=["hopper_bf16_gemv"],
+        functions=["hopper_bf16_gemv", "bf16_mm_pick_nosplit", "bf16_mm_run_nosplit"],
         extra_cuda_cflags=[
             "-O3",
             "--use_fast_math",
@@ -294,6 +423,7 @@ def _build_ext(device: torch.device):
             "--expt-relaxed-constexpr",
             gencode,
         ],
+        extra_ldflags=["-lcublasLt"],
         build_directory=str(build_dir),
         verbose=False,
     )
@@ -335,15 +465,40 @@ def prepare(weights: Weights) -> dict[str, Any]:
     state["use_pdl"] = False
     state["mm_backend"] = None
     state["mm_bf16"] = None
+    state["nosplit"] = {}
+    state["nosplit_ws"] = None
+    state["cutlass_inc"] = _find_cutlass_include()
     if device.type == "cuda":
         major, _ = torch.cuda.get_device_capability(device)
         state["use_pdl"] = major >= 9
-        state["ext"] = _build_ext(device)
+        try:
+            state["ext"] = _build_ext(device)
+        except Exception:
+            state["ext"] = None
         state["mm_backend"] = _probe_mm_bf16_backend(device)
         if state["mm_backend"] is not None:
             from flashinfer.gemm import mm_bf16
 
             state["mm_bf16"] = mm_bf16
+        ext = state["ext"]
+        if ext is not None:
+            max_ws = 0
+            for layer, ms in _NOSPLIT_MS.items():
+                Wt = state[f"{layer}_t"]
+                k, n = Wt.shape
+                for m in ms:
+                    ws = int(ext.bf16_mm_pick_nosplit(m, n, k))
+                    if ws < 0:
+                        continue
+                    state["nosplit"][(layer, m)] = True
+                    max_ws = max(max_ws, ws)
+            if state["nosplit"]:
+                state["nosplit_ws"] = torch.empty(max(max_ws, 1), dtype=torch.uint8, device=device)
+                for (layer, m) in state["nosplit"]:
+                    Wt = state[f"{layer}_t"]
+                    xw = torch.zeros(m, Wt.shape[0], dtype=torch.bfloat16, device=device)
+                    out = torch.empty(m, Wt.shape[1], dtype=torch.bfloat16, device=device)
+                    ext.bf16_mm_run_nosplit(xw, Wt, out, state["nosplit_ws"])
     return state
 
 
@@ -372,6 +527,12 @@ def kernel_fn(data: Inputs, state: dict[str, Any]) -> torch.Tensor:
         out = torch.empty((1, W.shape[0]), dtype=x.dtype, device=x.device)
         ext.hopper_bf16_gemv(x1, W, out, bool(state["use_pdl"]))
         return out.view(*x.shape[:-1], -1)
+
+    if state["nosplit"].get((layer, m)) and state["ext"] is not None:
+        x2 = x.view(-1, x.shape[-1])
+        out = torch.empty(x2.shape[0], n, dtype=x.dtype, device=x.device)
+        state["ext"].bf16_mm_run_nosplit(x2, state[f"{layer}_t"][:, :n], out, state["nosplit_ws"])
+        return out.view(*x.shape[:-1], n)
 
     mm = state["mm_bf16"]
     backend = state["mm_backend"]
