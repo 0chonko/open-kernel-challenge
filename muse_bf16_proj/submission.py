@@ -1,5 +1,5 @@
 # okc: problem=muse_bf16_proj
-"""Impl F: hopper GEMV m=1 + FlashInfer mm_bf16 (tensor-core backends) for thin-m.
+"""Impl G: hopper GEMV m=1 + FlashInfer mm_bf16 (tensor-core backends) for thin-m.
 
 Scalar thin-m GEMV (impl D) lost ~10x vs nvjet. FlashInfer mm_bf16 for m in {8,16,32} on qkv/pooler/unpooler only (E: o m=16/32 regressed).
 """
@@ -375,13 +375,16 @@ def kernel_fn(data: Inputs, state: dict[str, Any]) -> torch.Tensor:
 
     mm = state["mm_bf16"]
     backend = state["mm_backend"]
-    if (
-        mm is not None
-        and backend is not None
-        and m in (8, 16, 32)
-        and layer in ("qkv_gate", "pooler", "unpooler")
-    ):
-        # mm_bf16 wants B as [k, n] contiguous.
+    # Shape allow-list from E/F profiles: keep FI only where it beat nvjet.
+    use_fi = False
+    if mm is not None and backend is not None:
+        if layer == "pooler" and m in (8, 16, 32):
+            use_fi = True
+        elif layer == "unpooler" and m in (16, 32):
+            use_fi = True
+        elif layer == "qkv_gate" and m in (16, 32):
+            use_fi = True
+    if use_fi:
         return mm(x.view(-1, x.shape[-1]), state[f"{layer}_t"][:, :n], backend=backend).view(
             *x.shape[:-1], n
         )
