@@ -1,8 +1,9 @@
 # okc: problem=muse_bf16_proj
-"""Impl H: G + cublasLt no-split-K algo filter for qkv/pooler m∈{16,32}.
+# streamk: docstring — Impl I Stream-K identity
+"""Impl I: Stream-K.
 
-CUTLASS SM90 Stream-K JIT skipped (prepare ≤300s / prior art too heavy). Keeps nvjet-class
-mainloop; picks first heuristic with SPLITK_NUM≤1 to kill splitKreduce. o stays F.linear.
+Keep G hopper_bf16_gemv (m=1) + router + FI allow-list; thin-m qkv_gate/pooler/unpooler
+m in {8,16,32} use one-launch WMMA Stream-K BF16 GEMM with in-kernel partial reduce.
 """
 
 from __future__ import annotations
@@ -20,10 +21,13 @@ ROUTER_FP32_MAX_TOKENS = 8
 _MAX_K = 17408
 _MAX_N = 65536
 
-# G profiles: nvjet + splitKreduce on these thin-m shapes (unpooler/o often have no reduce).
-_NOSPLIT_MS = {
-    "qkv_gate": (16, 32),
-    "pooler": (16, 32),
+# streamk: tile — WMMA 16x16 panels; BN wide for N coverage
+BM, BN, BK = 16, 128, 16
+# streamk: dispatch — thin-m shapes that skip cublasLt splitKreduce via fused Stream-K
+_STREAMK_ALLOW = {
+    "qkv_gate": (8, 16, 32),
+    "pooler": (8, 16, 32),
+    "unpooler": (8, 16, 32),
 }
 
 
@@ -52,13 +56,13 @@ class Inputs(TypedDict):
 _CUDA_SRC = r"""
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <cublasLt.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <mma.h>  // streamk: WMMA tensor cores on SM86+
+#include <algorithm>  // streamk: grid = min(work, sms*2) occupancy
 
 #include <cstdint>
-#include <unordered_map>
 #include <utility>
 
 using bf16_t = __nv_bfloat16;
@@ -256,113 +260,198 @@ void hopper_bf16_gemv(torch::Tensor x, torch::Tensor w, torch::Tensor out, bool 
 #undef DISPATCH
 }
 
-// {{cuBLASLt split-K filter}}{{Prefer SPLITK_NUM≤1 heuristics to drop splitKreduce while keeping nvjet mainloop.}}
+// streamk: section — one-launch WMMA Stream-K; in-kernel partial reduce (no cublasLt::splitKreduce)
+namespace ns = nvcuda::wmma;  // streamk: WMMA namespace alias (not a type)
+using sk_bf16 = __nv_bfloat16;  // streamk: local alias; keep G bf16_t untouched
 
-static cublasLtHandle_t g_lt = nullptr;
+static __device__ __forceinline__ sk_bf16 sk_f32_bf16(float v) {  // streamk: store C as bf16
+  return __float2bfloat16(v);  // streamk: rn convert for C writeback
+}  // streamk: end helper
 
-struct NosplitEntry {
-  cublasLtMatmulDesc_t op{};
-  cublasLtMatrixLayout_t Ad{}, Bd{}, Cd{};
-  cublasLtMatmulAlgo_t algo{};
-  size_t ws = 0;
-};
+constexpr int kBM = 16;  // streamk: tile M (WMMA)
+constexpr int kBN = 128;  // streamk: tile N (8 warps * 16)
+constexpr int kBK = 16;  // streamk: tile K (WMMA)
+constexpr int kWarps = 8;  // streamk: BN/16 warps for occupancy
+constexpr int kThreads = kWarps * 32;  // streamk: block threads
 
-static std::unordered_map<uint64_t, NosplitEntry> g_nosplit;
+__device__ __forceinline__ void load_a_panel(  // streamk: A panel with zero-fill edges
+    sk_bf16* __restrict__ As,  // streamk: smem [16*16]
+    const sk_bf16* __restrict__ A,  // streamk: global A[M,K]
+    int M, int K, int m0, int kk, int tid) {  // streamk: tile origin + k slice
+  for (int i = tid; i < 16 * 16; i += kThreads) {  // streamk: coop fill
+    const int r = i >> 4;  // streamk: row in panel
+    const int c = i & 15;  // streamk: col in panel
+    const int mr = m0 + r;  // streamk: global m
+    As[i] = (mr < M) ? A[static_cast<size_t>(mr) * K + kk + c] : sk_bf16{};  // streamk: edge zero-fill
+  }  // streamk: end A load loop
+}  // streamk: end load_a_panel
 
-static uint64_t nosplit_key(int64_t M, int64_t N, int64_t K) {
-  return (static_cast<uint64_t>(M) << 40) | (static_cast<uint64_t>(N) << 16) | static_cast<uint64_t>(K & 0xffff);
-}
+__device__ __forceinline__ void load_b_panel(  // streamk: B panel for one warp cols
+    sk_bf16* __restrict__ Bs,  // streamk: smem [16*16]
+    const sk_bf16* __restrict__ B,  // streamk: global B[K,N]
+    int N, int K_unused, int nw, int kk, int lane) {  // streamk: n-origin + k
+  (void)K_unused;  // streamk: B stride is N not K
+  for (int i = lane; i < 16 * 16; i += 32) {  // streamk: warp-coop fill
+    const int r = i >> 4;  // streamk: k in panel
+    const int c = i & 15;  // streamk: n in panel
+    const int nc = nw + c;  // streamk: global n
+    Bs[i] = (nc < N) ? B[static_cast<size_t>(kk + r) * N + nc] : sk_bf16{};  // streamk: edge zero-fill
+  }  // streamk: end B load loop
+}  // streamk: end load_b_panel
 
-static void ensure_lt() {
-  if (!g_lt) {
-    TORCH_CHECK(cublasLtCreate(&g_lt) == CUBLAS_STATUS_SUCCESS);
-  }
-}
+__global__ void streamk_bf16_kernel(  // streamk: unified full-K / Stream-K launch
+    const sk_bf16* __restrict__ A,  // streamk: [M,K]
+    const sk_bf16* __restrict__ B,  // streamk: [K,N] = W[:n].T
+    sk_bf16* __restrict__ C,  // streamk: [M,N]
+    float* __restrict__ partials,  // streamk: workspace for split partials
+    int* __restrict__ flags,  // streamk: per-tile arrival counts
+    int M, int N, int K,  // streamk: gemm dims
+    int splits,  // streamk: K-split count (1 => full-K write)
+    int tile_stride) {  // streamk: partials middle dim (=max tiles) for shared workspace
+  const int tiles_m = (M + kBM - 1) / kBM;  // streamk: M tiles
+  const int tiles_n = (N + kBN - 1) / kBN;  // streamk: N tiles
+  const int num_tiles = tiles_m * tiles_n;  // streamk: MN tile count
+  const int work = num_tiles * splits;  // streamk: total stream-k work items
+  const int tid = threadIdx.x;  // streamk: linear tid
+  const int warp = tid >> 5;  // streamk: warp id
+  const int lane = tid & 31;  // streamk: lane id
 
-static cublasStatus_t make_row_layout(cublasLtMatrixLayout_t* layout, cudaDataType_t dt, int rows, int cols) {
-  auto st = cublasLtMatrixLayoutCreate(layout, dt, rows, cols, cols);
-  if (st != CUBLAS_STATUS_SUCCESS) return st;
-  cublasLtOrder_t ord = CUBLASLT_ORDER_ROW;
-  return cublasLtMatrixLayoutSetAttribute(*layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &ord, sizeof(ord));
-}
+  __shared__ sk_bf16 As[16 * 16];  // streamk: A panel smem
+  __shared__ sk_bf16 Bs[kWarps * 16 * 16];  // streamk: per-warp B panels
+  __shared__ float Cs[kWarps * 16 * 16];  // streamk: per-warp acc stage
 
-// Returns workspace bytes (>=0) on success; -1 if no nosplit algo. Caches descs for graph-safe run.
-int64_t bf16_mm_pick_nosplit(int64_t M, int64_t N, int64_t K) {
-  ensure_lt();
-  const uint64_t key = nosplit_key(M, N, K);
-  if (g_nosplit.count(key)) {
-    return static_cast<int64_t>(g_nosplit[key].ws);
-  }
+  for (int wid = static_cast<int>(blockIdx.x); wid < work; wid += static_cast<int>(gridDim.x)) {  // streamk: grid-stride work
+    const int tile = wid / splits;  // streamk: MN tile index
+    const int split = wid - tile * splits;  // streamk: K-split index
+    const int tm = tile / tiles_n;  // streamk: tile m
+    const int tn = tile - tm * tiles_n;  // streamk: tile n
+    const int m0 = tm * kBM;  // streamk: m origin
+    const int n0 = tn * kBN;  // streamk: n origin
+    const int nw = n0 + warp * 16;  // streamk: warp n origin
 
-  NosplitEntry e;
-  TORCH_CHECK(cublasLtMatmulDescCreate(&e.op, CUBLAS_COMPUTE_32F, CUDA_R_32F) == CUBLAS_STATUS_SUCCESS);
-  cublasOperation_t t = CUBLAS_OP_N;
-  cublasLtMatmulDescSetAttribute(e.op, CUBLASLT_MATMUL_DESC_TRANSA, &t, sizeof(t));
-  cublasLtMatmulDescSetAttribute(e.op, CUBLASLT_MATMUL_DESC_TRANSB, &t, sizeof(t));
-  TORCH_CHECK(make_row_layout(&e.Ad, CUDA_R_16BF, (int)M, (int)K) == CUBLAS_STATUS_SUCCESS);
-  TORCH_CHECK(make_row_layout(&e.Bd, CUDA_R_16BF, (int)K, (int)N) == CUBLAS_STATUS_SUCCESS);
-  TORCH_CHECK(make_row_layout(&e.Cd, CUDA_R_16BF, (int)M, (int)N) == CUBLAS_STATUS_SUCCESS);
+    const int k_iters = (K + kBK - 1) / kBK;  // streamk: K iterations
+    const int iters_per = (k_iters + splits - 1) / splits;  // streamk: iters per split
+    const int it0 = split * iters_per;  // streamk: split start
+    const int it1 = min(it0 + iters_per, k_iters);  // streamk: split end
 
-  cublasLtMatmulPreference_t pref;
-  TORCH_CHECK(cublasLtMatmulPreferenceCreate(&pref) == CUBLAS_STATUS_SUCCESS);
-  size_t ws_cap = 64ull << 20;
-  cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_cap, sizeof(ws_cap));
+    ns::fragment<ns::matrix_a, 16, 16, 16, sk_bf16, ns::row_major> a_frag;  // streamk: A frag
+    ns::fragment<ns::matrix_b, 16, 16, 16, sk_bf16, ns::row_major> b_frag;  // streamk: B frag
+    ns::fragment<ns::accumulator, 16, 16, 16, float> c_frag;  // streamk: fp32 acc
+    ns::fill_fragment(c_frag, 0.f);  // streamk: clear acc
 
-  cublasLtMatmulHeuristicResult_t heur[64];
-  int nres = 0;
-  auto st = cublasLtMatmulAlgoGetHeuristic(g_lt, e.op, e.Ad, e.Bd, e.Cd, e.Cd, pref, 64, heur, &nres);
-  int64_t out_ws = -1;
-  if (st == CUBLAS_STATUS_SUCCESS) {
-    for (int i = 0; i < nres; ++i) {
-      if (heur[i].state != CUBLAS_STATUS_SUCCESS) continue;
-      int splitk = 0;
-      size_t written = 0;
-      cublasLtMatmulAlgoConfigGetAttribute(
-          &heur[i].algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &splitk, sizeof(splitk), &written);
-      if (splitk <= 1) {
-        e.algo = heur[i].algo;
-        e.ws = heur[i].workspaceSize;
-        out_ws = static_cast<int64_t>(e.ws);
-        g_nosplit.emplace(key, e);
-        break;
-      }
-    }
-  }
-  cublasLtMatmulPreferenceDestroy(pref);
-  if (out_ws < 0) {
-    cublasLtMatrixLayoutDestroy(e.Ad);
-    cublasLtMatrixLayoutDestroy(e.Bd);
-    cublasLtMatrixLayoutDestroy(e.Cd);
-    cublasLtMatmulDescDestroy(e.op);
-  }
-  return out_ws;
-}
+    const bool active = (m0 < M) && (nw < N);  // streamk: skip OOB warps
+    for (int it = it0; it < it1; ++it) {  // streamk: K mainloop for this split
+      const int kk = it * kBK;  // streamk: k origin
+      load_a_panel(As, A, M, K, m0, kk, tid);  // streamk: stage A
+      __syncthreads();  // streamk: A visible
+      if (active) {  // streamk: compute path
+        ns::load_matrix_sync(a_frag, As, 16);  // streamk: A -> frag
+        load_b_panel(Bs + warp * 16 * 16, B, N, K, nw, kk, lane);  // streamk: stage B
+        __syncwarp();  // streamk: B visible in warp
+        ns::load_matrix_sync(b_frag, Bs + warp * 16 * 16, 16);  // streamk: B -> frag
+        ns::mma_sync(c_frag, a_frag, b_frag, c_frag);  // streamk: WMMA mma
+      }  // streamk: end active
+      __syncthreads();  // streamk: next iter barrier
+    }  // streamk: end K loop
+    if (active) {  // streamk: stage acc to smem
+      ns::store_matrix_sync(Cs + warp * 16 * 16, c_frag, 16, ns::mem_row_major);  // streamk: acc -> Cs
+    }  // streamk: end store
+    __syncthreads();  // streamk: Cs ready for write/reduce
 
-void bf16_mm_run_nosplit(torch::Tensor A, torch::Tensor B, torch::Tensor C, torch::Tensor workspace) {
-  TORCH_CHECK(A.is_cuda() && B.is_cuda() && C.is_cuda());
-  TORCH_CHECK(A.scalar_type() == at::kBFloat16 && B.scalar_type() == at::kBFloat16 && C.scalar_type() == at::kBFloat16);
-  TORCH_CHECK(A.dim() == 2 && B.dim() == 2 && C.dim() == 2);
-  const int M = A.size(0), K = A.size(1), N = B.size(1);
-  TORCH_CHECK(B.size(0) == K && C.size(0) == M && C.size(1) == N);
-  ensure_lt();
-  auto it = g_nosplit.find(nosplit_key(M, N, K));
-  TORCH_CHECK(it != g_nosplit.end(), "bf16_mm_run_nosplit: missing prepare pick");
-  const NosplitEntry& e = it->second;
-  float alpha = 1.f, beta = 0.f;
-  void* ws = workspace.defined() && workspace.numel() > 0 ? workspace.data_ptr() : nullptr;
-  size_t ws_bytes = workspace.defined() ? static_cast<size_t>(workspace.numel() * workspace.element_size()) : 0;
-  auto stream = at::cuda::getCurrentCUDAStream();
-  TORCH_CHECK(
-      cublasLtMatmul(
-          g_lt, e.op, &alpha, A.data_ptr(), e.Ad, B.data_ptr(), e.Bd, &beta, C.data_ptr(), e.Cd, C.data_ptr(), e.Cd,
-          &e.algo, ws, ws_bytes, stream) == CUBLAS_STATUS_SUCCESS);
-}
+    if (splits == 1) {  // streamk: full-K path — direct C write
+      if (m0 < M && nw < N) {  // streamk: bounds
+        const float* sp = Cs + warp * 16 * 16;  // streamk: warp acc
+        for (int i = lane; i < 16 * 16; i += 32) {  // streamk: coop store
+          const int r = i >> 4;  // streamk: r
+          const int c = i & 15;  // streamk: c
+          const int mr = m0 + r;  // streamk: global m
+          const int nc = nw + c;  // streamk: global n
+          if (mr < M && nc < N) {  // streamk: edge guard
+            C[static_cast<size_t>(mr) * N + nc] = sk_f32_bf16(sp[i]);  // streamk: write C
+          }  // streamk: end guard
+        }  // streamk: end store loop
+      }  // streamk: end bounds
+    } else {  // streamk: fused reduce path — avoid host splitKreduce
+      float* part = partials + (static_cast<size_t>(split) * tile_stride + tile) * (kBM * kBN);  // streamk: partial slot (max-stride)
+      if (m0 < M && nw < N) {  // streamk: write partial
+        const float* sp = Cs + warp * 16 * 16;  // streamk: warp acc
+        for (int i = lane; i < 16 * 16; i += 32) {  // streamk: coop partial store
+          const int r = i >> 4;  // streamk: r
+          const int c = i & 15;  // streamk: c
+          part[r * kBN + warp * 16 + c] =  // streamk: layout [BM,BN]
+              (m0 + r < M && nw + c < N) ? sp[i] : 0.f;  // streamk: zero pad
+        }  // streamk: end partial store
+      }  // streamk: end partial write
+      __syncthreads();  // streamk: partials settled in-block
+      if (tid == 0) {  // streamk: one thread reduces when last split arrives
+        __threadfence();  // streamk: publish partials before arrival flag (cross-block)
+        const int old = atomicAdd(flags + tile, 1);  // streamk: arrival count
+        if (old == splits - 1) {  // streamk: last split does fused reduce
+          for (int r = 0; r < kBM; ++r) {  // streamk: reduce rows
+            const int mr = m0 + r;  // streamk: global m
+            if (mr >= M) break;  // streamk: m edge
+            for (int c = 0; c < kBN; ++c) {  // streamk: reduce cols
+              const int nc = n0 + c;  // streamk: global n
+              if (nc >= N) break;  // streamk: n edge
+              float sum = 0.f;  // streamk: acc
+              for (int s = 0; s < splits; ++s) {  // streamk: sum splits
+                sum += partials[(static_cast<size_t>(s) * tile_stride + tile) * (kBM * kBN)  // streamk: max-stride idx
+                                + r * kBN + c];  // streamk: element
+              }  // streamk: end sum
+              C[static_cast<size_t>(mr) * N + nc] = sk_f32_bf16(sum);  // streamk: write reduced C
+            }  // streamk: end c
+          }  // streamk: end r
+        }  // streamk: end last-split
+      }  // streamk: end tid0
+      __syncthreads();  // streamk: before next work item
+    }  // streamk: end split branch
+  }  // streamk: end grid-stride
+}  // streamk: end kernel
+
+void streamk_bf16(  // streamk: host launch
+    torch::Tensor A,  // streamk: [M,K]
+    torch::Tensor B,  // streamk: [K,N]
+    torch::Tensor C,  // streamk: [M,N]
+    torch::Tensor partials,  // streamk: workspace
+    torch::Tensor flags,  // streamk: flags
+    int64_t splits,  // streamk: split count
+    int64_t tile_stride) {  // streamk: partials stride (=max tiles)
+  TORCH_CHECK(A.is_cuda() && B.is_cuda() && C.is_cuda());  // streamk: device check
+  const int M = A.size(0);  // streamk: M
+  const int K = A.size(1);  // streamk: K
+  const int N = B.size(1);  // streamk: N
+  TORCH_CHECK(B.size(0) == K);  // streamk: K match
+  TORCH_CHECK(K % 16 == 0);  // streamk: WMMA K align
+  const int sp = static_cast<int>(splits);  // streamk: splits
+  TORCH_CHECK(sp >= 1);  // streamk: valid splits
+  const int tstride = static_cast<int>(tile_stride);  // streamk: workspace stride
+  TORCH_CHECK(tstride >= 1 || sp == 1);  // streamk: stride unused when full-K
+
+  const int tiles_m = (M + kBM - 1) / kBM;  // streamk: tiles m
+  const int tiles_n = (N + kBN - 1) / kBN;  // streamk: tiles n
+  const int num_tiles = tiles_m * tiles_n;  // streamk: MN tiles
+  const int work = num_tiles * sp;  // streamk: work items
+
+  cudaDeviceProp prop{};  // streamk: query SMs for grid
+  cudaGetDeviceProperties(&prop, A.get_device());  // streamk: device props
+  int grid = std::min(work, std::max(1, prop.multiProcessorCount * 2));  // streamk: occupancy ~2 blocks/SM
+
+  auto stream = at::cuda::getCurrentCUDAStream();  // streamk: current stream (graph-safe)
+  streamk_bf16_kernel<<<grid, kThreads, 0, stream>>>(  // streamk: one launch
+      reinterpret_cast<const sk_bf16*>(A.data_ptr()),  // streamk: A
+      reinterpret_cast<const sk_bf16*>(B.data_ptr()),  // streamk: B
+      reinterpret_cast<sk_bf16*>(C.data_ptr()),  // streamk: C
+      partials.data_ptr<float>(),  // streamk: partials
+      flags.data_ptr<int>(),  // streamk: flags
+      M, N, K, sp, tstride);  // streamk: dims + splits + stride
+}  // streamk: end host
 """
 
 _CPP_DECL = r"""
 void hopper_bf16_gemv(torch::Tensor x, torch::Tensor w, torch::Tensor out, bool use_pdl);
-int64_t bf16_mm_pick_nosplit(int64_t M, int64_t N, int64_t K);
-void bf16_mm_run_nosplit(torch::Tensor A, torch::Tensor B, torch::Tensor C, torch::Tensor workspace);
+void streamk_bf16(torch::Tensor A, torch::Tensor B, torch::Tensor C,  // streamk: decl
+                  torch::Tensor partials, torch::Tensor flags, int64_t splits,  // streamk: workspace
+                  int64_t tile_stride);  // streamk: max-tiles stride
 """
 
 
@@ -389,33 +478,37 @@ def _align16(t: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _find_cutlass_include() -> str | None:
-    candidates: list[Path] = []
-    try:
-        import tilelang  # noqa: F401
+def _choose_splits(m: int, n: int, k: int, sms: int) -> int:  # streamk: splits heuristic
+    tiles = ((m + BM - 1) // BM) * ((n + BN - 1) // BN)  # streamk: MN tiles
+    k_iters = (k + BK - 1) // BK  # streamk: K iters
+    if tiles >= sms or m >= 64:  # streamk: enough MN parallelism → full-K
+        return 1  # streamk: no partials
+    target = sms * 2  # streamk: aim ~2 blocks/SM
+    sp = (target + tiles - 1) // tiles  # streamk: splits to fill SMs
+    return max(1, min(k_iters, sp, 32))  # streamk: clamp splits
 
-        candidates.append(Path(tilelang.__file__).resolve().parent / "3rdparty" / "cutlass" / "include")
-    except Exception:
-        pass
-    for sp in __import__("site").getsitepackages():
-        candidates.append(Path(sp) / "tilelang" / "3rdparty" / "cutlass" / "include")
-    for c in candidates:
-        if (c / "cutlass" / "cutlass.h").is_file():
-            return str(c)
-    return None
+
+def _use_streamk(layer: str, m: int) -> bool:  # streamk: allow-list gate
+    return m in _STREAMK_ALLOW.get(layer, ())  # streamk: dispatch
+
+
+def _out_n(layer: str, m: int, n_full: int) -> int:  # streamk: unpooler slice at m<=8
+    if layer == "unpooler" and m <= 8:  # streamk: match reference out_features
+        return 1024  # streamk: sliced N
+    return n_full  # streamk: full N
 
 
 def _build_ext(device: torch.device):
     major, minor = torch.cuda.get_device_capability(device)
     arch = f"sm_{major}{minor}"
     gencode = f"-gencode=arch=compute_{major}{minor},code={arch}"
-    build_dir = Path.home() / ".cache" / "muse_bf16_impl_h" / arch
+    build_dir = Path.home() / ".cache" / "muse_bf16_impl_i_streamk" / arch  # streamk: isolate build cache
     build_dir.mkdir(parents=True, exist_ok=True)
     return load_inline(
-        name=f"muse_bf16_impl_h_{arch}",
+        name=f"muse_bf16_impl_i_streamk_{arch}",  # streamk: distinct ext name
         cpp_sources=[_CPP_DECL],
         cuda_sources=[_CUDA_SRC],
-        functions=["hopper_bf16_gemv", "bf16_mm_pick_nosplit", "bf16_mm_run_nosplit"],
+        functions=["hopper_bf16_gemv", "streamk_bf16"],  # streamk: export Stream-K + G gemv
         extra_cuda_cflags=[
             "-O3",
             "--use_fast_math",
@@ -423,7 +516,6 @@ def _build_ext(device: torch.device):
             "--expt-relaxed-constexpr",
             gencode,
         ],
-        extra_ldflags=["-lcublasLt"],
         build_directory=str(build_dir),
         verbose=False,
     )
@@ -465,40 +557,71 @@ def prepare(weights: Weights) -> dict[str, Any]:
     state["use_pdl"] = False
     state["mm_backend"] = None
     state["mm_bf16"] = None
-    state["nosplit"] = {}
-    state["nosplit_ws"] = None
-    state["cutlass_inc"] = _find_cutlass_include()
+    state["sk_splits"] = {}  # streamk: per (layer,m) split plan
+    state["sk_out"] = {}  # streamk: prealloc outs (graph-safe)
+    state["sk_B"] = {}  # streamk: contiguous B=W[:n].T (slice of _t may be non-contig)
+    state["sk_partials"] = None  # streamk: max-size partials workspace
+    state["sk_flags"] = None  # streamk: max-size flags workspace
     if device.type == "cuda":
         major, _ = torch.cuda.get_device_capability(device)
         state["use_pdl"] = major >= 9
-        try:
-            state["ext"] = _build_ext(device)
-        except Exception:
-            state["ext"] = None
+        state["ext"] = _build_ext(device)
         state["mm_backend"] = _probe_mm_bf16_backend(device)
         if state["mm_backend"] is not None:
             from flashinfer.gemm import mm_bf16
 
             state["mm_bf16"] = mm_bf16
+
+        sms = torch.cuda.get_device_properties(device).multi_processor_count  # streamk: for splits
+        max_sp, max_tiles = 1, 0  # streamk: workspace bounds
+        for layer, ms in _STREAMK_ALLOW.items():  # streamk: plan each allow-list shape
+            n_full = state[layer].shape[0]  # streamk: full N
+            k = state[layer].shape[1]  # streamk: K
+            for m in ms:  # streamk: per-m splits
+                n = _out_n(layer, m, n_full)  # streamk: effective N
+                sp = _choose_splits(m, n, k, sms)  # streamk: choose splits
+                key = (layer, m)  # streamk: key
+                state["sk_splits"][key] = sp  # streamk: store splits
+                state["sk_out"][key] = torch.empty(  # streamk: prealloc out
+                    (m, n), device=device, dtype=torch.bfloat16  # streamk: graph-safe buffer
+                )  # streamk: end out alloc
+                bkey = (layer, n)  # streamk: pack B once per (layer,n)
+                if bkey not in state["sk_B"]:  # streamk: avoid duplicate packs
+                    state["sk_B"][bkey] = state[f"{layer}_t"][:, :n].contiguous()  # streamk: force contig for kernel
+                state["sk_B"][key] = state["sk_B"][bkey]  # streamk: alias by (layer,m)
+                tiles = ((m + BM - 1) // BM) * ((n + BN - 1) // BN)  # streamk: tile count
+                max_sp = max(max_sp, sp)  # streamk: max splits
+                max_tiles = max(max_tiles, tiles)  # streamk: max tiles
+        if max_tiles > 0:  # streamk: alloc once at max size
+            state["sk_partials"] = torch.empty(  # streamk: partials workspace
+                (max_sp, max_tiles, BM * BN), device=device, dtype=torch.float32  # streamk: [sp,tiles,BM*BN]
+            )  # streamk: end partials
+            state["sk_flags"] = torch.zeros(  # streamk: flags workspace
+                (max_tiles,), device=device, dtype=torch.int32  # streamk: one flag/tile
+            )  # streamk: end flags
+            state["sk_tile_stride"] = max_tiles  # streamk: middle-dim stride for shared buf
+        # streamk: optional warm launch (untimed prepare)
         ext = state["ext"]
-        if ext is not None:
-            max_ws = 0
-            for layer, ms in _NOSPLIT_MS.items():
-                Wt = state[f"{layer}_t"]
-                k, n = Wt.shape
-                for m in ms:
-                    ws = int(ext.bf16_mm_pick_nosplit(m, n, k))
-                    if ws < 0:
-                        continue
-                    state["nosplit"][(layer, m)] = True
-                    max_ws = max(max_ws, ws)
-            if state["nosplit"]:
-                state["nosplit_ws"] = torch.empty(max(max_ws, 1), dtype=torch.uint8, device=device)
-                for (layer, m) in state["nosplit"]:
-                    Wt = state[f"{layer}_t"]
-                    xw = torch.zeros(m, Wt.shape[0], dtype=torch.bfloat16, device=device)
-                    out = torch.empty(m, Wt.shape[1], dtype=torch.bfloat16, device=device)
-                    ext.bf16_mm_run_nosplit(xw, Wt, out, state["nosplit_ws"])
+        if ext is not None and state["sk_partials"] is not None:  # streamk: warm path
+            for layer, m in (("qkv_gate", 8), ("pooler", 16), ("unpooler", 8)):  # streamk: sample warm incl sliced N
+                key = (layer, m)  # streamk: key
+                if key not in state["sk_out"]:  # streamk: skip missing
+                    continue  # streamk: continue
+                k = state[layer].shape[1]  # streamk: K
+                x = torch.zeros((m, k), device=device, dtype=torch.bfloat16)  # streamk: dummy x
+                sp = int(state["sk_splits"][key])  # streamk: splits
+                if sp > 1:  # streamk: reset flags for fused reduce
+                    state["sk_flags"].zero_()  # streamk: clear flags
+                ext.streamk_bf16(  # streamk: warm launch
+                    x,  # streamk: A
+                    state["sk_B"][key],  # streamk: contig B
+                    state["sk_out"][key],  # streamk: C
+                    state["sk_partials"],  # streamk: partials
+                    state["sk_flags"],  # streamk: flags
+                    sp,  # streamk: splits
+                    int(state["sk_tile_stride"]),  # streamk: max-tiles stride
+                )  # streamk: end warm
+            torch.cuda.synchronize(device)  # streamk: settle JIT (prepare only)
     return state
 
 
@@ -528,11 +651,27 @@ def kernel_fn(data: Inputs, state: dict[str, Any]) -> torch.Tensor:
         ext.hopper_bf16_gemv(x1, W, out, bool(state["use_pdl"]))
         return out.view(*x.shape[:-1], -1)
 
-    if state["nosplit"].get((layer, m)) and state["ext"] is not None:
-        x2 = x.view(-1, x.shape[-1])
-        out = torch.empty(x2.shape[0], n, dtype=x.dtype, device=x.device)
-        state["ext"].bf16_mm_run_nosplit(x2, state[f"{layer}_t"][:, :n], out, state["nosplit_ws"])
-        return out.view(*x.shape[:-1], n)
+    if (  # streamk: Stream-K dispatch before FI
+        ext is not None  # streamk: ext ready
+        and _use_streamk(layer, m)  # streamk: allow-list
+        and state["sk_partials"] is not None  # streamk: workspace ready
+    ):  # streamk: enter Stream-K
+        key = (layer, m)  # streamk: lookup key
+        out = state["sk_out"][key]  # streamk: prealloc out (no alloc in kernel_fn)
+        sp = int(state["sk_splits"][key])  # streamk: planned splits
+        x2 = x.view(-1, x.shape[-1])  # streamk: [M,K]
+        if sp > 1:  # streamk: fused reduce needs clear flags (async, no host sync)
+            state["sk_flags"].zero_()  # streamk: reset arrivals
+        ext.streamk_bf16(  # streamk: one launch
+            x2,  # streamk: A
+            state["sk_B"][key],  # streamk: contig B from prepare
+            out,  # streamk: C
+            state["sk_partials"],  # streamk: max-size partials
+            state["sk_flags"],  # streamk: max-size flags
+            sp,  # streamk: splits
+            int(state["sk_tile_stride"]),  # streamk: workspace stride
+        )  # streamk: end launch
+        return out.view(*x.shape[:-1], n)  # streamk: reshape like input batching
 
     mm = state["mm_bf16"]
     backend = state["mm_backend"]
