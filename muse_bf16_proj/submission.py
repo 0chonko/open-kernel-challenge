@@ -1,7 +1,8 @@
 # okc: problem=muse_bf16_proj
-"""Impl B: hopper GEMV m=1 + CUDA router m<=8 + fused hi/lo router m>8.
+"""ABANDONED Impl C: hopper GEMV m=1 + FlashInfer mm_bf16 for thin-m qkv/pooler/unpooler.
 
-Targets f2a7 router m=16/32/128 where hi+lo is 2x nvjet + ~28% splitKreduce.
+Targets f2a7 profiles where m in {8,16,32} still pay nvjet splitK + splitKreduce (~8-18%).
+Router unchanged (impl A scalar FP32 GEMV lost 0.28x/0.10x vs cuBLAS).
 """
 
 from __future__ import annotations
@@ -246,187 +247,10 @@ void hopper_bf16_gemv(torch::Tensor x, torch::Tensor w, torch::Tensor out, bool 
   TORCH_CHECK(false, "hopper_bf16_gemv: unsupported Muse shape N=", N, " K=", K);
 #undef DISPATCH
 }
-
-// {{FlashInfer / serving GEMV patterns}}{{Router m<=8: one launch; stage one bf16 x-row in smem (~16KB), stream fp32 W — kill cast + dual sm80 f32 gemms.}}
-__global__ void __launch_bounds__(256)
-    router_fp32_kernel(float* __restrict__ out, const bf16_t* __restrict__ x,
-                       const float* __restrict__ w, int M, int N, int K) {
-  extern __shared__ bf16_t sx[];
-  const uint32_t tid = threadIdx.x;
-  const uint32_t nthreads = blockDim.x;
-  const uint32_t warp = tid / 32;
-  const uint32_t lane = tid % 32;
-  const uint32_t warps = nthreads / 32;
-  constexpr uint32_t kRows = 2;
-  const uint32_t r0 = (blockIdx.x * warps + warp) * kRows;
-  if (r0 >= static_cast<uint32_t>(N)) return;
-  const bool two = (r0 + 1) < static_cast<uint32_t>(N);
-
-  for (int mi = 0; mi < M; ++mi) {
-    const bf16_t* xrow = x + static_cast<size_t>(mi) * K;
-    for (uint32_t i = tid * kGemvVecSize; i < static_cast<uint32_t>(K); i += nthreads * kGemvVecSize) {
-      *reinterpret_cast<float4*>(sx + i) = *reinterpret_cast<const float4*>(xrow + i);
-    }
-    __syncthreads();
-
-    float acc0 = 0.f, acc1 = 0.f;
-    for (uint32_t k = lane * kGemvVecSize; k < static_cast<uint32_t>(K); k += 32 * kGemvVecSize) {
-      float4 xv = *reinterpret_cast<const float4*>(sx + k);
-      const bf16x2_t* x2 = reinterpret_cast<const bf16x2_t*>(&xv);
-      const float* w0 = w + static_cast<size_t>(r0) * K + k;
-#pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        const auto [a, b] = cast<fp32x2_t>(x2[i]);
-        acc0 = fmaf(__ldcs(w0 + i * 2), a, acc0);
-        acc0 = fmaf(__ldcs(w0 + i * 2 + 1), b, acc0);
-      }
-      if (two) {
-        const float* w1 = w + static_cast<size_t>(r0 + 1) * K + k;
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          const auto [a, b] = cast<fp32x2_t>(x2[i]);
-          acc1 = fmaf(__ldcs(w1 + i * 2), a, acc1);
-          acc1 = fmaf(__ldcs(w1 + i * 2 + 1), b, acc1);
-        }
-      }
-    }
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-      acc0 += __shfl_down_sync(0xffffffff, acc0, off);
-      acc1 += __shfl_down_sync(0xffffffff, acc1, off);
-    }
-    if (lane == 0) {
-      out[static_cast<size_t>(mi) * N + r0] = acc0;
-      if (two) out[static_cast<size_t>(mi) * N + r0 + 1] = acc1;
-    }
-    __syncthreads();
-  }
-}
-
-void router_fp32_gemv(torch::Tensor x, torch::Tensor w, torch::Tensor out) {
-  TORCH_CHECK(x.is_cuda() && w.is_cuda() && out.is_cuda());
-  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && w.scalar_type() == at::kFloat);
-  const int M = x.size(0);
-  const int K = x.size(1);
-  const int N = w.size(0);
-  TORCH_CHECK(M >= 1 && M <= 8);
-  TORCH_CHECK(w.size(1) == K && out.size(0) == M && out.size(1) == N);
-  TORCH_CHECK(K % 8 == 0 && N % 2 == 0);
-
-  constexpr int nthreads = 256;
-  const int rows_per_block = (nthreads / 32) * 2;
-  const int blocks = (N + rows_per_block - 1) / rows_per_block;
-  const size_t smem = static_cast<size_t>(K) * sizeof(bf16_t);
-  auto stream = at::cuda::getCurrentCUDAStream();
-  router_fp32_kernel<<<blocks, nthreads, smem, stream>>>(
-      reinterpret_cast<float*>(out.data_ptr()),
-      reinterpret_cast<const bf16_t*>(x.data_ptr()),
-      reinterpret_cast<const float*>(w.data_ptr()),
-      M, N, K);
-}
-
-// {{Stream-K / single-launch reduce}}{{Fused hi+lo BF16 router: one launch streams both W rows; kills 2nd nvjet + splitKreduce.}}
-__global__ void __launch_bounds__(256)
-    router_hilo_kernel(float* __restrict__ out, const bf16_t* __restrict__ x,
-                       const bf16_t* __restrict__ whi, const bf16_t* __restrict__ wlo,
-                       int M, int N, int K) {
-  extern __shared__ bf16_t sx[];
-  const uint32_t tid = threadIdx.x;
-  const uint32_t nthreads = blockDim.x;
-  const uint32_t warp = tid / 32;
-  const uint32_t lane = tid % 32;
-  const uint32_t warps = nthreads / 32;
-  constexpr uint32_t kRows = 2;
-  const uint32_t r0 = (blockIdx.x * warps + warp) * kRows;
-  if (r0 >= static_cast<uint32_t>(N)) return;
-  const bool two = (r0 + 1) < static_cast<uint32_t>(N);
-
-  for (int mi = 0; mi < M; ++mi) {
-    const bf16_t* xrow = x + static_cast<size_t>(mi) * K;
-    for (uint32_t i = tid * kGemvVecSize; i < static_cast<uint32_t>(K); i += nthreads * kGemvVecSize) {
-      *reinterpret_cast<float4*>(sx + i) = *reinterpret_cast<const float4*>(xrow + i);
-    }
-    __syncthreads();
-
-    float acc0 = 0.f, acc1 = 0.f;
-    for (uint32_t k = lane * kGemvVecSize; k < static_cast<uint32_t>(K); k += 32 * kGemvVecSize) {
-      float4 xv = *reinterpret_cast<const float4*>(sx + k);
-      const bf16x2_t* x2 = reinterpret_cast<const bf16x2_t*>(&xv);
-      const bf16_t* h0 = whi + static_cast<size_t>(r0) * K + k;
-      const bf16_t* l0 = wlo + static_cast<size_t>(r0) * K + k;
-      float4 hh0 = __ldcs(reinterpret_cast<const float4*>(h0));
-      float4 ll0 = __ldcs(reinterpret_cast<const float4*>(l0));
-      const bf16x2_t* h2 = reinterpret_cast<const bf16x2_t*>(&hh0);
-      const bf16x2_t* l2 = reinterpret_cast<const bf16x2_t*>(&ll0);
-#pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        const auto [xa, xb] = cast<fp32x2_t>(x2[i]);
-        const auto [ha, hb] = cast<fp32x2_t>(h2[i]);
-        const auto [la, lb] = cast<fp32x2_t>(l2[i]);
-        acc0 = fmaf(ha, xa, acc0);
-        acc0 = fmaf(hb, xb, acc0);
-        acc0 = fmaf(la, xa, acc0);
-        acc0 = fmaf(lb, xb, acc0);
-      }
-      if (two) {
-        const bf16_t* h1 = whi + static_cast<size_t>(r0 + 1) * K + k;
-        const bf16_t* l1 = wlo + static_cast<size_t>(r0 + 1) * K + k;
-        float4 hh1 = __ldcs(reinterpret_cast<const float4*>(h1));
-        float4 ll1 = __ldcs(reinterpret_cast<const float4*>(l1));
-        const bf16x2_t* hh = reinterpret_cast<const bf16x2_t*>(&hh1);
-        const bf16x2_t* ll = reinterpret_cast<const bf16x2_t*>(&ll1);
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          const auto [xa, xb] = cast<fp32x2_t>(x2[i]);
-          const auto [ha, hb] = cast<fp32x2_t>(hh[i]);
-          const auto [la, lb] = cast<fp32x2_t>(ll[i]);
-          acc1 = fmaf(ha, xa, acc1);
-          acc1 = fmaf(hb, xb, acc1);
-          acc1 = fmaf(la, xa, acc1);
-          acc1 = fmaf(lb, xb, acc1);
-        }
-      }
-    }
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-      acc0 += __shfl_down_sync(0xffffffff, acc0, off);
-      acc1 += __shfl_down_sync(0xffffffff, acc1, off);
-    }
-    if (lane == 0) {
-      out[static_cast<size_t>(mi) * N + r0] = acc0;
-      if (two) out[static_cast<size_t>(mi) * N + r0 + 1] = acc1;
-    }
-    __syncthreads();
-  }
-}
-
-void router_hilo_gemv(torch::Tensor x, torch::Tensor whi, torch::Tensor wlo, torch::Tensor out) {
-  TORCH_CHECK(x.is_cuda() && whi.is_cuda() && wlo.is_cuda() && out.is_cuda());
-  const int M = x.size(0);
-  const int K = x.size(1);
-  const int N = whi.size(0);
-  TORCH_CHECK(whi.sizes() == wlo.sizes());
-  TORCH_CHECK(whi.size(1) == K && out.size(0) == M && out.size(1) == N);
-  TORCH_CHECK(K % 8 == 0 && N % 2 == 0);
-
-  constexpr int nthreads = 256;
-  const int rows_per_block = (nthreads / 32) * 2;
-  const int blocks = (N + rows_per_block - 1) / rows_per_block;
-  const size_t smem = static_cast<size_t>(K) * sizeof(bf16_t);
-  auto stream = at::cuda::getCurrentCUDAStream();
-  router_hilo_kernel<<<blocks, nthreads, smem, stream>>>(
-      reinterpret_cast<float*>(out.data_ptr()),
-      reinterpret_cast<const bf16_t*>(x.data_ptr()),
-      reinterpret_cast<const bf16_t*>(whi.data_ptr()),
-      reinterpret_cast<const bf16_t*>(wlo.data_ptr()),
-      M, N, K);
-}
 """
 
 _CPP_DECL = r"""
 void hopper_bf16_gemv(torch::Tensor x, torch::Tensor w, torch::Tensor out, bool use_pdl);
-void router_fp32_gemv(torch::Tensor x, torch::Tensor w, torch::Tensor out);
-void router_hilo_gemv(torch::Tensor x, torch::Tensor whi, torch::Tensor wlo, torch::Tensor out);
 """
 
 
@@ -457,13 +281,13 @@ def _build_ext(device: torch.device):
     major, minor = torch.cuda.get_device_capability(device)
     arch = f"sm_{major}{minor}"
     gencode = f"-gencode=arch=compute_{major}{minor},code={arch}"
-    build_dir = Path.home() / ".cache" / "muse_bf16_impl_b_router_v2" / arch
+    build_dir = Path.home() / ".cache" / "muse_bf16_naive_gemv" / arch
     build_dir.mkdir(parents=True, exist_ok=True)
     return load_inline(
-        name=f"muse_bf16_impl_b_{arch}",
+        name=f"muse_bf16_naive_gemv_{arch}",
         cpp_sources=[_CPP_DECL],
         cuda_sources=[_CUDA_SRC],
-        functions=["hopper_bf16_gemv", "router_fp32_gemv", "router_hilo_gemv"],
+        functions=["hopper_bf16_gemv"],
         extra_cuda_cflags=[
             "-O3",
             "--use_fast_math",
@@ -483,8 +307,6 @@ def prepare(weights: Weights) -> dict[str, Any]:
     router = state["router"]
     hi = router.to(torch.bfloat16)
     lo = (router - hi.float()).to(torch.bfloat16)
-    state["router_hi"] = _align16(hi.contiguous())
-    state["router_lo"] = _align16(lo.contiguous())
     state["router_hi_t"] = hi.t().contiguous()
     state["router_lo_t"] = lo.t().contiguous()
 
@@ -501,23 +323,8 @@ def prepare(weights: Weights) -> dict[str, Any]:
 def kernel_fn(data: Inputs, state: dict[str, Any]) -> torch.Tensor:
     x, layer = data["x"], data["config"]["layer"]
     if layer == "router":
-        m = x.shape[0]
-        ext = state["ext"]
-        if (
-            m <= ROUTER_FP32_MAX_TOKENS
-            and ext is not None
-            and x.is_contiguous()
-            and x.data_ptr() % 16 == 0
-        ):
-            out = torch.empty((m, state["router"].shape[0]), dtype=torch.float32, device=x.device)
-            ext.router_fp32_gemv(x.view(m, -1), state["router"], out)
-            return out
-        if m <= ROUTER_FP32_MAX_TOKENS:
+        if x.shape[0] <= ROUTER_FP32_MAX_TOKENS:
             return F.linear(x.float(), state["router"])
-        if ext is not None and x.is_contiguous() and x.data_ptr() % 16 == 0:
-            out = torch.empty((m, state["router"].shape[0]), dtype=torch.float32, device=x.device)
-            ext.router_hilo_gemv(x.view(m, -1), state["router_hi"], state["router_lo"], out)
-            return out
         acc = torch.mm(x, state["router_hi_t"], out_dtype=torch.float32)
         acc += torch.mm(x, state["router_lo_t"], out_dtype=torch.float32)
         return acc
