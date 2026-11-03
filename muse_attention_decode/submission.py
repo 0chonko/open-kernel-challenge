@@ -1,13 +1,14 @@
 # okc: problem=muse_attention_decode
-"""FlashAttention-3 gated decode + ThunderKittens-style 16-row Triton tiles.
+"""FA3 gated decode + DScale / Dissecting-Hopper path-aware verify tiles.
 
-Paper: ThunderKittens (Spector et al.) — tile-centric Hopper kernels (16×16
-WGMMA-friendly register tiles, simple layouts). Kept FA3 spine from the prior tip
-(fused QK/RoPE/FP8 store prep + fused RMSNorm×sigmoid epilogue, ~1.08×), and
-applied TK tile discipline around it for verify (q_len=8):
-  (1) prep/epilogue use BLOCK_M=16 (warpgroup-height) instead of tiny 4-row blocks;
-  (2) when scheduler_metadata is absent (verify + sliding), feed FA3 the batch
-      layout [B,L,Hq,D] so the L=8 causal Q tile is explicit, with pack_gqa=True.
+Keeps the tip spine: FA3 + fused Triton prep/epilogue + TK 16-row tiles.
+Adds DScale (arXiv:2609.37532) + Dissecting Hopper util (arXiv:2609.12923) knobs:
+  (1) specialize prep/epilogue BLOCK_M + num_warps on cfg q_len==8 vs 1
+      (raise M/warps on large verify; decode keeps TK-16);
+  (2) L=8 verify: dense [B,L,Hq,D] + pack_gqa=True (GMMA fragment fill);
+      heuristic num_splits (num_splits=1 doubled sliding FA and lost the score);
+  (3) config-keyed fixed-address FP8 Q workspace (graph-stable, no value alloc);
+  (4) epilogue loads FA out and the qkv gate tail by stride — no .contiguous() copy.
 """
 
 from typing import TypedDict  # shape/dtype contracts for Inputs / Config
@@ -59,8 +60,9 @@ FP8 = torch.float8_e4m3fn  # E4M3 cache + FA3 query dtype on the scored FP8 path
 FP8_E4M3_MAX = 448.0  # saturate before FP8 cast (same bound as FusedQKNorm)
 _NORMS = {}  # cache FusedQKNorm modules keyed by (hq, hkv, d) — config-stable, not per-input
 _ROPE = {}  # cache float32 cos|sin tables keyed by rope_theta — built once per theta
+_Q_WORK = {}  # fixed-address FP8 Q buffers keyed by config shape (DScale graph-stable)
 ROPE_POSITIONS = 1 << 21  # SGLang RotaryEmbedding table length (covers long contexts)
-# ThunderKittens base tile height: 16 rows = one warpgroup MMA-friendly strip
+# ThunderKittens / Hopper WGMMA-friendly strip height
 TK_TILE_M = 16
 
 
@@ -85,15 +87,31 @@ def _cos_sin(theta, d, device):
     return cache  # subsequent calls hit the module-level dict
 
 
-def _tk_block_m(n_rows: int) -> int:
-    """Pick a TK-aligned row tile: prefer 16, grow only for huge grids."""
+def _q_workspace(tokens, hq, d, device):
+    """Reuse a config-shaped FP8 Q buffer (address stable across CUDA-graph replays)."""
+    key = (tokens, hq, d, device.index if device.index is not None else 0)
+    buf = _Q_WORK.get(key)
+    if buf is None or buf.device != device:
+        buf = _Q_WORK[key] = torch.empty(tokens, hq * d, dtype=FP8, device=device)
+    return buf
+
+
+def _path_tile(q_len: int, n_rows: int) -> tuple[int, int]:
+    """DScale path-aware (BLOCK_M, num_warps): verify raises M; decode keeps TK-16."""
+    if q_len == 8:  # verify — Dissecting-Hopper: fill GMMA fragments, don't under-tile
+        if n_rows >= 4096:
+            return 32, 8  # B≥32 verify: wider strip + more warps
+        if n_rows >= TK_TILE_M:
+            return TK_TILE_M, 4
+        return 8, 4
+    # decode: tip TK tiles (16-row default); only shrink below one strip
     if n_rows >= 65536:
-        return 32  # large verify B=32 still fine at 16; reserve 32 for extreme tests
+        return 32, 4
     if n_rows >= TK_TILE_M:
-        return TK_TILE_M  # WGMMA-friendly default (verify L=8 hits this)
+        return TK_TILE_M, 4
     if n_rows >= 8:
-        return 8
-    return 4
+        return 8, 4
+    return 4, 4
 
 
 @triton.jit
@@ -112,7 +130,7 @@ def _fused_qk_rope_store_kernel(
     NUM_KV_HEADS: tl.constexpr,  # Hkv
     D: tl.constexpr,  # head_dim
     BD: tl.constexpr,  # next_power_of_2(D) load width
-    BLOCK_M: tl.constexpr,  # rows per program — TK prefers 16
+    BLOCK_M: tl.constexpr,  # rows per program — path-aware (16 verify / TK decode)
     HAS_ROPE: tl.constexpr,  # 1 on sliding layers
     FP8_KV_STORE: tl.constexpr,  # 1 → saturate + store E4M3, emit FP8 Q
     FP8_MAX: tl.constexpr,  # 448.0
@@ -122,10 +140,11 @@ def _fused_qk_rope_store_kernel(
     rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)  # absolute row ids in this block
     row_mask = rows < n_rows  # mask padded lanes past the last live row
     cols = tl.arange(0, BD)  # column vector covering head_dim (possibly padded)
-    col_mask = cols < D  # ignore power-of-two padding columns
-    mask = row_mask[:, None] & col_mask[None, :]  # 2D validity for head loads/stores
+    # D==BD (scored D=64): drop col mask so Triton can widen vector ld/st
+    mask = row_mask[:, None] if BD == D else (row_mask[:, None] & (cols < D)[None, :])
 
     HEADS: tl.constexpr = NUM_Q_HEADS + 2 * NUM_KV_HEADS  # Q then K then V packing
+    INV_D: tl.constexpr = 1.0 / D  # mul instead of div.full in PTX
     token = rows // HEADS  # which token this row belongs to
     head = rows % HEADS  # which head index within Q|K|V
     is_q = head < NUM_Q_HEADS  # query-head lanes
@@ -135,21 +154,20 @@ def _fused_qk_rope_store_kernel(
     src = token * stride_qkv + head * D  # base offset of this head's D elements in QKV
     raw = tl.load(QKV + src[:, None] + cols[None, :], mask=mask, other=0.0)  # bf16/fp16 load
     x = raw.to(tl.float32)  # RMS + RoPE math in fp32
-    var = tl.sum(tl.where(mask, x * x, 0.0), axis=1) / D  # mean square over head_dim
+    var = tl.sum(tl.where(mask, x * x, 0.0), axis=1) * INV_D  # mean square over head_dim
     rstd = tl.rsqrt(var + eps)  # reciprocal RMS
     x = x * rstd[:, None]  # normalized Q/K (V overwritten later from raw)
 
     if HAS_ROPE:  # sliding-window layers only
         # match separate-RoPE numerics: rotate the bf16-rounded normalized row
         x = x.to(QKV.dtype.element_ty).to(tl.float32)
-        partner_cols = cols ^ 1  # interleaved pair partner (…0↔1, 2↔3, …)
-        xp = tl.load(QKV + src[:, None] + partner_cols[None, :], mask=mask, other=0.0).to(tl.float32)
-        xp = (xp * rstd[:, None]).to(QKV.dtype.element_ty).to(tl.float32)  # partner, same rounding
+        # partner = cols^1 of x — register swap, no second QKV global load
+        even, odd = tl.split(tl.reshape(x, (BLOCK_M, BD // 2, 2)))
+        xp = tl.interleave(odd, even)
         pos = tl.load(POS + token, mask=row_mask, other=0).to(tl.int64)  # absolute position
         freq = cols // 2  # pair index into cos/sin half-tables
-        cs_mask = row_mask[:, None] & (cols < D)[None, :]
-        cos = tl.load(COS_SIN + pos[:, None] * D + freq[None, :], mask=cs_mask, other=1.0)
-        sin = tl.load(COS_SIN + pos[:, None] * D + D // 2 + freq[None, :], mask=cs_mask, other=0.0)
+        cos = tl.load(COS_SIN + pos[:, None] * D + freq[None, :], mask=mask, other=1.0)
+        sin = tl.load(COS_SIN + pos[:, None] * D + D // 2 + freq[None, :], mask=mask, other=0.0)
         is_even = (cols % 2 == 0)[None, :]  # even idx = cos branch of the pair
         x = tl.where(is_even, x * cos - xp * sin, xp * sin + x * cos)  # GPT-J interleaved RoPE
 
@@ -159,6 +177,7 @@ def _fused_qk_rope_store_kernel(
     x = tl.where(is_v[:, None], raw.to(tl.float32), x)
     if FP8_KV_STORE:
         x = tl.minimum(tl.maximum(x, -FP8_MAX), FP8_MAX)  # clamp to E4M3 dynamic range
+        x = x.to(tl.float8e4nv)  # pack path for wider FP8 stores
 
     loc = tl.load(CACHE_LOC + token, mask=row_mask, other=0).to(tl.int64)  # dest row
     # IMPORTANT vs SGLang FusedQKNorm: challenge marks slot 0 as a live cache row
@@ -175,42 +194,54 @@ def _fused_qk_rope_store_kernel(
 
 @triton.jit
 def _rms_norm_gate_epilogue_kernel(
-    X,  # [tokens*Hq, D] FA3 attention output (any float dtype FA returned)
-    GATE,  # [tokens*Hq, D] gate logits from the fused QKV projection
+    X,  # FA3 output, logical [B, L, Hq, D] (any float dtype FA returned)
+    GATE,  # gate logits, logical [B, L, Hq, D], often a strided tail of qkv
     OUT,  # [tokens*Hq, D] bf16 final gated normalized output
     eps,  # RMSNorm epsilon
     n_rows,  # tokens * Hq
-    stride_x,  # row stride of X in elements
-    stride_g,  # row stride of GATE
-    stride_o,  # row stride of OUT
+    stride_x_b,  # X batch stride (elements)
+    stride_x_l,  # X length stride
+    stride_x_h,  # X head stride
+    stride_g_b,  # GATE batch stride
+    stride_g_l,  # GATE length stride
+    stride_g_h,  # GATE head stride
+    stride_o,  # row stride of packed OUT
     D: tl.constexpr,  # head_dim
     BD: tl.constexpr,  # next_power_of_2(D)
-    BLOCK_M: tl.constexpr,  # TK-style multi-row tile (16 on verify)
+    BLOCK_M: tl.constexpr,  # path-aware multi-row tile
+    SEQ: tl.constexpr,  # L — 1 decode, 8 verify
+    NUM_Q_HEADS: tl.constexpr,  # Hq
 ):
     """Fuse FA→bf16 cast + per-head RMSNorm + sigmoid(gate); BLOCK_M rows/program."""
     pid = tl.program_id(0)  # one program owns BLOCK_M (token, head) rows
     rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)  # absolute head-row ids
     row_mask = rows < n_rows  # pad past the last live row
     cols = tl.arange(0, BD)  # columns covering head_dim
-    col_mask = cols < D  # drop padding lanes
-    mask = row_mask[:, None] & col_mask[None, :]  # 2D validity
-    # load FA output and gate; promote to fp32 for stable RMS + sigmoid
-    x = tl.load(X + rows[:, None] * stride_x + cols[None, :], mask=mask, other=0.0).to(tl.float32)
-    g = tl.load(GATE + rows[:, None] * stride_g + cols[None, :], mask=mask, other=0.0).to(tl.float32)
-    var = tl.sum(tl.where(mask, x * x, 0.0), axis=1) / D  # mean square per head-row
+    INV_D: tl.constexpr = 1.0 / D  # mul instead of div.full in PTX
+    mask = row_mask[:, None] if BD == D else (row_mask[:, None] & (cols < D)[None, :])
+    tok = rows // NUM_Q_HEADS  # token in row-major [B, L]
+    head = rows % NUM_Q_HEADS
+    b = tok // SEQ
+    l = tok % SEQ
+    # last dim is contiguous on both inputs; strides cover the gate tail's token gap
+    x_off = b[:, None] * stride_x_b + l[:, None] * stride_x_l + head[:, None] * stride_x_h
+    g_off = b[:, None] * stride_g_b + l[:, None] * stride_g_l + head[:, None] * stride_g_h
+    x = tl.load(X + x_off + cols[None, :], mask=mask, other=0.0).to(tl.float32)
+    g = tl.load(GATE + g_off + cols[None, :], mask=mask, other=0.0).to(tl.float32)
+    var = tl.sum(tl.where(mask, x * x, 0.0), axis=1) * INV_D  # mean square per head-row
     rstd = tl.rsqrt(var + eps)  # 1 / RMS
-    sig = 1.0 / (1.0 + tl.exp(-g))  # sigmoid(gate) elementwise
+    sig = tl.sigmoid(g)  # maps to ex2+rcp better than hand-rolled 1/(1+exp)
     y = (x * rstd[:, None]) * sig  # rmsnorm(a) * sigmoid(gate)
     tl.store(OUT + rows[:, None] * stride_o + cols[None, :], y.to(tl.bfloat16), mask=mask)
 
 
-def _fused_qk_rope_store(qkv, positions, cos_sin, k_cache, v_cache, cache_loc, hq, hkv, d, has_rope):
+def _fused_qk_rope_store(qkv, positions, cos_sin, k_cache, v_cache, cache_loc, hq, hkv, d, has_rope, q_len):
     """Host wrapper: launch fused prep; returns FP8 Q ready for FA3 (unity kv_scale)."""
     tokens = qkv.shape[0]  # B*L flattened token count
     heads = hq + 2 * hkv  # Q+K+V heads processed as rows
     n_rows = tokens * heads  # total (token, head) rows
-    block_m = _tk_block_m(n_rows)  # TK 16-row tiles for verify-sized grids
-    q_out = torch.empty(tokens, hq * d, dtype=FP8, device=qkv.device)  # FA3 wants FP8 queries
+    block_m, n_warps = _path_tile(q_len, n_rows)  # DScale: verify vs decode tiles
+    q_out = _q_workspace(tokens, hq, d, qkv.device)  # fixed-address FP8 Q
     # flatten paged caches to [rows, Hkv*D] so the kernel can address by cache_loc
     k_flat = k_cache.view(-1, hkv * d)
     v_flat = v_cache.view(-1, hkv * d)
@@ -233,39 +264,68 @@ def _fused_qk_rope_store(qkv, positions, cos_sin, k_cache, v_cache, cache_loc, h
         HAS_ROPE=has_rope,  # compile-time RoPE switch
         FP8_KV_STORE=True,  # always FP8 cache on this problem
         FP8_MAX=FP8_E4M3_MAX,  # saturate bound
-        num_warps=4,  # one warpgroup — TK's collaborative compute unit
+        num_warps=n_warps,  # path-aware warp count
     )
     return q_out  # [T, Hq*D] float8_e4m3fn
 
 
-def _fused_rms_norm_gate(attn_out, gate, tokens, hq, d):
+def _bhd_strides(t, length, hq, d):
+    """Logical [B, L, Hq, D] strides without copying. None if the layout isn't one we index."""
+    if t.ndim == 4 and t.shape[-1] == d and t.shape[-2] == hq:
+        return t, t.stride(0), t.stride(1), t.stride(2)
+    if t.ndim == 3 and t.shape[-1] == d and t.shape[-2] == hq:
+        st = t.stride(0)  # [T, Hq, D], T = B*L row-major
+        return t, st * length, st, t.stride(1)
+    if t.ndim == 2 and t.shape[-1] == hq * d and t.stride(-1) == 1:
+        st = t.stride(0)  # [T, Hq*D] including a strided gate tail
+        return t, st * length, st, d
+    if t.ndim == 2 and t.shape[-1] == d and t.stride(-1) == 1:
+        sd = t.stride(0)  # packed [T*Hq, D]
+        st = sd * hq
+        return t, st * length, st, sd
+    return None
+
+
+def _fused_rms_norm_gate(attn_out, gate, tokens, hq, d, q_len):
     """Host wrapper: FA output + gate → bf16 [T, Hq*D] via one Triton epilogue."""
-    # FA3 may return [B,L,Hq,D], [T,Hq,D], or flat; force contiguous row-per-head view
-    x = attn_out.reshape(tokens * hq, d)
-    if not x.is_contiguous():  # rare non-contiguous FA view — one contig copy
-        x = x.contiguous()
-    g = gate.reshape(tokens * hq, d)  # gate already lives inside qkv; view only
-    if not g.is_contiguous():
-        g = g.contiguous()
-    out = torch.empty(tokens, hq * d, dtype=torch.bfloat16, device=x.device)  # final buffer
-    out_rows = out.view(tokens * hq, d)  # kernel writes head-rows in BLOCK_M tiles
+    x = _bhd_strides(attn_out, q_len, hq, d)
+    if x is None:  # unexpected FA layout: one copy, then packed rows
+        flat = attn_out.reshape(tokens * hq, d).contiguous()
+        x = (flat, d * hq * q_len, d * hq, d)
+    g = _bhd_strides(gate, q_len, hq, d)
+    if g is None:
+        flat = gate.reshape(tokens * hq, d).contiguous()
+        g = (flat, d * hq * q_len, d * hq, d)
+    out = torch.empty(tokens, hq * d, dtype=torch.bfloat16, device=attn_out.device)
+    out_rows = out.view(tokens * hq, d)
     n_rows = tokens * hq
-    block_m = _tk_block_m(n_rows)  # 16-row tiles: verify B=1 → 128 rows → 8 programs
+    block_m, n_warps = _path_tile(q_len, n_rows)
     _rms_norm_gate_epilogue_kernel[(triton.cdiv(n_rows, block_m),)](
-        x,  # attention values
-        g,  # gate logits
-        out_rows,  # bf16 destination
-        RMS_EPS,  # eps
-        n_rows,  # row count
-        x.stride(0),  # X row stride
-        g.stride(0),  # gate row stride
-        out_rows.stride(0),  # out row stride
-        d,  # D
-        triton.next_power_of_2(d),  # BD
-        block_m,  # BLOCK_M
-        num_warps=4,  # warpgroup-sized launch to match prep
+        x[0],
+        g[0],
+        out_rows,
+        RMS_EPS,
+        n_rows,
+        x[1], x[2], x[3],
+        g[1], g[2], g[3],
+        out_rows.stride(0),
+        d,
+        triton.next_power_of_2(d),
+        block_m,
+        SEQ=q_len,
+        NUM_Q_HEADS=hq,
+        num_warps=n_warps,
     )
     return out  # [T, Hq*D] bfloat16
+
+
+def _verify_fa3_knobs(cfg):
+    """L=8 FA3 specialization: pack GQA; keep heuristic splits (forced splits hurt verify)."""
+    if cfg["q_len"] != 8:
+        return 0, None  # decode: tip defaults
+    # pack heads into denser WGMMA tiles; num_splits=0 → FA3 heuristic (tip-stable)
+    pack = True if (cfg["num_q_heads"] > cfg["num_kv_heads"]) else None
+    return 0, pack
 
 
 def kernel_fn(data: Inputs) -> torch.Tensor:
@@ -278,10 +338,12 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
     device = qkv.device  # stay on the capture device
     scaled = cfg["kv_scale"] != 1.0  # non-unity scales need descales + divide-before-store
     has_rope = bool(cfg["rope_theta"])  # sliding layers only
-    # FA3 scheduler is only present on full-attn decode; verify/sliding omit it
-    sched = data["scheduler_metadata"]
-    # batch [B,L,H,D] path: TK-friendly L=8 Q tile; keep varlen when schedule is fixed
-    use_batch_q = sched is None
+    verify = length == 8  # config-stable branch (CUDA-graph OK)
+    num_splits, pack_gqa = _verify_fa3_knobs(cfg)
+    # FA3 scheduler only on full-attn decode; drop if we force splits
+    sched = data["scheduler_metadata"] if num_splits == 0 else None
+    # L=8 always dense batch Q; decode uses batch when no fixed schedule (sliding)
+    use_batch_q = verify or sched is None
 
     k_cache, v_cache = data["k_cache"], data["v_cache"]  # in-place FP8 pools
 
@@ -290,7 +352,7 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
         cos_sin = _cos_sin(cfg["rope_theta"], d, device) if has_rope else None
         q = _fused_qk_rope_store(
             qkv, data["positions"], cos_sin, k_cache, v_cache, data["cache_loc"],
-            hq, hkv, d, has_rope,
+            hq, hkv, d, has_rope, length,
         )
         q = q.view(batch, length, hq, d) if use_batch_q else q.view(tokens, hq, d)
     else:
@@ -334,14 +396,18 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
         # sliding: last `window` tokens → FA window (window-1, 0); full → (-1, -1)
         window_size=(window - 1, 0) if window else (-1, -1),
         scheduler_metadata=sched,  # only non-None on full decode
+        num_splits=num_splits,  # 0 → FA3 heuristic
         **descale,  # empty on scored unity-scale loads
     )
     if use_batch_q:
-        # L=8 causal block is a short Q tile; pack GQA for denser WGMMA along heads
-        fa_kwargs["pack_gqa"] = True
+        # L=8 / sliding: pack GQA for denser WGMMA along heads (Hopper fragment fill)
+        fa_kwargs["pack_gqa"] = True if pack_gqa is None else pack_gqa
+        fa_kwargs["max_seqlen_q"] = length  # uniform_q_len hint for FA3
     else:
         fa_kwargs["cu_seqlens_q"] = data["cu_seqlens_q"]
         fa_kwargs["max_seqlen_q"] = length
+        if pack_gqa is not None:
+            fa_kwargs["pack_gqa"] = pack_gqa
 
     out = flash_attn_with_kvcache(**fa_kwargs)
     if isinstance(out, tuple):  # some FA builds return (out, softmax_lse, ...)
@@ -349,5 +415,5 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
 
     gate = qkv[:, (hq + 2 * hkv) * d:]  # gate logits share the fused projection buffer
     # fused epilogue: avoid separate .to(bf16) materialization + rms_norm_gate launch
-    o = _fused_rms_norm_gate(out, gate, tokens, hq, d)
+    o = _fused_rms_norm_gate(out, gate, tokens, hq, d, length)
     return o.view(batch, length, hq * d)  # judge expects bf16 [B, L, Hq*D]
