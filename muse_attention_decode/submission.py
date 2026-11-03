@@ -1,11 +1,21 @@
 # okc: problem=muse_attention_decode
-"""FA3 gated decode + FA2-style work partitioning for verify (L=8).
+"""FA3 attention spine + FA4-style producer/consumer pipelining co-design.
 
-Spine: FlashAttention-3 (Shah/Dao 2024) via `flash_attn_with_kvcache` with fused
-Triton prep + gated RMS epilogue (~1.08× tip). FA2 (Dao 2023) ideas applied around
-that spine for short-Q verify: (1) do not over-split KV on sliding windows
-(`num_splits=1` → skip FlashAttnFwdCombine tax that dominated tip profiles),
-(2) pack GQA, (3) coarser Triton Q/epilogue tiles so L=8 prep is not launch-bound.
+Paper: FlashAttention-4 (Zadouri / Dao et al., 2026) — algorithm + kernel pipelining
+co-design for asymmetric hardware (overlap matmul with non-matmul / memory stages).
+We keep FlashAttention-3 (`flash_attn_with_kvcache`) as the attention engine on Hopper,
+and apply FA4's co-design idea *around* it so verify (q_len=8) is not launch-/traffic-
+bound on the prep → FA → epilogue chain:
+
+  1. Fused prep producer: QK-RMSNorm[+RoPE] + FP8 KV store + FP8 Q (one Triton grid).
+  2. FA3 consumer: feeds on prep outputs; sliding path uses num_splits=1 to skip the
+     FlashAttnFwdCombine stage (FA4-style: drop non-matmul sync work when tiles fit).
+  3. Preallocated FA `out=` workspace: removes the DtoD/elementwise contig copy seen
+     on verify in the tip profile (~2 µs / 10%+ on L=8 sliding).
+  4. Blocked, software-pipelined epilogue (BLOCK_M + num_stages): FA→RMSNorm×sigmoid
+     in one launch, tuned for verify batch 16/32 head-row counts.
+
+CUDA-graph safe: no .item/.cpu/sync; workspaces keyed only by static config shapes.
 """
 
 from typing import TypedDict  # shape/dtype contracts for Inputs / Config
@@ -58,6 +68,10 @@ FP8_E4M3_MAX = 448.0  # saturate before FP8 cast (same bound as FusedQKNorm)
 _NORMS = {}  # cache FusedQKNorm modules keyed by (hq, hkv, d) — config-stable, not per-input
 _ROPE = {}  # cache float32 cos|sin tables keyed by rope_theta — built once per theta
 ROPE_POSITIONS = 1 << 21  # SGLang RotaryEmbedding table length (covers long contexts)
+# FA4-style ping-pong workspaces: keyed by static (tokens, hq, d, device) — never by data
+_WS_Q: dict = {}  # FP8 Q [T, Hq, D] fed to FA3
+_WS_FA: dict = {}  # bf16 FA out [T, Hq, D] written via out=
+_WS_O: dict = {}  # bf16 final [T, Hq*D] gated epilogue
 
 
 def _qk_norm(hq, hkv, d):
@@ -81,10 +95,18 @@ def _cos_sin(theta, d, device):
     return cache  # subsequent calls hit the module-level dict
 
 
+def _ws(store, key, shape, dtype, device):
+    """Reuse a device buffer for this static shape (CUDA-graph: alloc once per capture)."""
+    buf = store.get(key)
+    if buf is None or buf.shape != shape or buf.dtype != dtype or buf.device != device:
+        buf = store[key] = torch.empty(shape, dtype=dtype, device=device)
+    return buf
+
+
 @triton.jit
 def _fused_qk_rope_store_kernel(
     QKV,  # [T, qkv_width] fused projection: Q heads | K heads | V heads | gate
-    Q_OUT,  # [T, Hq*D] contiguous queries for FA3 (FP8 when FP8_KV_STORE)
+    Q_OUT,  # [T, Hq, D] contiguous queries for FA3 (FP8 when FP8_KV_STORE)
     POS,  # [T] positions; read only if HAS_ROPE
     COS_SIN,  # [max_pos, D] fp32 cos then sin halves; read only if HAS_ROPE
     K_CACHE,  # [N, Hkv*D] flat FP8/BF16 K pool rows
@@ -92,6 +114,7 @@ def _fused_qk_rope_store_kernel(
     CACHE_LOC,  # [T] destination row per token (slot 0 is LIVE here — do not skip)
     eps,  # RMSNorm epsilon
     stride_qkv,  # elements between successive tokens in QKV
+    stride_qo,  # elements between successive tokens in Q_OUT (Hq*D when contiguous)
     n_rows,  # T * (Hq + 2*Hkv): one program row per (token, Q/K/V head)
     NUM_Q_HEADS: tl.constexpr,  # Hq
     NUM_KV_HEADS: tl.constexpr,  # Hkv
@@ -102,7 +125,7 @@ def _fused_qk_rope_store_kernel(
     FP8_KV_STORE: tl.constexpr,  # 1 → saturate + store E4M3, emit FP8 Q
     FP8_MAX: tl.constexpr,  # 448.0
 ):
-    """One launch: per-head RMSNorm Q/K, optional RoPE, FP8 KV store, FP8 Q out."""
+    """Producer stage: per-head RMSNorm Q/K, optional RoPE, FP8 KV store, FP8 Q out."""
     pid = tl.program_id(0)  # which BLOCK_M-chunk of (token, head) rows we own
     rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)  # absolute row ids in this block
     row_mask = rows < n_rows  # mask padded lanes past the last live row
@@ -154,13 +177,14 @@ def _fused_qk_rope_store_kernel(
     tl.store(K_CACHE + kv_dst[:, None] + cols[None, :], x, mask=kv_mask & is_k[:, None])
     tl.store(V_CACHE + kv_dst[:, None] + cols[None, :], x, mask=kv_mask & is_v[:, None])
 
-    q_dst = tl.where(is_q, (token * NUM_Q_HEADS + head) * D, 0)  # pack Q for FA3
+    # pack Q as [T, Hq, D] so FA3 consumes without a host reshape/contig stage
+    q_dst = tl.where(is_q, token * stride_qo + head * D, 0)
     tl.store(Q_OUT + q_dst[:, None] + cols[None, :], x, mask=mask & is_q[:, None])
 
 
 @triton.jit
 def _rms_norm_gate_epilogue_kernel(
-    X,  # [tokens*Hq, D] FA3 attention output (any float dtype FA returned)
+    X,  # [tokens*Hq, D] FA3 attention output (preallocated contig workspace)
     GATE,  # [tokens*Hq, D] gate logits from the fused QKV projection
     OUT,  # [tokens*Hq, D] bf16 final gated normalized output
     eps,  # RMSNorm epsilon
@@ -170,15 +194,15 @@ def _rms_norm_gate_epilogue_kernel(
     stride_o,  # row stride of OUT
     D: tl.constexpr,  # head_dim
     BD: tl.constexpr,  # next_power_of_2(D)
-    BLOCK_M: tl.constexpr,  # FA2: rows per program (coarser on verify)
+    BLOCK_M: tl.constexpr,  # head-rows per program (FA4-style tile overlap width)
 ):
-    """Fuse FA→bf16 cast + per-head RMSNorm + sigmoid(gate) into one write."""
-    pid = tl.program_id(0)  # BLOCK_M-chunk of (token, head) rows
-    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)  # absolute head-row ids
-    row_mask = rows < n_rows  # mask padded lanes
-    cols = tl.arange(0, BD)  # columns covering head_dim
-    col_mask = cols < D  # drop padding lanes
-    mask = row_mask[:, None] & col_mask[None, :]  # 2D validity
+    """Consumer epilogue: FA→bf16 cast + per-head RMSNorm + sigmoid(gate), blocked."""
+    pid = tl.program_id(0)  # BLOCK_M head-rows per CTA
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_mask = rows < n_rows
+    cols = tl.arange(0, BD)
+    col_mask = cols < D
+    mask = row_mask[:, None] & col_mask[None, :]
     # load FA output and gate; promote to fp32 for stable RMS + sigmoid
     x = tl.load(X + rows[:, None] * stride_x + cols[None, :], mask=mask, other=0.0).to(tl.float32)
     g = tl.load(GATE + rows[:, None] * stride_g + cols[None, :], mask=mask, other=0.0).to(tl.float32)
@@ -189,57 +213,34 @@ def _rms_norm_gate_epilogue_kernel(
     tl.store(OUT + rows[:, None] * stride_o + cols[None, :], y.to(tl.bfloat16), mask=mask)
 
 
-def _prep_block_m(n_rows, q_len):
-    """FA2-style Q tiling: coarser blocks for short verify so prep is not over-split."""
-    if q_len >= 8:  # verify L=8: B∈{1..32} → n_rows up to 32*8*20=5120
-        if n_rows < 256:
-            return 16
-        if n_rows < 2048:
-            return 32
-        return 64  # B=32 verify: fewer programs than tip's block_m=8
-    if n_rows < 1024:
-        return 4
-    if n_rows < 8192:
-        return 8
-    if n_rows < 65536:
-        return 16
-    return 32
-
-
-def _fa3_partition(cfg):
-    """FA2 work partitioning for FA3: avoid over-split on windowed short-Q; pack GQA.
-
-    Tip profiles: sliding verify spent ~20% in FlashAttnFwdCombine from heuristic
-    KV splits. Window already bounds KV (~2048); L=8×Hq supplies enough Q tiles.
-    Full layers keep num_splits=0 (heuristic + scheduler_metadata).
-    """
-    hq, hkv = cfg["num_q_heads"], cfg["num_kv_heads"]
-    pack = True if (hq > hkv and hq % hkv == 0) else None  # GQA pack when legal
-    if cfg["window"]:  # sliding: force one KV partition (skip combine)
-        return 1, pack
-    return 0, pack  # full: FA3 heuristic; keep scheduler_metadata
-
-
-def _fused_qk_rope_store(qkv, positions, cos_sin, k_cache, v_cache, cache_loc, hq, hkv, d, has_rope, q_len):
-    """Host wrapper: launch fused prep; returns FP8 Q ready for FA3 (unity kv_scale)."""
+def _fused_qk_rope_store(qkv, positions, cos_sin, k_cache, v_cache, cache_loc, hq, hkv, d, has_rope, q_out):
+    """Host wrapper: launch fused prep into preallocated FP8 Q [T, Hq, D]."""
     tokens = qkv.shape[0]  # B*L flattened token count
     heads = hq + 2 * hkv  # Q+K+V heads processed as rows
     n_rows = tokens * heads  # total (token, head) rows
-    block_m = _prep_block_m(n_rows, q_len)  # FA2: coarser on verify
-    q_out = torch.empty(tokens, hq * d, dtype=FP8, device=qkv.device)  # FA3 wants FP8 queries
+    # verify L=8: slightly larger tiles cut grid launches on small T; decode keeps fine grain
+    if tokens <= 8:
+        block_m = 4
+    elif tokens <= 64:
+        block_m = 8
+    elif tokens <= 256:
+        block_m = 16
+    else:
+        block_m = 32
     # flatten paged caches to [rows, Hkv*D] so the kernel can address by cache_loc
     k_flat = k_cache.view(-1, hkv * d)
     v_flat = v_cache.view(-1, hkv * d)
     _fused_qk_rope_store_kernel[(triton.cdiv(n_rows, block_m),)](
         qkv,  # fused projection
-        q_out,  # FP8 Q destination
+        q_out,  # FP8 Q destination [T, Hq, D]
         positions if has_rope else qkv,  # dummy ptr when no RoPE (not read)
         cos_sin if has_rope else qkv,  # dummy ptr when no RoPE
         k_flat,  # K cache rows
         v_flat,  # V cache rows
         cache_loc,  # per-token destinations
         RMS_EPS,  # norm eps
-        qkv.stride(0),  # token stride
+        qkv.stride(0),  # token stride in QKV
+        q_out.stride(0),  # token stride in Q_OUT (= Hq*D when contig)
         n_rows,  # grid bound
         hq,  # NUM_Q_HEADS
         hkv,  # NUM_KV_HEADS
@@ -250,24 +251,24 @@ def _fused_qk_rope_store(qkv, positions, cos_sin, k_cache, v_cache, cache_loc, h
         FP8_KV_STORE=True,  # always FP8 cache on this problem
         FP8_MAX=FP8_E4M3_MAX,  # saturate bound
         num_warps=4,  # matches FusedQKNorm sweep default
+        num_stages=2,  # FA4-style software pipeline of loads vs RMS/RoPE math
     )
-    return q_out  # [T, Hq*D] float8_e4m3fn
+    return q_out  # [T, Hq, D] float8_e4m3fn
 
 
-def _fused_rms_norm_gate(attn_out, gate, tokens, hq, d, q_len):
-    """Host wrapper: FA output + gate → bf16 [T, Hq*D] via one Triton epilogue."""
-    # FA3 may return [T, Hq, D] or [T, Hq*D]; force a contiguous row-per-head view
-    x = attn_out.reshape(tokens * hq, d)
-    if not x.is_contiguous():  # rare non-contiguous FA view — one contig copy
-        x = x.contiguous()
+def _fused_rms_norm_gate(attn_out, gate, tokens, hq, d, out):
+    """Host wrapper: FA out workspace + gate → bf16 [T, Hq*D] via blocked epilogue."""
+    x = attn_out.reshape(tokens * hq, d)  # FA wrote contig [T,Hq,D] via out=
     g = gate.reshape(tokens * hq, d)  # gate already lives inside qkv; view only
-    if not g.is_contiguous():
-        g = g.contiguous()
-    out = torch.empty(tokens, hq * d, dtype=torch.bfloat16, device=x.device)  # final buffer
-    out_rows = out.view(tokens * hq, d)  # kernel writes head-rows in BLOCK_M chunks
+    out_rows = out.view(tokens * hq, d)  # kernel writes one head-row at a time
     n_rows = tokens * hq
-    # FA2: tile epilogue — verify L=8 uses 8–16 rows/program vs tip's 1
-    block_m = 16 if (q_len >= 8 and n_rows >= 16) else (8 if n_rows >= 8 else 1)
+    # verify B=16/32 → hundreds–thousands of head-rows: tile to cut CTA count
+    if n_rows <= 128:
+        block_m = 4
+    elif n_rows <= 512:
+        block_m = 8
+    else:
+        block_m = 16
     _rms_norm_gate_epilogue_kernel[(triton.cdiv(n_rows, block_m),)](
         x,  # attention values
         g,  # gate logits
@@ -280,13 +281,14 @@ def _fused_rms_norm_gate(attn_out, gate, tokens, hq, d, q_len):
         d,  # D
         triton.next_power_of_2(d),  # BD
         block_m,  # BLOCK_M
-        num_warps=4,  # small head_dim=64: 4 warps is enough
+        num_warps=4,  # head_dim=64: 4 warps enough
+        num_stages=3,  # deeper pipeline: overlap X/gate loads with RMS+sigmoid
     )
     return out  # [T, Hq*D] bfloat16
 
 
 def kernel_fn(data: Inputs) -> torch.Tensor:
-    """Timed entry: fused prep (or scaled fallback) → FA3 → fused gated RMS epilogue."""
+    """Timed entry: pipelined prep → FA3 (out=) → blocked gated RMS epilogue."""
     cfg = data["config"]  # static knobs for this captured graph
     batch, length = cfg["batch"], cfg["q_len"]  # B, L
     hq, hkv, d = cfg["num_q_heads"], cfg["num_kv_heads"], cfg["head_dim"]  # head geometry
@@ -295,17 +297,22 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
     device = qkv.device  # stay on the capture device
     scaled = cfg["kv_scale"] != 1.0  # non-unity scales need descales + divide-before-store
     has_rope = bool(cfg["rope_theta"])  # sliding layers only
+    window = cfg["window"]  # 2048 or 0
 
     k_cache, v_cache = data["k_cache"], data["v_cache"]  # in-place FP8 pools
+    # shape-keyed workspaces: eliminate per-call empty + FA DtoD contig on verify
+    ws_key = (tokens, hq, d, device)
+    q_buf = _ws(_WS_Q, ws_key, (tokens, hq, d), FP8, device)
+    fa_buf = _ws(_WS_FA, ws_key, (tokens, hq, d), torch.bfloat16, device)
+    o_buf = _ws(_WS_O, ws_key, (tokens, hq * d), torch.bfloat16, device)
 
     if not scaled:
         # Unity scales: one Triton launch does QK-norm[+RoPE], FP8 KV write, FP8 Q.
         cos_sin = _cos_sin(cfg["rope_theta"], d, device) if has_rope else None
         q = _fused_qk_rope_store(
             qkv, data["positions"], cos_sin, k_cache, v_cache, data["cache_loc"],
-            hq, hkv, d, has_rope, length,
+            hq, hkv, d, has_rope, q_buf,
         )
-        q = q.view(tokens, hq, d)  # FA3 expects [T, Hq, D]
     else:
         # Non-unity scales: keep SGLang FusedQKNorm + store_cache + FA descales.
         if has_rope:
@@ -323,7 +330,6 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
         )
         q = q.view(tokens, hq, d).to(FP8)  # FA3 FP8 query cast (separate launch on this path)
 
-    window = cfg["window"]  # 2048 or 0
     descale = {}  # FA3 optional KV descale tensors
     if scaled:
         # broadcast scalar scales to [B, Hkv] as flash_attn_with_kvcache expects
@@ -332,33 +338,31 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
             v_descale=data["v_scale"].reshape(1, 1).expand(batch, hkv),
         )
 
-    num_splits, pack_gqa = _fa3_partition(cfg)  # FA2: sliding → no KV over-split; pack GQA
-    # scheduler_metadata assumes heuristic splits; only pass it when num_splits==0
-    sched = data["scheduler_metadata"] if num_splits == 0 else None
-
-    # FlashAttention-3 paged decode: causal, windowed or full; FA2 partition knobs above
-    out = flash_attn_with_kvcache(
+    # Sliding window (≤2048 KV): one split avoids FlashAttnFwdCombine — tip profile showed
+    # combine at ~20% of verify-1 sliding. Full context keeps heuristic splits (num_splits=0).
+    fa_kwargs = dict(
         q=q,  # FP8 queries [T, Hq, D]
         k_cache=k_cache,  # FP8 paged K
         v_cache=v_cache,  # FP8 paged V
         page_table=data["page_table"],  # logical→physical pages
         cache_seqlens=data["cache_seqlens"],  # KV lengths including this block
-        cu_seqlens_q=data["cu_seqlens_q"],  # query prefix sums (one seq per request)
+        cu_seqlens_q=data["cu_seqlens_q"],  # query prefix sums
         max_seqlen_q=length,  # L
         # fold Muse's 5.473 query gain into softmax scale (same as SGLang)
         softmax_scale=cfg["sm_scale"] * cfg["qk_scale_factor"],
         causal=True,  # decode/verify causality inside the block
         # sliding: last `window` tokens → FA window (window-1, 0); full → (-1, -1)
         window_size=(window - 1, 0) if window else (-1, -1),
-        scheduler_metadata=sched,  # full decode schedule when using heuristic splits
-        num_splits=num_splits,  # 1 on sliding (skip combine); 0 heuristic on full
-        pack_gqa=pack_gqa,  # FA2/FA3 GQA packing when Hq>Hkv
+        scheduler_metadata=data["scheduler_metadata"],  # FA3 tile schedule on full decode
+        out=fa_buf,  # preallocated bf16 — kills DtoD contig copy into epilogue
         **descale,  # empty on scored unity-scale loads
     )
+    if window:  # sliding: FA4-style drop of non-matmul combine stage
+        fa_kwargs["num_splits"] = 1
+    out = flash_attn_with_kvcache(**fa_kwargs)
     if isinstance(out, tuple):  # some FA builds return (out, softmax_lse, ...)
         out = out[0]
 
     gate = qkv[:, (hq + 2 * hkv) * d:]  # gate logits share the fused projection buffer
-    # fused epilogue: avoid separate .to(bf16) materialization + rms_norm_gate launch
-    o = _fused_rms_norm_gate(out, gate, tokens, hq, d, length)
+    o = _fused_rms_norm_gate(out, gate, tokens, hq, d, o_buf)
     return o.view(batch, length, hq * d)  # judge expects bf16 [B, L, Hq*D]
