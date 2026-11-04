@@ -1,5 +1,5 @@
 # okc: problem=muse_bf16_proj
-"""Piece submission extracted from proven mega paste; unclaimed shapes fall back to SGLang."""
+"""Assemble step 1/6: small_m only (12-bit/BF16 GEMV). Unclaimed shapes → SGLang."""
 
 import hashlib
 import zlib
@@ -27,526 +27,626 @@ class Inputs(TypedDict):
     x: torch.Tensor
     config: Config
 
-tt_lt__LT_CPP = r'''
-#include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <cublasLt.h>
+# ---- small_m/small_m_kernels.py ----
+
+SM_CUDA_TEMPLATE = r'''
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <stdint.h>
 #include <algorithm>
-#include <array>
-#include <memory>
-#include <set>
-#include <vector>
+#include <type_traits>
+#include <cooperative_groups.h>
 
-#define LT_OK(call) TORCH_CHECK((call) == CUBLAS_STATUS_SUCCESS, "cuBLASLt failure: ", #call)
+#define SMD __device__ __forceinline__
 
-using Config = std::array<int64_t, 9>;
-
-Config config_of(const cublasLtMatmulAlgo_t& a) {
-  Config c{};
-  for (int i = 0; i < 9; ++i) {
-    size_t written = 0;
-    if (i >= 7) {
-      uint16_t value = 0;
-      cublasLtMatmulAlgoConfigGetAttribute(&a, (cublasLtMatmulAlgoConfigAttributes_t)i,
-                                          &value, sizeof(value), &written);
-      c[i] = value;
-    } else {
-      uint32_t value = 0;
-      cublasLtMatmulAlgoConfigGetAttribute(&a, (cublasLtMatmulAlgoConfigAttributes_t)i,
-                                          &value, sizeof(value), &written);
-      c[i] = value;
-    }
-  }
-  return c;
-}
-
-bool set_config(cublasLtMatmulAlgo_t& a, int attr, int value) {
-  if (attr >= 7) {
-    uint16_t v = value;
-    return cublasLtMatmulAlgoConfigSetAttribute(&a,
-      (cublasLtMatmulAlgoConfigAttributes_t)attr, &v, sizeof(v)) == CUBLAS_STATUS_SUCCESS;
-  }
-  uint32_t v = value;
-  return cublasLtMatmulAlgoConfigSetAttribute(&a,
-    (cublasLtMatmulAlgoConfigAttributes_t)attr, &v, sizeof(v)) == CUBLAS_STATUS_SUCCESS;
-}
-
-std::vector<uint32_t> cap_list(const cublasLtMatmulAlgo_t& a, cublasLtMatmulAlgoCapAttributes_t attr) {
-  size_t bytes = 0;
-  cublasLtMatmulAlgoCapGetAttribute(&a, attr, nullptr, 0, &bytes);
-  if (!bytes) return {0};
-  std::vector<uint32_t> values(bytes / sizeof(uint32_t));
-  if (cublasLtMatmulAlgoCapGetAttribute(&a, attr, values.data(), bytes, &bytes) != CUBLAS_STATUS_SUCCESS)
-    return {0};
-  return values;
-}
-
-uint32_t cap_int(const cublasLtMatmulAlgo_t& a, cublasLtMatmulAlgoCapAttributes_t attr) {
-  uint32_t v = 0;
-  size_t written = 0;
-  cublasLtMatmulAlgoCapGetAttribute(&a, attr, &v, sizeof(v), &written);
+SMD int4 sm_ldw(const int4* p) {
+  int4 v;
+  asm volatile("ld.global.nc.L1::no_allocate.v4.s32 {%0,%1,%2,%3}, [%4];"
+               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
   return v;
 }
 
-struct LtContext {
-  cublasLtHandle_t handle = nullptr;
-  torch::Tensor workspace;
-  explicit LtContext(torch::Tensor ws) : workspace(ws) {
-    c10::cuda::CUDAGuard guard(ws.device());
-    LT_OK(cublasLtCreate(&handle));
-  }
-  ~LtContext() { if (handle) cublasLtDestroy(handle); }
-};
-
-struct LtPlan {
-  std::shared_ptr<LtContext> context;
-  cublasLtMatmulDesc_t operation = nullptr;
-  cublasLtMatrixLayout_t a_layout = nullptr, b_layout = nullptr, d_layout = nullptr;
-  torch::Tensor weight, bias;
-  int m, n, k, layout, epilogue;
-  std::vector<cublasLtMatmulAlgo_t> algorithms;
-  std::vector<size_t> workspaces;
-  std::set<Config> seen;
-  std::vector<std::vector<int64_t>> diagnostics;
-  int checked = 0, heuristic_count = 0, id_count = 0;
-
-  LtPlan(std::shared_ptr<LtContext> ctx, torch::Tensor w, int rows, int cols,
-         int inner, int variant, int epi)
-      : context(ctx), weight(w), m(rows), n(cols), k(inner), layout(variant), epilogue(epi) {
-    c10::cuda::CUDAGuard guard(w.device());
-    LT_OK(cublasLtMatmulDescCreate(&operation, CUBLAS_COMPUTE_32F, CUDA_R_32F));
-    int8_t fast = 0;
-    LT_OK(cublasLtMatmulDescSetAttribute(operation, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fast, sizeof(fast)));
-    bool is_row = layout % 2;
-    bool is_packed = layout >= 2;
-    cublasOperation_t trans_a = !is_row && !is_packed ? CUBLAS_OP_T : CUBLAS_OP_N;
-    cublasOperation_t trans_b = is_row && !is_packed ? CUBLAS_OP_T : CUBLAS_OP_N;
-    LT_OK(cublasLtMatmulDescSetAttribute(operation, CUBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)));
-    LT_OK(cublasLtMatmulDescSetAttribute(operation, CUBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)));
-    if (is_row) {
-      LT_OK(cublasLtMatrixLayoutCreate(&a_layout, CUDA_R_16BF, m, k, k));
-      LT_OK(cublasLtMatrixLayoutCreate(&b_layout, CUDA_R_16BF, is_packed ? k : n,
-                                      is_packed ? n : k, is_packed ? n : k));
-      LT_OK(cublasLtMatrixLayoutCreate(&d_layout, CUDA_R_16BF, m, n, n));
-      cublasLtOrder_t order = CUBLASLT_ORDER_ROW;
-      for (auto d : {a_layout, b_layout, d_layout})
-        LT_OK(cublasLtMatrixLayoutSetAttribute(d, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)));
-    } else {
-      LT_OK(cublasLtMatrixLayoutCreate(&a_layout, CUDA_R_16BF, is_packed ? n : k,
-                                      is_packed ? k : n, is_packed ? n : k));
-      LT_OK(cublasLtMatrixLayoutCreate(&b_layout, CUDA_R_16BF, k, m, k));
-      LT_OK(cublasLtMatrixLayoutCreate(&d_layout, CUDA_R_16BF, n, m, n));
-    }
-    cublasLtEpilogue_t e = epi ? CUBLASLT_EPILOGUE_BIAS : CUBLASLT_EPILOGUE_DEFAULT;
-    LT_OK(cublasLtMatmulDescSetAttribute(operation, CUBLASLT_MATMUL_DESC_EPILOGUE, &e, sizeof(e)));
-    if (epi) {
-      bias = torch::zeros({std::max(m, n)}, w.options());
-      void* ptr = bias.data_ptr();
-      LT_OK(cublasLtMatmulDescSetAttribute(operation, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &ptr, sizeof(ptr)));
-    }
-  }
-
-  ~LtPlan() {
-    if (operation) cublasLtMatmulDescDestroy(operation);
-    if (a_layout) cublasLtMatrixLayoutDestroy(a_layout);
-    if (b_layout) cublasLtMatrixLayoutDestroy(b_layout);
-    if (d_layout) cublasLtMatrixLayoutDestroy(d_layout);
-  }
-
-  bool add(const cublasLtMatmulAlgo_t& algo) {
-    Config c = config_of(algo);
-    if (seen.count(c)) return false;
-    seen.insert(c);
-    ++checked;
-    if (diagnostics.size() < 32) {
-      uint64_t flags = 0;
-      size_t written = 0;
-      int status = cublasLtMatmulAlgoCapGetAttribute(&algo, CUBLASLT_ALGO_CAP_NUMERICAL_IMPL_FLAGS,
-        &flags, sizeof(flags), &written);
-      std::vector<int64_t> row(c.begin(), c.end());
-      row.push_back(flags);
-      row.push_back(status);
-      diagnostics.push_back(row);
-    }
-    if (c[3] != CUBLASLT_REDUCTION_SCHEME_NONE && c[3] != CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE)
-      return false;
-    if (c[2] > 1 && c[3] != CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE) return false;
-    uint64_t flags = 0;
-    size_t written = 0;
-    if (cublasLtMatmulAlgoCapGetAttribute(&algo, CUBLASLT_ALGO_CAP_NUMERICAL_IMPL_FLAGS,
-                                         &flags, sizeof(flags), &written) != CUBLAS_STATUS_SUCCESS) return false;
-    if ((flags & CUBLASLT_NUMERICAL_IMPL_FLAGS_ACCUMULATOR_TYPE_MASK) != CUBLASLT_NUMERICAL_IMPL_FLAGS_ACCUMULATOR_32F)
-      return false;
-    // Algo 66 reports INPUT_16F even for CUDA_R_16BF descriptors in cuBLASLt 13.
-    // The descriptors fix BF16 storage; reject TF32 and require FP32 accumulators.
-    if (flags & CUBLASLT_NUMERICAL_IMPL_FLAGS_INPUT_TF32)
-      return false;
-    cublasLtMatmulHeuristicResult_t result{};
-    if (cublasLtMatmulAlgoCheck(context->handle, operation, a_layout, b_layout,
-                               d_layout, d_layout, &algo, &result) != CUBLAS_STATUS_SUCCESS) return false;
-    if (result.state != CUBLAS_STATUS_SUCCESS || result.workspaceSize > size_t(context->workspace.numel())) return false;
-    algorithms.push_back(algo);
-    workspaces.push_back(result.workspaceSize);
-    return true;
-  }
-
-  int restore(std::vector<int64_t> values) {
-    TORCH_CHECK(values.size() == 9, "expected nine cuBLASLt configuration fields");
-    cublasLtMatmulAlgo_t algo{};
-    if (cublasLtMatmulAlgoInit(context->handle, CUBLAS_COMPUTE_32F, CUDA_R_32F,
-        CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF, values[0], &algo) != CUBLAS_STATUS_SUCCESS) return -1;
-    for (int i = 1; i < 9; ++i) {
-      if (!set_config(algo, i, values[i]) && values[i] != 0) return -1;
-    }
-    if (!add(algo)) return -1;
-    return algorithms.size() - 1;
-  }
-
-  void enumerate(bool exhaustive) {
-    c10::cuda::CUDAGuard guard(weight.device());
-    cublasLtMatmulPreference_t pref;
-    LT_OK(cublasLtMatmulPreferenceCreate(&pref));
-    uint32_t reduction = CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE;
-    LT_OK(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
-                                             &reduction, sizeof(reduction)));
-    for (size_t ws : {size_t(0), size_t(4 << 20), size_t(32 << 20), size_t(128 << 20)}) {
-      ws = std::min(ws, size_t(context->workspace.numel()));
-      LT_OK(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)));
-      std::vector<cublasLtMatmulHeuristicResult_t> result(256);
-      int count = 0;
-      auto rc = cublasLtMatmulAlgoGetHeuristic(context->handle, operation, a_layout, b_layout,
-                                               d_layout, d_layout, pref, 256, result.data(), &count);
-      if (rc != CUBLAS_STATUS_SUCCESS) continue;
-      heuristic_count += count;
-      for (int i = 0; i < count; ++i) if (result[i].state == CUBLAS_STATUS_SUCCESS) add(result[i].algo);
-    }
-    cublasLtMatmulPreferenceDestroy(pref);
-    if (!exhaustive) return;
-    std::array<int, 256> ids{};
-    LT_OK(cublasLtMatmulAlgoGetIds(context->handle, CUBLAS_COMPUTE_32F, CUDA_R_32F,
-      CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF, ids.size(), ids.data(), &id_count));
-    for (int i = 0; i < id_count; ++i) {
-      cublasLtMatmulAlgo_t a{};
-      if (cublasLtMatmulAlgoInit(context->handle, CUBLAS_COMPUTE_32F, CUDA_R_32F,
-          CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF, ids[i], &a) != CUBLAS_STATUS_SUCCESS) continue;
-      auto tiles = cap_list(a, CUBLASLT_ALGO_CAP_TILE_IDS);
-      auto stages = cap_list(a, CUBLASLT_ALGO_CAP_STAGES_IDS);
-      for (auto tile : tiles) for (auto stage : stages) {
-        auto b = a;
-        if (!set_config(b, 1, tile) || !set_config(b, 6, stage)) continue;
-        add(b);
-        if (tiles.size() > 100) {
-          for (int cluster : {2, 3, 4, 5, 6, 7, 8, 9, 11, 12}) {
-            auto s = b;
-            if (set_config(s, 8, cluster)) add(s);
-          }
-        }
-      }
-    }
-  }
-
-  void expand(std::vector<int> indices) {
-    for (int index : indices) {
-      auto a = algorithms.at(index);
-      if (cap_int(a, CUBLASLT_ALGO_CAP_SPLITK_SUPPORT) &&
-          (cap_int(a, CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK) & CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE)) {
-        for (int split : {2, 3, 4, 6, 8, 12, 16}) {
-          auto b = a;
-          if (set_config(b, 2, split) && set_config(b, 3, CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE)) add(b);
-        }
-      }
-      auto stages = cap_list(a, CUBLASLT_ALGO_CAP_STAGES_IDS);
-      for (auto stage : stages) {
-        auto b = a;
-        if (set_config(b, 6, stage)) add(b);
-      }
-      for (int swizzle = 0; swizzle <= int(cap_int(a, CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT)); ++swizzle) {
-        for (int custom = 0; custom <= int(cap_int(a, CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX)); ++custom) {
-          for (int cluster : {0, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12}) {
-            auto b = a;
-            if (set_config(b, 4, swizzle) && set_config(b, 5, custom) && set_config(b, 8, cluster)) add(b);
-          }
-        }
-      }
-    }
-  }
-
-  std::vector<std::vector<int64_t>> metadata() const {
-    std::vector<std::vector<int64_t>> result;
-    for (size_t i = 0; i < algorithms.size(); ++i) {
-      Config c = config_of(algorithms[i]);
-      std::vector<int64_t> row(c.begin(), c.end());
-      row.push_back(workspaces[i]);
-      result.push_back(row);
-    }
-    return result;
-  }
-
-  int run(torch::Tensor x, torch::Tensor out, int index) {
-    const float alpha = 1.0f, beta = 0.0f;
-    const void* a = layout % 2 ? x.data_ptr() : weight.data_ptr();
-    const void* b = layout % 2 ? weight.data_ptr() : x.data_ptr();
-    return int(cublasLtMatmul(context->handle, operation, &alpha, a, a_layout, b, b_layout,
-      &beta, out.data_ptr(), d_layout, out.data_ptr(), d_layout, &algorithms.at(index),
-      context->workspace.data_ptr(), workspaces.at(index), at::cuda::getCurrentCUDAStream(x.get_device())));
-  }
-};
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("version", []() { return cublasLtGetVersion(); });
-  pybind11::class_<LtContext, std::shared_ptr<LtContext>>(m, "Context")
-    .def(pybind11::init<torch::Tensor>());
-  pybind11::class_<LtPlan, std::shared_ptr<LtPlan>>(m, "Plan")
-    .def(pybind11::init<std::shared_ptr<LtContext>, torch::Tensor, int, int, int, int, int>())
-    .def("enumerate", &LtPlan::enumerate).def("expand", &LtPlan::expand)
-    .def("metadata", &LtPlan::metadata).def("restore", &LtPlan::restore).def("run", &LtPlan::run)
-    .def_readonly("checked", &LtPlan::checked).def_readonly("heuristic_count", &LtPlan::heuristic_count)
-    .def_readonly("diagnostics", &LtPlan::diagnostics)
-    .def_readonly("id_count", &LtPlan::id_count);
+SMD uint4 sm_ldx(const void* p) {
+  uint4 v;
+  asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+  return v;
 }
-'''
-tt_lt__LT_EXT = None
-tt_lt__LT_WORKSPACE_BYTES = 128 << 20
-tt_lt__LT_LAYERS = ('qkv_gate', 'o', 'pooler', 'unpooler')
-tt_lt__LT_H200_FIXED = {(256, 'o'): (2, 0, [66, 17, 1, 0, 0, 0, 35, 0, 2]), (128, 'unpooler'): (2, 0, [66, 18, 1, 0, 0, 3, 35, 0, 5]), (256, 'unpooler'): (3, 0, [66, 20, 1, 0, 0, 4, 35, 0, 2]), (128, 'qkv_gate'): (0, 0, [66, 92, 1, 0, 0, 0, 35, 0, 5]), (256, 'qkv_gate'): (0, 0, [66, 124, 1, 0, 0, 0, 35, 0, 2]), (128, 'pooler'): (2, 0, [66, 15, 1, 0, 0, 4, 35, 0, 2]), (256, 'pooler'): (3, 0, [66, 18, 1, 0, 0, 0, 35, 0, 2])}
-tt_lt__LT_H200_VERSION = 130101
-tt_lt__LT_SEARCH_SEEDS = {(128, 'qkv_gate'): [(2, 0, [66, 15, 1, 0, 0, 0, 35, 0, 2]), (2, 0, [66, 15, 1, 0, 0, 1, 35, 0, 2]), (2, 0, [66, 15, 1, 0, 0, 0, 35, 0, 4])], (128, 'o'): [(2, 0, [66, 18, 1, 0, 0, 4, 35, 0, 2]), (2, 0, [66, 17, 1, 0, 0, 0, 35, 0, 2]), (3, 0, [66, 18, 1, 0, 0, 2, 35, 0, 5]), (3, 0, [66, 18, 1, 0, 0, 5, 35, 0, 2])], (128, 'pooler'): [(2, 0, [66, 15, 1, 0, 0, 1, 35, 0, 2]), (2, 0, [66, 15, 1, 0, 0, 0, 35, 0, 2]), (2, 0, [66, 15, 1, 0, 0, 2, 35, 0, 5])], (128, 'unpooler'): [(2, 0, [66, 18, 1, 0, 0, 0, 35, 0, 2]), (2, 0, [66, 18, 1, 0, 0, 6, 35, 0, 5]), (2, 0, [66, 28, 1, 0, 0, 2, 35, 0, 2]), (3, 0, [66, 18, 1, 0, 0, 5, 35, 0, 2])], (256, 'qkv_gate'): [(0, 0, [66, 134, 1, 0, 0, 0, 35, 0, 9]), (1, 0, [66, 134, 1, 0, 0, 2, 35, 0, 9]), (0, 0, [66, 134, 1, 0, 0, 0, 35, 0, 2])], (256, 'o'): [(1, 0, [66, 20, 1, 0, 0, 7, 35, 0, 5]), (2, 0, [66, 20, 1, 0, 0, 4, 35, 0, 5]), (3, 0, [66, 20, 1, 0, 0, 5, 35, 0, 3]), (2, 0, [66, 20, 1, 0, 0, 0, 35, 0, 5])], (256, 'pooler'): [(3, 0, [66, 18, 1, 0, 0, 0, 35, 0, 2]), (3, 0, [66, 18, 1, 0, 0, 4, 35, 0, 3]), (0, 0, [66, 183, 1, 0, 0, 0, 35, 0, 8]), (0, 0, [66, 183, 1, 0, 0, 0, 35, 0, 9])], (256, 'unpooler'): [(2, 0, [66, 20, 1, 0, 0, 0, 35, 0, 5]), (2, 0, [66, 20, 1, 0, 0, 5, 35, 0, 2]), (3, 0, [66, 20, 1, 0, 0, 0, 35, 0, 3])]}
 
-def tt_lt__lt_build():
-    global tt_lt__LT_EXT
-    if tt_lt__LT_EXT is None:
-        tt_lt__LT_EXT = load_inline(name='muse_cublaslt_v1', cpp_sources=tt_lt__LT_CPP, with_cuda=True, extra_cflags=['-O3', '-std=c++20'], extra_ldflags=['-l:libcublasLt.so.13'], verbose=False)
-    return tt_lt__LT_EXT
+SMD uint32_t sm_lde(const uint32_t* p) {
+  uint32_t v;
+  asm volatile("ld.global.nc.u32 %0, [%1];" : "=r"(v) : "l"(p));
+  return v;
+}
 
-def tt_lt__lt_state(weights: dict) -> dict:
-    ext = tt_lt__lt_build()
-    device = weights['qkv_gate'].device
-    workspace = torch.empty(tt_lt__LT_WORKSPACE_BYTES, device=device, dtype=torch.uint8)
-    return {'ext': ext, 'version': ext.version(), 'context': ext.Context(workspace), 'configs': {}, 'weights': {name: weights[name].contiguous() for name in tt_lt__LT_LAYERS}, 'packed': {}, 'workspace': workspace}
+SMD uint32_t sm_prmt(uint32_t a, uint32_t b, uint32_t s) {
+  uint32_t d;
+  asm("prmt.b32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(s));
+  return d;
+}
 
-def tt_lt__lt_plan(st: dict, layer: str, m: int, layout: int, epilogue: int):
-    w = st['weights'][layer]
-    n, k = w.shape
-    if layout >= 2:
-        if layer not in st['packed']:
-            st['packed'][layer] = w.t().contiguous()
-        w = st['packed'][layer]
-    return st['ext'].Plan(st['context'], w, m, n, k, layout, epilogue)
+SMD void sm_mma(float (&c)[4], const uint32_t* a, uint32_t b0, uint32_t b1) {
+  asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
 
-def tt_lt_prepare_cublaslt(weights: dict) -> dict:
-    device = weights['qkv_gate'].device
-    props = torch.cuda.get_device_properties(device)
-    if (props.major, props.minor) != (9, 0) or not tt_lt__LT_H200_FIXED:
-        return {'configs': {}}
-    st = tt_lt__lt_state(weights)
-    if tt_lt__LT_H200_VERSION is not None and st['version'] != tt_lt__LT_H200_VERSION:
-        return {'configs': {}}
-    for key, descriptor in tt_lt__LT_H200_FIXED.items():
-        m, layer = key
-        layout, epilogue, config = descriptor
-        plan = tt_lt__lt_plan(st, layer, m, layout, epilogue)
-        index = plan.restore(list(config))
-        if index < 0 or plan.metadata()[index][:9] != list(config):
-            continue
-        x = torch.zeros((m, st['weights'][layer].shape[1]), device=device, dtype=torch.bfloat16)
-        out = torch.empty((m, st['weights'][layer].shape[0]), device=device, dtype=torch.bfloat16)
-        if plan.run(x, out, index) == 0:
-            st['configs'][key] = (plan, index)
-    torch.cuda.synchronize(device)
-    return st
+// 8 weights of one k16 step: low bytes in L0 (values 0-3) and L1 (values 4-7), 4-bit codes in C.
+SMD void sm_dec(uint32_t L0, uint32_t L1, uint32_t C, uint32_t T0, uint32_t T1, uint32_t* a) {
+  const uint32_t cm = C & 0x77777777u;
+  const uint32_t hlo = sm_prmt(T0, T1, cm);
+  const uint32_t hhi = sm_prmt(T0, T1, cm >> 16);
+  a[0] = sm_prmt(L0, hlo, 0x5140u) | ((C << 12) & 0x80008000u);
+  a[1] = sm_prmt(L0, hlo, 0x7362u) | ((C << 8) & 0x80008000u);
+  a[2] = sm_prmt(L1, hhi, 0x5140u) | ((C << 4) & 0x80008000u);
+  a[3] = sm_prmt(L1, hhi, 0x7362u) | (C & 0x80008000u);
+}
 
-def tt_lt_run_cublaslt(x: torch.Tensor, layer: str, n: int, st: dict) -> torch.Tensor | None:
-    entry = st['configs'].get((x.shape[0], layer))
-    if entry is None or not x.is_cuda or x.dtype != torch.bfloat16 or (not x.is_contiguous()):
-        return None
-    w = st['weights'][layer]
-    if x.device != w.device or w.dtype != torch.bfloat16 or tuple(w.shape) != (n, x.shape[1]) or x.data_ptr() % 256:
-        return None
-    out = torch.empty((x.shape[0], n), device=x.device, dtype=torch.bfloat16)
-    rc = entry[0].run(x, out, entry[1])
-    if rc:
-        raise RuntimeError(f'cuBLASLt launch failed: status {rc}')
-    return out
+__device__ __noinline__ void sm_never(void* p) { asm volatile("trap;"); }
 
-"""Experimental lossless BF16 register-A WGMMA projections, one launch per call."""
-import hashlib
-import torch
-from torch.utils.cpp_extension import load_inline
+// Never taken, but ptxas cannot prove it: ends the basic block so loads issue where written.
+SMD void sm_order_point(int m, void* p) {
+  uint32_t t;
+  asm volatile("mov.u32 %0, %%clock;" : "=r"(t));
+  if ((t & (uint32_t)m) == 0x7fffffffu) sm_never(p);
+}
 
-def tt_mw_mma(n):
-    nr = n // 2
-    regs = ','.join((f'%{i}' for i in range(nr)))
-    outs = ','.join((f'"+f"(d[{i}])' for i in range(nr)))
-    inputs = ','.join([f'"r"(a[{i}])' for i in range(16)] + [f'"l"(b+{2 * i})' for i in range(4)])
-    ops = ['wgmma.fence.sync.aligned;']
-    for kk in range(4):
-        ar = ','.join((f'%{nr + 4 * kk + i}' for i in range(4)))
-        ops.append(f'wgmma.mma_async.sync.aligned.m64n{n}k16.f32.bf16.bf16 {{{regs}}}, {{{ar}}}, %{nr + 16 + kk}, 1, 1, 1, 0;')
-    ops.append('wgmma.commit_group.sync.aligned; wgmma.wait_group.sync.aligned 0;')
-    return f'D void mma{n}(float* d,uint32_t* a,uint64_t b) {{asm volatile("' + ' '.join(ops) + f'" : {outs} : {inputs} : "memory");}}'
-tt_mw_CUDA_PREFIX = '\n\n#include <cuda.h>\n#include <cuda_runtime.h>\n#include <cuda_bf16.h>\n#include <stdint.h>\n#define D __device__ __forceinline__\nD uint32_t addr(void* p) { return uint32_t(__cvta_generic_to_shared(p)); }\nD void waitbar(uint32_t b,int p) {\n  asm volatile("{.reg .pred p; W: mbarrier.try_wait.parity.shared::cta.b64 p,[%0],%1; @!p bra W;}" :: "r"(b),"r"(p) : "memory");\n}\nD void arrive(uint32_t b) { asm volatile("mbarrier.arrive.shared::cta.b64 _,[%0];" :: "r"(b) : "memory"); }\nD void cluster_sync() { asm volatile("barrier.cluster.arrive.release.aligned; barrier.cluster.wait.acquire.aligned;" ::: "memory"); }\nD uint64_t desc(uint32_t a) { return uint64_t((a&0x3ffff)>>4) | (uint64_t(64)<<32) | (uint64_t(1)<<62); }\nD void tma(uint32_t d,const void* map,int k,int row,uint32_t b,uint64_t pol) {\n  asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0],[%1,{%2,%3}],[%4],%5;" :: "r"(d),"l"(map),"r"(k),"r"(row),"r"(b),"l"(pol) : "memory");\n}\nD uint4 ldw(const uint4* p,uint64_t policy) {\n  uint4 v;\n  asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.v4.u32 {%0,%1,%2,%3},[%4],%5;" : "=r"(v.x),"=r"(v.y),"=r"(v.z),"=r"(v.w) : "l"(p),"l"(policy));\n  return v;\n}\nD uint32_t prmt(uint32_t a,uint32_t b,uint32_t s) {\n  uint32_t d;asm("prmt.b32 %0,%1,%2,%3;":"=r"(d):"r"(a),"r"(b),"r"(s));return d;\n}\nD void dec(uint32_t l0,uint32_t l1,uint32_t c,uint32_t t0,uint32_t t1,uint32_t* a) {\n  uint32_t cm=c&0x77777777u,lo=prmt(t0,t1,cm),hi=prmt(t0,t1,cm>>16);\n  a[0]=prmt(l0,lo,0x5140u)|((c<<12)&0x80008000u);\n  a[1]=prmt(l0,lo,0x7362u)|((c<<8)&0x80008000u);\n  a[2]=prmt(l1,hi,0x5140u)|((c<<4)&0x80008000u);\n  a[3]=prmt(l1,hi,0x7362u)|(c&0x80008000u);\n}\nD void patch(uint32_t* a,uint32_t e) {\n  uint32_t reg=(e>>8)&31u,xr=(e&127u)<<(8+((e>>7)&1u)*16);\n  #pragma unroll\n  for(int r=0;r<16;r++) if(reg==r)a[r]^=xr;\n}\n\n'
-tt_mw_CUDA_CORE = r'''
+SMD uint32_t sm_smem_u32(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
 
-template<int BN,int R,int WK,int PF,int Q,bool C12,int CAP>
-__global__ __launch_bounds__(128*WK,CAP) void m32w_gemm(
-    const __grid_constant__ CUtensorMap tx,const uint4* __restrict__ w,
-    const uint32_t* __restrict__ esc,__nv_bfloat16* out,int m,int n,int k,int split,uint32_t t0,uint32_t t1) {
-  extern __shared__ __align__(1024) uint8_t sm[];
-  constexpr int RW=R/16,NT=128*WK,RP=R+4,SB=BN*128,WS=(Q*(SB+8)+1023)/1024*1024,NL=C12?3:4;
-  int tid=threadIdx.x,wg=tid/128,warp=tid%128/32,lane=tid%32;
-  uint32_t base0=addr(sm),base=base0+wg*WS,full=base+Q*SB;
-  int rank=blockIdx.x%split,nt=blockIdx.x/split,mt=blockIdx.y;
-  int kb0=(k/64)*(rank*WK+wg)/(split*WK),nkb=(k/64)*(rank*WK+wg+1)/(split*WK)-kb0;
-  uint64_t pw,px;
-  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0,1.0;":"=l"(pw));
-  asm volatile("createpolicy.fractional.L2::evict_last.b64 %0,1.0;":"=l"(px));
-  if(tid%128==0) {
-    for(int s=0;s<Q;s++)asm volatile("mbarrier.init.shared::cta.b64 [%0],1;" :: "r"(full+s*8) : "memory");
-    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-  }
-  __syncthreads();
-  auto loadx=[&](int i) {
-    if(tid%128==0 && i<nkb) {
-      int s=i%Q;
-      asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _,[%0],%1;" :: "r"(full+s*8),"r"(SB) : "memory");
-      tma(base+s*SB,&tx,(kb0+i)*64,mt*BN,full+s*8,px);
+SMD uint32_t sm_rank() {
+  uint32_t r;
+  asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(r));
+  return r;
+}
+
+SMD uint32_t sm_mapa(uint32_t a, uint32_t rank) {
+  uint32_t d;
+  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(rank));
+  return d;
+}
+
+SMD void sm_mbar_init(uint32_t bar, uint32_t count) {
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(bar), "r"(count) : "memory");
+}
+
+SMD void sm_mbar_expect(uint32_t bar, uint32_t tx) {
+  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(bar), "r"(tx) : "memory");
+}
+
+SMD void sm_fence_init() { asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory"); }
+SMD void sm_cl_arrive() { asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory"); }
+SMD void sm_cl_wait() { asm volatile("barrier.cluster.wait.aligned;" ::: "memory"); }
+
+SMD void sm_st_async4(uint32_t ra, float4 v, uint32_t rbar) {
+  asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.f32 [%0], {%1, %2, %3, %4}, [%5];"
+               ::"r"(ra), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w), "r"(rbar) : "memory");
+}
+
+SMD bool sm_mbar_try(uint32_t bar) {
+  uint32_t ok;
+  asm volatile("{\n .reg .pred p;\n mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%1], 0;\n"
+               " selp.u32 %0, 1, 0, p;\n}" : "=r"(ok) : "r"(bar) : "memory");
+  return ok != 0;
+}
+
+SMD uint64_t sm_gtime() {
+  uint64_t t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+
+// Bounded: a broken transaction count shows up as a device fault instead of consuming unfinished data.
+SMD void sm_wait_bar(uint32_t bar) {
+  if (sm_mbar_try(bar)) return;
+  const uint64_t t0 = sm_gtime();
+  while (!sm_mbar_try(bar))
+    if (sm_gtime() - t0 > 20000000ull) __trap();
+}
+
+SMD void sm_add4(float4& a, const float4& b) { a.x += b.x; a.y += b.y; a.z += b.z; a.w += b.w; }
+
+SMD float4 sm_shfl_xor4(const float4& v, int o) {
+  return make_float4(__shfl_xor_sync(0xffffffffu, v.x, o), __shfl_xor_sync(0xffffffffu, v.y, o),
+                     __shfl_xor_sync(0xffffffffu, v.z, o), __shfl_xor_sync(0xffffffffu, v.w, o));
+}
+
+SMD void sm_store(__nv_bfloat16* p, float v) { *p = __float2bfloat16_rn(v); }
+SMD void sm_store(float* p, float v) { *p = v; }
+
+template <int FMT> struct SmFmt;
+template <> struct SmFmt<0> { static constexpr int NL = 4, NA = 1; };
+template <> struct SmFmt<1> { static constexpr int NL = 3, NA = 1; };
+template <> struct SmFmt<2> { static constexpr int NL = 8, NA = 2; };
+template <> struct SmFmt<3> { static constexpr int NL = 6, NA = 2; };
+
+template <int FMT>
+SMD void sm_decode(const int4 (&w)[SmFmt<FMT>::NL], uint32_t (&A)[SmFmt<FMT>::NA * 16], uint32_t T0, uint32_t T1,
+                   uint32_t U0, uint32_t U1) {
+  if constexpr (FMT == 0 || FMT == 2) {
+#pragma unroll
+    for (int l = 0; l < SmFmt<FMT>::NL; ++l) {
+      A[4 * l + 0] = (uint32_t)w[l].x;
+      A[4 * l + 1] = (uint32_t)w[l].y;
+      A[4 * l + 2] = (uint32_t)w[l].z;
+      A[4 * l + 3] = (uint32_t)w[l].w;
     }
-  };
-  #pragma unroll
-  for(int s=0;s<Q;s++)loadx(s);
-  uint32_t e0=0xffffffffu,e1=0xffffffffu,nxt=0xffffffffu;int ep=0;
-  if(C12 && warp<RW) {
-    const uint32_t* el=esc+((nt*split*WK+rank*WK+wg)*RW+warp)*64;
-    e0=el[lane];e1=el[lane+32];nxt=__shfl_sync(0xffffffffu,e0,0);
-  }
-  uint4 raw[PF][NL]={};
-  auto load=[&](int slot,int i) {
-    if(i<nkb && warp<RW) {
-      const uint4* src=w+((long)(nt*(k/64)+kb0+i)*RW+warp)*NL*32+lane;
-      #pragma unroll
-      for(int l=0;l<NL;l++)raw[slot][l]=ldw(src+l*32,pw);
+  } else {
+#pragma unroll
+    for (int h = 0; h < SmFmt<FMT>::NA; ++h) {
+      const int4* u = w + 3 * h;
+      const uint32_t t0 = h ? U0 : T0, t1 = h ? U1 : T1;
+      sm_dec(u[0].x, u[0].y, u[2].x, t0, t1, A + 16 * h + 0);
+      sm_dec(u[0].z, u[0].w, u[2].y, t0, t1, A + 16 * h + 4);
+      sm_dec(u[1].x, u[1].y, u[2].z, t0, t1, A + 16 * h + 8);
+      sm_dec(u[1].z, u[1].w, u[2].w, t0, t1, A + 16 * h + 12);
     }
-  };
-  #pragma unroll
-  for(int p=0;p<PF;p++)load(p,p);
-  float acc[BN/2];
-  #pragma unroll
-  for(int j=0;j<BN/2;j++)asm volatile("mov.b32 %0,0;":"=f"(acc[j]));
-  #pragma unroll 1
-  for(int ib=0;ib<nkb;ib+=PF) {
-    #pragma unroll
-    for(int p=0;p<PF;p++) {
-      int i=ib+p;if(i>=nkb)break;
-      uint32_t a[16];
-      if constexpr(C12) {
-        dec(raw[p][0].x,raw[p][0].y,raw[p][2].x,t0,t1,a);
-        dec(raw[p][0].z,raw[p][0].w,raw[p][2].y,t0,t1,a+4);
-        dec(raw[p][1].x,raw[p][1].y,raw[p][2].z,t0,t1,a+8);
-        dec(raw[p][1].z,raw[p][1].w,raw[p][2].w,t0,t1,a+12);
+  }
+}
+
+// Escape entry: seq << 18 | lane << 13 | register << 8 | half << 7 | 7-bit XOR of the high byte's exponent bits.
+template <int NR>
+SMD void sm_patch(uint32_t (&A)[NR], uint32_t e) {
+  const uint32_t reg = (e >> 8) & 31u;
+  const uint32_t xr = (e & 0x7Fu) << (8 + ((e >> 7) & 1u) * 16);
+#pragma unroll
+  for (int r = 0; r < NR; ++r)
+    if (reg == (uint32_t)r) A[r] ^= xr;
+}
+
+// Adjacent lanes read adjacent float4 slots, with each lane summing that slot's split-K partials.
+template <class Emit>
+SMD void sm_reduce(const float4* src, int NI, int P, int PSTR, int tid, int nt, Emit emit) {
+  for (int idx = tid; idx < NI; idx += nt) {
+    float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+    for (int p = 0; p < P; ++p) sm_add4(v, src[(size_t)p * PSTR + idx]);
+    emit(idx, v);
+  }
+}
+
+// MT n8 token tiles, RT 16-row tiles per warp, ST units in flight per row tile. DIAG (timing only): 1 no MMA,
+// 2 no x loads, 4 no reduction, 8 loads only, 16 empty kernel, 32 (with 8) plain output stores, 64 (with 8) a 4 KB
+// straight-line code block at the end, 128 (with 4) no output stores.
+template <int FMT, int MT, int RT, int ST, int RED, int DIAG, int NTMAX, int CM, int CN, int CK, int CWR, int CWK, int CKU, int CS>
+__global__ void __launch_bounds__(NTMAX) sm_gemv(
+    const int4* __restrict__ wp, const __nv_bfloat16* __restrict__ x, void* __restrict__ outp,
+    const uint32_t* __restrict__ esc, int m_arg, int N_arg, int K_arg, int WR_arg, int WK_arg, int KU_arg, uint32_t T0, uint32_t T1,
+    uint32_t U0, uint32_t U1) {
+  const int m = CM ? CM : m_arg;
+  const int N = CN ? CN : N_arg, K = CK ? CK : K_arg;
+  const int WR = CWR ? CWR : WR_arg, WK = CWK ? CWK : WK_arg, KU = CKU ? CKU : KU_arg;
+  constexpr int NL = SmFmt<FMT>::NL, NA = SmFmt<FMT>::NA;
+  constexpr bool C12 = FMT == 1 || FMT == 3;
+  constexpr bool HILO = FMT >= 2;
+  constexpr bool NOMMA = DIAG & 1, NOX = DIAG & 2, NORED = DIAG & 4, RO = DIAG & 8, EMPTY = DIAG & 16;
+  constexpr bool RO_STORE = DIAG & 32, RO_CODE = DIAG & 64, NOSTORE = DIAG & 128;
+  constexpr bool PUSH = (RED == 2 || RED == 3) && !NORED && !RO && !EMPTY;
+  using OutT = typename std::conditional<HILO, float, __nv_bfloat16>::type;
+  OutT* out = reinterpret_cast<OutT*>(outp);
+  extern __shared__ __align__(16) unsigned char smem[];
+  __shared__ __align__(8) uint64_t s_bar;
+  if constexpr (EMPTY) {
+    return;
+  } else {
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, nt = CWR ? CWR * CWK * 32 : blockDim.x;
+    const int NW = WR * WK, wr = warp % WR, wk = warp / WR;
+    const int S = CS ? CS : gridDim.y;
+    const int GX = CN ? CN / (WR * RT * 16) : gridDim.x;
+    const int G = GX * S * NW;
+    const int gw = (blockIdx.y * GX + blockIdx.x) * NW + warp;
+    const int rt0 = (blockIdx.x * WR + wr) * RT;
+    const int c0 = (blockIdx.y * WK + wk) * KU;
+    const int TV = min(4 * MT, (m + 1) >> 1);
+    const uint32_t bar = sm_smem_u32(&s_bar);
+    uint32_t rank = 0;
+    if constexpr (PUSH) {
+      rank = sm_rank();
+      if (rank == 0 && tid == 0) {
+        const uint32_t parts = RED == 2 ? (uint32_t)((S - 1) * NW) : (uint32_t)((S - 1) * WR);
+        sm_mbar_init(bar, 1);
+        sm_mbar_expect(bar, parts * RT * TV * 128u);
+        sm_fence_init();
+      }
+      sm_cl_arrive();
+    }
+
+    uint32_t my_e = 0xFFFFFFFFu;
+    if constexpr (C12 && !RO) my_e = sm_lde(esc + (size_t)gw * 32 + lane);
+
+    const int4* wq = wp + (size_t)gw * (RT * NL * 32) + lane;
+    const size_t sstride = (size_t)G * (RT * NL * 32);
+    const __nv_bfloat16* x0 = x + (size_t)c0 * 64 + (lane & 3) * 16;
+
+    int4 w[ST][RT][NL];
+    uint4 xv[ST][MT][2];
+    auto load = [&](int slot, int s) {
+#pragma unroll
+      for (int j = 0; j < RT; ++j)
+#pragma unroll
+        for (int l = 0; l < NL; ++l) w[slot][j][l] = sm_ldw(wq + (size_t)s * sstride + (j * NL + l) * 32);
+      if constexpr (!NOX && !RO) {
+#pragma unroll
+        for (int n = 0; n < MT; ++n) {
+          const __nv_bfloat16* xp = x0 + (size_t)min(n * 8 + (lane >> 2), m - 1) * K + s * 64;
+          xv[slot][n][0] = sm_ldx(xp);
+          xv[slot][n][1] = sm_ldx(xp + 8);
+        }
+      }
+    };
+#pragma unroll
+    for (int s = 0; s < ST; ++s) load(s, s);
+    sm_order_point(m, outp);
+
+    float acc[NA][RT][MT][4];
+#pragma unroll
+    for (int h = 0; h < NA; ++h)
+#pragma unroll
+      for (int j = 0; j < RT; ++j)
+#pragma unroll
+        for (int n = 0; n < MT; ++n)
+#pragma unroll
+          for (int c = 0; c < 4; ++c) acc[h][j][n][c] = 0.f;
+    uint32_t fold = 0;
+    uint32_t nxt = 0xFFFFFFFFu;
+    int ep = 0;
+    if constexpr (C12 && !RO) nxt = __shfl_sync(0xffffffffu, my_e, 0);
+
+#pragma unroll 1
+    for (int i = 0; i < KU; i += ST) {
+#pragma unroll
+      for (int s = 0; s < ST; ++s) {
+        const int si = i + s;
+        if (ST == 3 && si >= KU) break;
+        if constexpr (RO) {
+#pragma unroll
+          for (int j = 0; j < RT; ++j)
+#pragma unroll
+            for (int l = 0; l < NL; ++l)
+              fold ^= (uint32_t)(w[s][j][l].x ^ w[s][j][l].y ^ w[s][j][l].z ^ w[s][j][l].w);
+          if (si + ST < KU) load(s, si + ST);
+          sm_order_point(m, outp);
+        } else {
+          uint32_t A[RT][NA * 16];
+#pragma unroll
+          for (int j = 0; j < RT; ++j) sm_decode<FMT>(w[s][j], A[j], T0, T1, U0, U1);
+          uint32_t b[MT][8];
+#pragma unroll
+          for (int n = 0; n < MT; ++n) {
+            if constexpr (NOX) {
+#pragma unroll
+              for (int e = 0; e < 8; ++e) b[n][e] = 0x3f803f80u;
+            } else {
+              b[n][0] = xv[s][n][0].x; b[n][1] = xv[s][n][0].y; b[n][2] = xv[s][n][0].z; b[n][3] = xv[s][n][0].w;
+              b[n][4] = xv[s][n][1].x; b[n][5] = xv[s][n][1].y; b[n][6] = xv[s][n][1].z; b[n][7] = xv[s][n][1].w;
+            }
+          }
+          if (si + ST < KU) load(s, si + ST);
+          sm_order_point(m, outp);
+          if constexpr (C12) {
+#pragma unroll
+            for (int j = 0; j < RT; ++j) {
+              const uint32_t useq = (uint32_t)(si * RT + j);
+              if ((nxt >> 18) == useq) {
+                do {
+                  if (lane == (int)((nxt >> 13) & 31u)) sm_patch<NA * 16>(A[j], nxt);
+                  ++ep;
+                  nxt = ep < 32 ? __shfl_sync(0xffffffffu, my_e, ep) : 0xFFFFFFFFu;
+                } while ((nxt >> 18) == useq);
+              }
+            }
+          }
+#pragma unroll
+          for (int j = 0; j < RT; ++j)
+#pragma unroll
+            for (int n = 0; n < MT; ++n)
+#pragma unroll
+              for (int q = 0; q < 4; ++q) {
+                if constexpr (NOMMA) {
+#pragma unroll
+                  for (int h = 0; h < NA; ++h)
+                    fold ^= A[j][16 * h + 4 * q] ^ A[j][16 * h + 4 * q + 1] ^ A[j][16 * h + 4 * q + 2] ^
+                            A[j][16 * h + 4 * q + 3];
+                  fold ^= b[n][2 * q] ^ b[n][2 * q + 1];
+                } else {
+                  sm_mma(acc[0][j][n], A[j] + 4 * q, b[n][2 * q], b[n][2 * q + 1]);
+                  if constexpr (HILO) sm_mma(acc[NA - 1][j][n], A[j] + 16 + 4 * q, b[n][2 * q], b[n][2 * q + 1]);
+                }
+              }
+        }
+      }
+    }
+
+    if constexpr (RO) {
+      if constexpr (RO_CODE) {
+        if (warp == 0) {
+          uint32_t a = fold, b = fold ^ 1u, c = fold ^ 2u, d = fold ^ 3u;
+          const uint32_t k = (uint32_t)m | 1u;
+#pragma unroll
+          for (int q = 0; q < 64; ++q)
+            asm volatile("mad.lo.u32 %0, %0, %4, %5;\n mad.lo.u32 %1, %1, %4, %5;\n mad.lo.u32 %2, %2, %4, %5;\n"
+                         " mad.lo.u32 %3, %3, %4, %5;" : "+r"(a), "+r"(b), "+r"(c), "+r"(d) : "r"(k), "r"(q));
+          fold = a ^ b ^ c ^ d;
+        }
+      }
+      if constexpr (RO_STORE) {
+        if ((lane & 3) == 0)
+          sm_store(out + rt0 * 16 + (lane >> 2), __uint_as_float(fold & 0x3fffffffu));
       } else {
-        #pragma unroll
-        for(int l=0;l<4;l++) {
-          a[4*l]=raw[p][l].x;a[4*l+1]=raw[p][l].y;a[4*l+2]=raw[p][l].z;a[4*l+3]=raw[p][l].w;
+        if (fold == 0x9e3779b9u) sm_store(out, 1.f);
+      }
+      return;
+    } else {
+      float r[RT][MT][4];
+#pragma unroll
+      for (int j = 0; j < RT; ++j)
+#pragma unroll
+        for (int n = 0; n < MT; ++n)
+#pragma unroll
+          for (int c = 0; c < 4; ++c) r[j][n][c] = HILO ? acc[0][j][n][c] + acc[NA - 1][j][n][c] : acc[0][j][n][c];
+      if constexpr (NOMMA) {
+        if (fold == 0x9e3779b9u) r[0][0][0] = 1.f;
+      }
+
+      const int RB = WR * RT * 16;
+      const int row0 = blockIdx.x * RB;
+      if (NORED || (RED == 0 && WK == 1)) {
+#pragma unroll
+        for (int j = 0; j < RT; ++j)
+#pragma unroll
+          for (int n = 0; n < MT; ++n)
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+              const int tok = n * 8 + 2 * (lane & 3) + (c & 1);
+              const int row = (rt0 + j) * 16 + (lane >> 2) + 8 * (c >> 1);
+              if (NOSTORE ? __float_as_uint(r[j][n][c]) == 0x9e3779b9u : tok < m)
+                sm_store(out + (size_t)tok * N + row, r[j][n][c]);
+            }
+        return;
+      }
+      if constexpr (!NORED) {
+        // Full slots: idx = (tile * MT + n) * 32 + lane. Compact slots (MT 1): idx = (tile * TV + t) * 8 + g.
+        auto emit_full = [&](int idx, float4 v) {
+          const int ln = idx & 31, rest = idx >> 5, n = rest % MT, tile = rest / MT;
+          const float vv[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+          for (int c = 0; c < 4; ++c) {
+            const int tok = n * 8 + 2 * (ln & 3) + (c & 1);
+            const int row = row0 + tile * 16 + (ln >> 2) + 8 * (c >> 1);
+            if (tok < m) sm_store(out + (size_t)tok * N + row, vv[c]);
+          }
+        };
+        auto emit_compact = [&](int idx, float4 v) {
+          const int g = idx & 7, rest = idx >> 3, t = rest % TV, tile = rest / TV;
+          const float vv[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+          for (int c = 0; c < 4; ++c) {
+            const int tok = 2 * t + (c & 1);
+            const int row = row0 + tile * 16 + g + 8 * (c >> 1);
+            if (tok < m) sm_store(out + (size_t)tok * N + row, vv[c]);
+          }
+        };
+        if constexpr (RED == 0 || RED == 1) {
+          float4* part = reinterpret_cast<float4*>(smem);
+          const int NI = WR * RT * MT * 32;
+#pragma unroll
+          for (int j = 0; j < RT; ++j)
+#pragma unroll
+            for (int n = 0; n < MT; ++n)
+              part[((size_t)warp * RT * MT + j * MT + n) * 32 + lane] =
+                  make_float4(r[j][n][0], r[j][n][1], r[j][n][2], r[j][n][3]);
+          __syncthreads();
+          if constexpr (RED == 0) {
+            sm_reduce(part, NI, WK, NI, tid, nt, emit_full);
+          } else {
+            float4* csum = part + (size_t)NW * RT * MT * 32;
+            sm_reduce(part, NI, WK, NI, tid, nt, [&](int idx, float4 v) { csum[idx] = v; });
+            cooperative_groups::cluster_group cl = cooperative_groups::this_cluster();
+            cl.sync();
+            const int rk = (int)cl.block_rank();
+            const int per = (NI + S - 1) / S;
+            const int e1 = min(NI, (rk + 1) * per);
+            for (int idx = rk * per + tid; idx < e1; idx += nt) {
+              float4 v = *cl.map_shared_rank(csum + idx, 0);
+              for (int q = 1; q < S; ++q) sm_add4(v, *cl.map_shared_rank(csum + idx, q));
+              emit_full(idx, v);
+            }
+            cl.sync();
+          }
+        } else {
+          const int NIc = WR * RT * TV * 8;
+          const int t = lane & 3, g = lane >> 2;
+          float4* recv = reinterpret_cast<float4*>(smem);
+          // The leader's own partials use plain shared stores; only remote CTAs push with st.async.
+          if constexpr (RED == 2) {
+            sm_cl_wait();
+            if (t < TV) {
+              const uint32_t rbar = sm_mapa(bar, 0);
+#pragma unroll
+              for (int j = 0; j < RT; ++j)
+#pragma unroll
+                for (int n = 0; n < MT; ++n) {
+                  const int tn = n * 4 + t;
+                  if (tn < TV) {
+                    const int idx = ((wr * RT + j) * TV + tn) * 8 + g;
+                    float4* dst = recv + (size_t)(rank * WK + wk) * NIc + idx;
+                    const float4 v = make_float4(r[j][n][0], r[j][n][1], r[j][n][2], r[j][n][3]);
+                    if (rank == 0) *dst = v;
+                    else sm_st_async4(sm_mapa(sm_smem_u32(dst), 0), v, rbar);
+                  }
+                }
+            }
+            if (rank != 0) return;
+            __syncthreads();
+            sm_wait_bar(bar);
+            sm_reduce(recv, NIc, S * WK, NIc, tid, nt, emit_compact);
+          } else {
+            float4* part = recv + (size_t)S * NIc;
+            if (t < TV) {
+#pragma unroll
+              for (int j = 0; j < RT; ++j)
+#pragma unroll
+                for (int n = 0; n < MT; ++n)
+                  if (n * 4 + t < TV)
+                    part[(size_t)wk * NIc + ((wr * RT + j) * TV + n * 4 + t) * 8 + g] =
+                        make_float4(r[j][n][0], r[j][n][1], r[j][n][2], r[j][n][3]);
+            }
+            __syncthreads();
+            sm_cl_wait();
+            const uint32_t rbar = sm_mapa(bar, 0);
+            sm_reduce(part, NIc, WK, NIc, tid, nt, [&](int idx, float4 v) {
+              float4* dst = recv + (size_t)rank * NIc + idx;
+              if (rank == 0) *dst = v;
+              else sm_st_async4(sm_mapa(sm_smem_u32(dst), 0), v, rbar);
+            });
+            if (rank != 0) return;
+            __syncthreads();
+            sm_wait_bar(bar);
+            sm_reduce(recv, NIc, S, NIc, tid, nt, emit_compact);
+          }
         }
       }
-      load(p,i+PF);
-      if constexpr(C12) {
-        while((nxt>>18)==uint32_t(i)) {
-          if(lane==int((nxt>>13)&31u))patch(a,nxt);
-          ++ep;
-          uint32_t ev=ep<32?e0:e1;
-          nxt=__shfl_sync(0xffffffffu,ev,ep&31);
-          if(ep>=64)nxt=0xffffffffu;
-        }
-      }
-      int s=i%Q;
-      waitbar(full+s*8,(i/Q)&1);
-      #pragma unroll
-      for(int j=0;j<BN/2;j++)asm volatile("":"+f"(acc[j])::"memory");
-      if constexpr(BN==16)mma16(acc,a,desc(base+s*SB));
-      if constexpr(BN==32)mma32(acc,a,desc(base+s*SB));
-      if constexpr(BN==64)mma64(acc,a,desc(base+s*SB));
-      #pragma unroll
-      for(int j=0;j<BN/2;j++)asm volatile("":"+f"(acc[j])::"memory");
-      loadx(i+Q);
     }
   }
-  __syncthreads();
-  if(tid%128==0) {
-    for(int s=0;s<Q;s++)asm volatile("mbarrier.inval.shared::cta.b64 [%0];" :: "r"(full+s*8) : "memory");
-  }
-  __syncthreads();
-  int row=warp*16+lane/4,col=2*(lane%4);
-  #pragma unroll
-  for(int j=0;j<BN/8;j++) {
-    #pragma unroll
-    for(int h=0;h<2;h++) {
-      if(warp>=RW)continue;
-      ((float*)sm)[(wg*BN+col+8*j)*RP+row+8*h]=acc[4*j+2*h];
-      ((float*)sm)[(wg*BN+col+8*j+1)*RP+row+8*h]=acc[4*j+2*h+1];
-    }
-  }
-  __syncthreads();
-  if(split>1)cluster_sync();
-  for(int q=tid+rank*NT;q<BN*(R/4);q+=NT*split) {
-    int token=q/(R/4),row=(q%(R/4))*4;
-    if(mt*BN+token>=m)continue;
-    float4 sum=make_float4(0,0,0,0);
-    for(int pp=0;pp<split*WK;pp++) {
-      int s=pp/WK;
-      uint32_t remote=base0+((pp%WK*BN+token)*RP+row)*4;
-      if(split>1)asm volatile("mapa.shared::cluster.u32 %0,%1,%2;":"=r"(remote):"r"(remote),"r"(s));
-      float4 v;
-      asm volatile("ld.shared::cluster.v4.f32 {%0,%1,%2,%3},[%4];":"=f"(v.x),"=f"(v.y),"=f"(v.z),"=f"(v.w):"r"(remote):"memory");
-      sum.x+=v.x;sum.y+=v.y;sum.z+=v.z;sum.w+=v.w;
-    }
-    __nv_bfloat162 lo=__floats2bfloat162_rn(sum.x,sum.y),hi=__floats2bfloat162_rn(sum.z,sum.w);
-    *(uint2*)(out+(long)(mt*BN+token)*n+nt*R+row)=make_uint2(*(uint32_t*)&lo,*(uint32_t*)&hi);
-  }
-  __syncthreads();
-  if(split>1)cluster_sync();
 }
 
+static int sm_smem_optin() {
+  static int v = -1;
+  if (v < 0) {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+  }
+  return v;
+}
+
+// query 0 launches; 1 returns max active clusters (cluster launch) or blocks per SM; 2 returns regs*1000+local bytes.
+template <int FMT, int MT, int RT, int ST, int RED, int DIAG, int NTMAX, int CM, int CN, int CK, int CWR, int CWK, int CKU, int CS>
+static int sm_launch_t(int64_t wp, int64_t x, int64_t out, int64_t esc, int m, int N, int K, int WR, int WK, int KU,
+                       int S, int64_t t01, int64_t u01, int64_t stream, int query) {
+  auto kern = sm_gemv<FMT, MT, RT, ST, RED, DIAG, NTMAX, CM, CN, CK, CWR, CWK, CKU, CS>;
+  if (query == 2) {
+    cudaFuncAttributes fa;
+    if (cudaFuncGetAttributes(&fa, kern) != cudaSuccess) return -10;
+    return fa.numRegs * 1000 + (int)std::min<size_t>(fa.localSizeBytes, 999);
+  }
+  if ((CM && m != CM) || (CN && N != CN) || (CK && K != CK)) return -12;
+  if ((CWR && WR != CWR) || (CWK && WK != CWK) || (CKU && KU != CKU) || (CS && S != CS)) return -12;
+  const int NW = WR * WK, nt = NW * 32, RB = WR * RT * 16;
+  if (WR < 1 || WK < 1 || nt > NTMAX) return -1;
+  if (N % RB) return -2;
+  if ((int64_t)S * WK * KU * 64 != K) return -3;
+  if ((ST != 3 && KU % ST) || KU < ST) return -4;
+  if (m < 1 || m > MT * 8) return -5;
+  const bool cl = RED != 0;
+  if (!cl && S != 1) return -9;
+  if (cl && (S < 2 || S > 16)) return -9;
+  const int TV = std::min(4 * MT, (m + 1) / 2);
+  size_t sm = 0;
+  if (!(DIAG & 28)) {
+    if (RED == 0) sm = WK > 1 ? (size_t)NW * RT * MT * 512 : 0;
+    else if (RED == 1) sm = (size_t)(NW + WR) * RT * MT * 512;
+    else if (RED == 2) sm = (size_t)S * NW * RT * TV * 128;
+    else sm = (size_t)(S + WK) * WR * RT * TV * 128;
+  }
+  static int max_dyn = -1;
+  if (max_dyn < 0) {
+    cudaFuncAttributes fa;
+    cudaFuncGetAttributes(&fa, kern);
+    max_dyn = sm_smem_optin() - (int)fa.sharedSizeBytes;
+    cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, max_dyn);
+    if (cl) cudaFuncSetAttribute(kern, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+  }
+  if ((int64_t)sm > max_dyn) return -6;
+  cudaLaunchConfig_t lc = {};
+  cudaLaunchAttribute at[1];
+  lc.gridDim = dim3(N / RB, S, 1);
+  lc.blockDim = dim3(nt, 1, 1);
+  lc.dynamicSmemBytes = sm;
+  lc.stream = (cudaStream_t)stream;
+  if (cl) {
+    at[0].id = cudaLaunchAttributeClusterDimension;
+    at[0].val.clusterDim.x = 1;
+    at[0].val.clusterDim.y = S;
+    at[0].val.clusterDim.z = 1;
+    lc.attrs = at;
+    lc.numAttrs = 1;
+  }
+  if (query == 1) {
+    int v = 0;
+    cudaError_t e = cl ? cudaOccupancyMaxActiveClusters(&v, kern, &lc)
+                       : cudaOccupancyMaxActiveBlocksPerMultiprocessor(&v, kern, nt, sm);
+    cudaGetLastError();
+    return e == cudaSuccess ? v : -11;
+  }
+  cudaLaunchKernelEx(&lc, kern, reinterpret_cast<const int4*>(wp), reinterpret_cast<const __nv_bfloat16*>(x),
+                     reinterpret_cast<void*>(out), reinterpret_cast<const uint32_t*>(esc), m, N, K, WR, WK, KU,
+                     (uint32_t)(t01 & 0xffffffff), (uint32_t)((uint64_t)t01 >> 32), (uint32_t)(u01 & 0xffffffff),
+                     (uint32_t)((uint64_t)u01 >> 32));
+  return cudaGetLastError() == cudaSuccess ? 0 : -8;
+}
+
+int sm_launch(int inst, int64_t wp, int64_t x, int64_t out, int64_t esc, int m, int N, int K, int WR, int WK, int KU,
+              int S, int64_t t01, int64_t u01, int64_t stream, int query) {
+  switch (inst) {
+@@CASES@@
+    default: return -99;
+  }
+}
 '''
-tt_mw_CUDA_MAP = '\nusing EncodeFn=decltype(&cuTensorMapEncodeTiled);\nint map(CUtensorMap* tm,const void* ptr,int rows,int k,int box) {\n  static EncodeFn encode=nullptr;\n  if(!encode) {cudaDriverEntryPointQueryResult q;cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled",(void**)&encode,12000,cudaEnableDefault,&q);}\n  uint64_t dims[]={uint64_t(k),uint64_t(rows)},stride[]={uint64_t(k)*2};uint32_t b[]={64,uint32_t(box)},es[]={1,1};\n  return int(encode(tm,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,2,(void*)ptr,dims,stride,b,es,CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_128B,CU_TENSOR_MAP_L2_PROMOTION_L2_256B,CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));\n}\n\n'
-tt_mw_CUDA_HOST = '\ntemplate<int BN,int R,int WK,int PF,int Q,bool C12,int CAP>\nint launch_t(const void* x,const void* w,const void* e,void* out,int m,int n,int k,int split,uint64_t tab,cudaStream_t st) {\n  CUtensorMap tx;int rc=map(&tx,x,m,k,BN);if(rc)return rc;\n  constexpr int a=WK*((Q*(BN*128+8)+1023)/1024*1024),b=WK*BN*(R+4)*4,smem=a>b?a:b;\n  auto kern=m32w_gemm<BN,R,WK,PF,Q,C12,CAP>;\n  static bool ready=false;\n  if(!ready) {\n    rc=int(cudaFuncSetAttribute(kern,cudaFuncAttributeMaxDynamicSharedMemorySize,smem));if(rc)return rc;\n    rc=int(cudaFuncSetAttribute(kern,cudaFuncAttributeNonPortableClusterSizeAllowed,1));if(rc)return rc;\n    ready=true;\n  }\n  cudaLaunchConfig_t cfg={};cfg.gridDim=dim3((n/R)*split,(m+BN-1)/BN);cfg.blockDim=dim3(128*WK);cfg.dynamicSmemBytes=smem;cfg.stream=st;\n  cudaLaunchAttribute attr={};attr.id=cudaLaunchAttributeClusterDimension;attr.val.clusterDim={unsigned(split),1,1};\n  if(split>1){cfg.attrs=&attr;cfg.numAttrs=1;}\n  return int(cudaLaunchKernelEx(&cfg,kern,tx,(const uint4*)w,(const uint32_t*)e,(__nv_bfloat16*)out,m,n,k,split,uint32_t(tab),uint32_t(tab>>32)));\n}\nint launch(int id,uint64_t x,uint64_t w,uint64_t e,uint64_t out,int m,int n,int k,int split,uint64_t tab,uint64_t st) {\n  switch(id) {DISPATCH}\n  return -1;\n}\nint info(int id){cudaFuncAttributes fa={};switch(id){INFO}return fa.numRegs*10000+fa.localSizeBytes;}\n'
-tt_mw_CPP = '\n#include <pybind11/pybind11.h>\n#include <stdint.h>\nint launch(int,uint64_t,uint64_t,uint64_t,uint64_t,int,int,int,int,uint64_t,uint64_t);\nint info(int);\n'
 
-def tt_mw_cuda_source(instances):
+SM_CPP = r"""
+#include <pybind11/pybind11.h>
+#include <stdint.h>
+int sm_launch(int inst, int64_t wp, int64_t x, int64_t out, int64_t esc, int m, int N, int K, int WR, int WK, int KU,
+              int S, int64_t t01, int64_t u01, int64_t stream, int query);
+"""
+
+SM_FIELDS = ("fmt", "mt", "rt", "st", "red", "diag", "ntmax")
+SM_NL = {0: 4, 1: 3, 2: 8, 3: 6}
+SM_FMT_NAME = {0: "bf", 1: "c12", 2: "hl", 3: "hlc"}
+SM_SIGN_POS = (3, 19, 7, 23, 11, 27, 15, 31)
+SM_LAYER_K = {"qkv_gate": 8192, "o": 1024, "pooler": 8192, "unpooler": 4096, "router": 8192}
+SM_ESC_CAP = 32
+
+def sm_inst(fmt, rt, st, red, mt=1, diag=0, ntmax=512):
+    return (fmt, mt, rt, st, red, diag, ntmax)
+
+def sm_cuda_source(instances):
     cases = []
-    attrs = []
     for i, inst in enumerate(instances):
-        bn, r, wk, pf, q, c, cap = inst
-        params = f'{bn},{r},{wk},{pf},{q},{str(c).lower()},{cap}'
-        cases.append(f'case {i}: return launch_t<{params}>((void*)x,(void*)w,(void*)e,(void*)out,m,n,k,split,tab,(cudaStream_t)st);')
-        attrs.append(f'case {i}:cudaFuncGetAttributes(&fa,m32w_gemm<{params}>);break;')
-    return tt_mw_CUDA_PREFIX + '\n'.join((tt_mw_mma(n) for n in (16, 32, 64))) + tt_mw_CUDA_CORE + tt_mw_CUDA_MAP + tt_mw_CUDA_HOST.replace('DISPATCH', '\n'.join(cases)).replace('INFO', '\n'.join(attrs))
+        args = ", ".join(str(v) for v in (inst if len(inst) > 7 else inst + (0,) * 7))
+        cases.append(f"    case {i}: return sm_launch_t<{args}>(wp, x, out, esc, m, N, K, WR, WK, KU, S, t01, u01,"
+                     " stream, query);")
+    return SM_CUDA_TEMPLATE.replace("@@CASES@@", "\n".join(cases))
 
-def tt_mw_build(instances):
-    src = tt_mw_cuda_source(instances)
-    name = 'm32w_' + hashlib.sha256(src.encode()).hexdigest()[:12]
-    return load_inline(name, tt_mw_CPP, cuda_sources=src, functions=['launch', 'info'], no_implicit_headers=True, with_pytorch_error_handling=False, extra_cuda_cflags=['-O3', '-std=c++20', '-lineinfo', '-gencode=arch=compute_90a,code=sm_90a'])
-tt_mw_SM_SIGN_POS = (3, 19, 7, 23, 11, 27, 15, 31)
+def sm_build(instances, name="small_m_gemv", extra_cuda="", extra_cpp="", extra_funcs=()):
+    return load_inline(name, SM_CPP + extra_cpp, cuda_sources=sm_cuda_source(instances) + extra_cuda,
+                       functions=["sm_launch", *extra_funcs], extra_cuda_cflags=["-O3", "-lineinfo"],
+                       no_implicit_headers=True, with_pytorch_error_handling=False, verbose=False)
 
-def tt_mw__to_i16(v):
+def sm_units(w):
+    """BF16 [n, k] -> int32 [n/16, k/64, 32 lanes, 32 values] of 16-bit patterns in A-fragment order."""
+    n, k = w.shape
+    bits = w.contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
+    v = bits.view(n // 16, 2, 8, k // 64, 4, 4, 2, 2).permute(0, 3, 2, 4, 5, 6, 1, 7)
+    return v.reshape(n // 16, k // 64, 32, 32)
+
+def _to_i16(v):
     return torch.where(v >= 32768, v - 65536, v).to(torch.int16)
 
-def tt_mw__to_i32(v):
-    return torch.where(v >= 2 ** 31, v - 2 ** 32, v).to(torch.int32)
+def _to_i32(v):
+    return torch.where(v >= 2**31, v - 2**32, v).to(torch.int32)
 
-def tt_mw_sm_bf16_bytes(v):
+def sm_bf16_bytes(v):
     r, c = v.shape[:2]
-    words = tt_mw__to_i16(v.view(r, c, 32, 4, 8).permute(0, 1, 3, 2, 4)).contiguous()
+    words = _to_i16(v.view(r, c, 32, 4, 8).permute(0, 1, 3, 2, 4)).contiguous()
     return words.view(torch.uint8).view(r, c, 2048)
 
-def tt_mw_sm_c12_bytes(v):
+def sm_c12_bytes(v):
     """Packs units into the 12-bit format. Returns (bytes [r, c, 1536], base, escapes (r, c, lane, value, xor7))."""
     r, c = v.shape[:2]
     dev = v.device
-    lo = v & 255
+    lo = v & 0xFF
     sign = v >> 15
-    eh = v >> 8 & 127
+    eh = (v >> 8) & 0x7F
     hist = torch.bincount(eh.flatten(), minlength=128).cpu()
     window = torch.stack([hist[b:b + 8].sum() for b in range(121)])
     base = int(window.argmax())
@@ -554,141 +654,283 @@ def tt_mw_sm_c12_bytes(v):
     inwin = (d >= 0) & (d < 8)
     d = torch.where(inwin, d, torch.zeros_like(d))
     nib = (torch.arange(8, device=dev) * 4).long()
-    pos = torch.tensor(tt_mw_SM_SIGN_POS, device=dev).long()
+    pos = torch.tensor(SM_SIGN_POS, device=dev).long()
     code = ((d.view(r, c, 32, 4, 8).long() << nib) + (sign.view(r, c, 32, 4, 8).long() << pos)).sum(-1)
-    code = tt_mw__to_i32(code).contiguous().view(torch.uint8).view(r, c, 32, 16)
+    code = _to_i32(code).contiguous().view(torch.uint8).view(r, c, 32, 16)
     lo8 = lo.to(torch.uint8)
     data = torch.stack([lo8[..., :16], lo8[..., 16:], code], dim=2).reshape(r, c, 1536).contiguous()
     er, ec, el, ev = (~inwin).nonzero().unbind(1)
     xor7 = eh[er, ec, el, ev] ^ base
-    return (data, base, (er, ec, el, ev, xor7))
+    return data, base, (er, ec, el, ev, xor7)
 
-def tt_mw_sm_c12_unpack(data, base, esc):
+def sm_c12_unpack(data, base, esc):
     """Inverse of sm_c12_bytes, used to prove the packing is exact."""
     r, c = data.shape[:2]
     dev = data.device
     p = data.view(r, c, 3, 32, 16)
     lo = torch.cat([p[:, :, 0], p[:, :, 1]], dim=-1).to(torch.int32)
-    code = p[:, :, 2].contiguous().view(torch.int32).view(r, c, 32, 4).long() & 4294967295
+    code = p[:, :, 2].contiguous().view(torch.int32).view(r, c, 32, 4).long() & 0xFFFFFFFF
     nib = (torch.arange(8, device=dev) * 4).long()
-    pos = torch.tensor(tt_mw_SM_SIGN_POS, device=dev).long()
-    d = (code[..., None] >> nib & 7).reshape(r, c, 32, 32)
-    sg = (code[..., None] >> pos & 1).reshape(r, c, 32, 32)
-    val = (sg << 15 | base + d << 8).to(torch.int32) | lo
+    pos = torch.tensor(SM_SIGN_POS, device=dev).long()
+    d = ((code[..., None] >> nib) & 7).reshape(r, c, 32, 32)
+    sg = ((code[..., None] >> pos) & 1).reshape(r, c, 32, 32)
+    val = ((sg << 15) | ((base + d) << 8)).to(torch.int32) | lo
     er, ec, el, ev, xor7 = esc
     val[er, ec, el, ev] ^= (xor7 << 8).to(torch.int32)
     return val
 
-def tt_mw_sm_table(base):
-    t0 = base | base + 1 << 8 | base + 2 << 16 | base + 3 << 24
-    t1 = base + 4 | base + 5 << 8 | base + 6 << 16 | base + 7 << 24
+def sm_table(base):
+    t0 = base | (base + 1) << 8 | (base + 2) << 16 | (base + 3) << 24
+    t1 = (base + 4) | (base + 5) << 8 | (base + 6) << 16 | (base + 7) << 24
     v = t0 | t1 << 32
-    return v - 2 ** 64 if v >= 2 ** 63 else v
+    return v - 2**64 if v >= 2**63 else v
 
-def tt_mw_pack_weight(w, r, wk, split, compressed=True):
-    n, k = w.shape
-    total = wk * split
-    rw = r // 16
-    if w.dtype != torch.bfloat16 or r not in (32, 64) or n % r or k % 64 or (k // 64 < total):
-        return None
-    bits = w.contiguous().view(torch.int16).to(torch.int32) & 65535
-    v = bits.view(n // 16, 2, 8, k // 64, 4, 2, 4, 2).permute(0, 3, 2, 6, 4, 5, 1, 7).reshape(n // 16, k // 64, 32, 32)
-    esc = torch.full((n // r * total * rw, 64), -1, dtype=torch.int32, device=w.device)
-    table, max_esc, escapes = (0, 0, 0)
-    if compressed:
-        data, b, entries = tt_mw_sm_c12_bytes(v)
-        if not torch.equal(tt_mw_sm_c12_unpack(data, b, entries), v):
-            return None
-        table = tt_mw_sm_table(b) & 18446744073709551615
-        er, ec, el, ev, xor7 = entries
-        escapes = er.numel()
-        if escapes:
-            boundaries = torch.tensor([k // 64 * s // total for s in range(1, total)], device=w.device)
-            rank = torch.bucketize(ec, boundaries, right=True)
-            seq = ec - k // 64 * rank // total
-            group = (er // rw * total + rank) * rw + er % rw
-            max_esc = int(torch.bincount(group, minlength=esc.shape[0]).max())
-            if max_esc > 64 or int(seq.max()) >= (1 << 14) - 1:
-                return None
-            order = torch.argsort(group * (1 << 14) + seq)
-            gs = group[order]
-            ss = seq[order]
-            pos = torch.arange(len(gs), device=w.device) - torch.searchsorted(gs, gs)
-            entry = ss.long() << 18 | el[order].long() << 13 | (ev[order] // 2).long() << 8 | (ev[order] % 2).long() << 7 | xor7[order].long()
-            esc[gs, pos] = tt_mw__to_i32(entry)
+def sm_pack_format(w, fmt):
+    """Units of one format for a whole matrix, or None if the 12-bit packing is not exact.
+
+    Returns dict: data uint8 [R, C, NL*512], t01/u01 decode tables, escapes (r, c, lane, value, xor7, half) where
+    half 1 marks the lo matrix of a HILO pair."""
+    if fmt in (2, 3):
+        hi = w.to(torch.bfloat16)
+        lo = (w - hi.float()).to(torch.bfloat16)
+        mats = [sm_units(hi), sm_units(lo)]
     else:
-        data = tt_mw_sm_bf16_bytes(v)
-    payload = data.view(n // r, rw, k // 64, -1).permute(0, 2, 1, 3).contiguous().view(-1)
-    return dict(w=payload, esc=esc, table=table, r=r, wk=wk, split=split, compressed=compressed, n=n, k=k, escapes=escapes, max_esc=max_esc, pack_exact=True)
+        mats = [sm_units(w)]
+    if fmt in (0, 2):
+        data = torch.cat([sm_bf16_bytes(v) for v in mats], dim=-1).contiguous()
+        return {"data": data, "t01": 0, "u01": 0, "esc": None, "fmt": fmt}
+    parts, tabs, escs = [], [], []
+    for h, v in enumerate(mats):
+        data, base, esc = sm_c12_bytes(v)
+        if not torch.equal(sm_c12_unpack(data, base, esc), v):
+            return None
+        parts.append(data)
+        tabs.append(sm_table(base))
+        escs.append(esc + (torch.full_like(esc[0], h),))
+    esc = tuple(torch.cat([e[i] for e in escs]) for i in range(6))
+    return {"data": torch.cat(parts, dim=-1).contiguous(), "t01": tabs[0], "u01": tabs[-1] if fmt == 3 else 0,
+            "esc": esc, "fmt": fmt, "n_esc": int(esc[0].numel())}
 
-def tt_mw_launch_raw(ext, idx, pk, x, out):
-    return ext.launch(idx, x.data_ptr(), pk['w'].data_ptr(), pk['esc'].data_ptr(), out.data_ptr(), x.shape[0], pk['n'], pk['k'], pk['split'], pk['table'], torch.cuda.current_stream().cuda_stream)
+def sm_geometry(R, C, rt, wr, wk, ku, s):
+    if R % (wr * rt) or C != s * wk * ku:
+        return None
+    gx = R // (wr * rt)
+    return gx, wr * wk, gx * s * wr * wk
 
-def tt_mw_verify_onehot(ext, idx, pk, w, m=32):
-    n, k = w.shape
-    eye = torch.eye(k, device=w.device, dtype=torch.bfloat16)
-    out = torch.empty((k, n), device=w.device, dtype=torch.bfloat16)
-    for start in range(0, k, m):
-        if tt_mw_launch_raw(ext, idx, pk, eye[start:start + m], out[start:start + m]):
+def sm_stream(pk, rt, wr, wk, ku, s):
+    """Stream-ordered weights and per-warp escape lists for one launch geometry, or None if a list overflows."""
+    data = pk["data"]
+    R, C, B = data.shape
+    geo = sm_geometry(R, C, rt, wr, wk, ku, s)
+    if geo is None:
+        return None
+    gx, nw, G = geo
+    dev = data.device
+    si = torch.arange(ku, device=dev).view(ku, 1, 1)
+    gw = torch.arange(G, device=dev).view(1, G, 1)
+    j = torch.arange(rt, device=dev).view(1, 1, rt)
+    cta, warp = gw // nw, gw % nw
+    by, bx = cta // gx, cta % gx
+    wri, wki = warp % wr, warp // wr
+    tile = (bx * wr + wri) * rt + j
+    chunk = (by * wk + wki) * ku + si
+    idx = (tile * C + chunk).reshape(-1)
+    wp = data.view(R * C, B)[idx].contiguous().view(-1)
+    esc = torch.full((G, SM_ESC_CAP), -1, dtype=torch.int32, device=dev)
+    if pk["esc"] is not None and pk["esc"][0].numel():
+        er, ec, el, ev, x7, half = pk["esc"]
+        bx_e, rem = er // (wr * rt), er % (wr * rt)
+        wr_e, j_e = rem // rt, rem % rt
+        by_e, rem2 = ec // (wk * ku), ec % (wk * ku)
+        wk_e, s_e = rem2 // ku, rem2 % ku
+        g_e = (by_e * gx + bx_e) * nw + wk_e * wr + wr_e
+        seq = s_e * rt + j_e
+        if int(seq.max()) >= (1 << 14) - 1:
+            return None
+        counts = torch.bincount(g_e, minlength=G)
+        if int(counts.max()) > SM_ESC_CAP:
+            return None
+        order = torch.argsort(g_e * (1 << 14) + seq)
+        g_s, seq_s = g_e[order], seq[order]
+        rank = torch.arange(len(g_s), device=dev) - torch.searchsorted(g_s, g_s)
+        reg = ev[order] // 2 + 16 * half[order]
+        entry = (seq_s.long() << 18) | (el[order].long() << 13) | (reg.long() << 8) | (
+            (ev[order] % 2).long() << 7) | x7[order].long()
+        esc[g_s, rank] = _to_i32(entry)
+    return {"wp": wp, "esc": esc, "t01": pk["t01"], "u01": pk["u01"], "fmt": pk["fmt"],
+            "max_esc": int((esc != -1).sum(1).max())}
+
+def sm_launch_raw(ext, inst_id, sp, x, out, n, cfg, query=0):
+    """cfg = (WR, WK, KU, S)."""
+    wr, wk, ku, s = cfg
+    m, k = x.shape
+    return ext.sm_launch(inst_id, sp["wp"].data_ptr(), x.data_ptr(), out.data_ptr(), sp["esc"].data_ptr(), m, n, k,
+                         wr, wk, ku, s, sp["t01"], sp["u01"], torch.cuda.current_stream().cuda_stream, query)
+
+# ---- deliverable API ----
+# Exact token counts take precedence over token-tile entries. Geometry and reduction mapping are H100-validated;
+# the compressed m=16/32 configurations have not yet been measured on the H200 judge.
+SM_TABLE_M = {
+    ("router", 1): ((2, 1, 1, 1, 2, 0, 256), (1, 4, 4, 8)),
+}
+SM_TABLE_MT = {
+    ("pooler", 1): ((1, 1, 1, 2, 0, 0, 256), (1, 8, 16, 1)),
+    ("qkv_gate", 1): ((1, 1, 1, 2, 2, 0, 256), (1, 4, 8, 4)),
+    ("o", 1): ((1, 1, 1, 2, 0, 0, 256), (2, 4, 4, 1)),
+    ("o", 2): ((1, 2, 1, 2, 0, 0, 256), (2, 4, 4, 1)),
+    ("unpooler", 1): ((0, 1, 1, 2, 2, 0, 256), (1, 8, 4, 2)),
+    ("router", 1): ((2, 1, 1, 1, 3, 0, 256), (1, 4, 4, 8)),
+}
+SM_MAX_M = 32
+
+SM_TABLE_M.update({
+    ("router", 8): SM_TABLE_MT[("router", 1)],
+    ("qkv_gate", 8): SM_TABLE_MT[("qkv_gate", 1)],
+    ("pooler", 8): SM_TABLE_MT[("pooler", 1)],
+    ("o", 8): SM_TABLE_MT[("o", 1)],
+    ("unpooler", 1): SM_TABLE_MT[("unpooler", 1)],
+    ("unpooler", 8): SM_TABLE_MT[("unpooler", 1)],
+})
+SM_TABLE_MT[('pooler', 2)] = ((1, 2, 1, 2, 0, 0, 256), (1, 8, 16, 1))
+SM_TABLE_MT[('pooler', 4)] = ((1, 4, 1, 1, 0, 0, 256), (1, 8, 16, 1))
+SM_TABLE_MT[('qkv_gate', 2)] = ((1, 2, 1, 1, 2, 0, 256), (1, 4, 8, 4))
+SM_TABLE_MT[('unpooler', 2)] = ((1, 2, 1, 2, 0, 0, 256), (2, 4, 16, 1))
+
+def sm_mt(m):
+    return 1 if m <= 8 else 2 if m <= 16 else 4 if m <= 32 else 0
+
+def sm_rows(layer, m, n_full):
+    return 1024 if layer == "unpooler" and m <= 8 else n_full
+
+def sm_bf16_twin(inst):
+    """The same launch shape on uncompressed weights: the fallback when a 12-bit pack does not fit."""
+    return (inst[0] - 1,) + inst[1:] if inst[0] in (1, 3) else None
+
+def sm_verify_onehot(ext, inst_id, sp, exact, cfg, rows_per_launch=8):
+    """Runs every column as a one-hot input: each output must equal its weight column exactly.
+
+    exact: [n, k] values the kernel must reproduce (BF16 weights, or hi + lo in FP32 for the router)."""
+    n, k = exact.shape
+    mm = rows_per_launch
+    dev = exact.device
+    out_dtype = torch.float32 if exact.dtype == torch.float32 else torch.bfloat16
+    got = torch.empty(k // mm, mm, n, dtype=out_dtype, device=dev)
+    eye = torch.eye(k, dtype=torch.bfloat16, device=dev).view(k // mm, mm, k)
+    for i in range(k // mm):
+        if sm_launch_raw(ext, inst_id, sp, eye[i], got[i], n, cfg) != 0:
             return False
-    return bool(torch.equal(out.view(torch.int16), w.T.contiguous().view(torch.int16)))
-tt_mw_CONFIGS = {(16, 'pooler'): ((16, 64, 1, 2, 2, True, 1), 8), (16, 'unpooler'): ((16, 64, 4, 2, 2, True, 1), 1), (16, 'qkv_gate'): ((16, 64, 1, 2, 2, True, 1), 8), (32, 'pooler'): ((32, 64, 1, 2, 2, True, 1), 8), (32, 'unpooler'): ((32, 64, 4, 2, 2, True, 1), 1), (32, 'qkv_gate'): ((32, 64, 1, 2, 2, True, 1), 8)}
+    return bool(torch.equal(got.view(k, n), exact.t().to(out_dtype)))
 
-def tt_mw_prepare_m32w(weights, configs=None) -> dict:
-    configs = tt_mw_CONFIGS if configs is None else configs
-    device = next(iter(weights.values())).device
-    state = {'plans': {}, 'device': device}
-    if device.type != 'cuda' or torch.cuda.get_device_capability(device) != (9, 0):
-        return state
+def sm_verify_random(ext, inst_id, sp, w_rows, cfg, ms, seed=11):
+    """Random inputs with a spike row against an FP64 reference, at a quarter of the judge's tolerances."""
+    n, k = w_rows.shape
+    is_router = w_rows.dtype == torch.float32
+    tol = 1e-4 if is_router else 1e-2
+    gen = torch.Generator(device=w_rows.device).manual_seed(seed)
+    for m in ms:
+        x = torch.randn((m, k), generator=gen, device=w_rows.device)
+        x[m - 1].zero_()
+        x[m - 1, (seed * 131 + m) % k] = 16.0
+        x = x.to(torch.bfloat16)
+        ref = (x.double() @ w_rows.double().T).to(torch.float32 if is_router else torch.bfloat16).double()
+        out = torch.empty((m, n), dtype=torch.float32 if is_router else torch.bfloat16, device=w_rows.device)
+        if sm_launch_raw(ext, inst_id, sp, x, out, n, cfg) != 0:
+            return False
+        diff = out.double() - ref
+        rows = diff.norm(dim=1) / torch.maximum(ref.norm(dim=1), 0.1 * ref.norm(dim=1).mean())
+        if not bool(torch.isfinite(out).all()) or float(diff.norm() / ref.norm()) > tol / 4 or \
+                float(rows.max()) > tol or float(rows[m - 1]) > 2.5e-4:
+            return False
+    return True
+
+def sm_exact(w_rows, fmt):
+    if fmt in (2, 3):
+        hi = w_rows.to(torch.bfloat16)
+        return hi.float() + (w_rows - hi.float()).to(torch.bfloat16).float()
+    return w_rows
+
+def sm_plan(ext, inst_id, packs, streams, w, layer, key, inst, cfg):
+    """Packs, stream-orders and verifies one table entry; None if any step fails."""
+    m_hi = key[2] if key[1] == "m" else 8 * inst[1]
+    rows = sm_rows(layer, m_hi, w.shape[0])
+    fmt = inst[0]
+    pkey = (layer, rows, fmt)
+    if pkey not in packs:
+        packs[pkey] = sm_pack_format(w[:rows].contiguous(), fmt)
+    if packs[pkey] is None:
+        return None
+    skey = pkey + (inst[2],) + tuple(cfg)
+    if skey not in streams:
+        streams[skey] = sm_stream(packs[pkey], inst[2], *cfg)
+    sp = streams[skey]
+    if sp is None:
+        return None
+    vkey = ("verified", inst) + skey
+    if vkey not in streams:
+        w_rows = w[:rows].contiguous()
+        lo = 1 if inst[1] == 1 else 4 * inst[1] + 1
+        fixed_m = inst[7] if len(inst) > 7 else 0
+        ms = [fixed_m] if fixed_m else sorted({lo, (lo + 8 * inst[1]) // 2, 8 * inst[1]})
+        streams[vkey] = sm_verify_onehot(ext, inst_id[inst], sp, sm_exact(w_rows, fmt), cfg, fixed_m or 8 * inst[1]) and \
+            sm_verify_random(ext, inst_id[inst], sp, w_rows, cfg, ms)
+    if not streams[vkey]:
+        return None
+    return dict(sp, inst_id=inst_id[inst], cfg=cfg, rows=rows)
+
+def prepare_small_m(weights, table_m=None, table_mt=None, name="small_m_gemv"):
+    table_m = dict(SM_TABLE_M if table_m is None else table_m)
+    table_mt = dict(SM_TABLE_MT if table_mt is None else table_mt)
+    entries = [((layer, "m", m), v) for (layer, m), v in table_m.items()] + \
+              [((layer, "mt", mt), v) for (layer, mt), v in table_mt.items()]
+    specialized = []
+    for key, (inst, cfg) in entries:
+        if len(inst) == 7:
+            layer, kind, m = key
+            fixed_m = m if kind == "m" else 0
+            rows = sm_rows(layer, m if fixed_m else inst[1] * 8, weights[layer].shape[0])
+            inst = inst + (fixed_m, rows, SM_LAYER_K[layer], *cfg)
+        specialized.append((key, (inst, cfg)))
+    entries = specialized
     instances = []
-    for inst, split in configs.values():
-        for c in (inst[5], False):
-            twin = inst[:5] + (c,) + inst[6:]
-            if twin not in instances:
-                instances.append(twin)
-    ext = tt_mw_build(instances)
-    state['ext'] = ext
-    packs = {}
-    for (m, layer), (inst, split) in configs.items():
-        if layer not in weights:
-            continue
-        w = weights[layer]
-        for compressed in (inst[5], False):
-            actual = inst[:5] + (compressed,) + inst[6:]
-            idx = instances.index(actual)
-            if ext.info(idx) % 10000:
-                continue
-            key = (layer, inst[1], inst[2], split, compressed)
-            if key not in packs:
-                packs[key] = tt_mw_pack_weight(w, inst[1], inst[2], split, compressed)
-            pk = packs[key]
-            if pk is None or not tt_mw_verify_onehot(ext, idx, pk, w, m):
-                continue
-            if m == 32 and (not tt_mw_verify_onehot(ext, idx, pk, w, 33)):
-                continue
-            state['plans'][m, layer] = (idx, pk)
-            break
-    return state
+    for _, (inst, _) in entries:
+        instances.append(inst)
+        if sm_bf16_twin(inst):
+            instances.append(sm_bf16_twin(inst))
+    instances = list(dict.fromkeys(instances))
+    st = {"plans": {}}
+    if not instances:
+        return st
+    ext = sm_build(instances, name)
+    st["ext"] = ext
+    inst_id = {inst: i for i, inst in enumerate(instances)}
+    packs, streams = {}, {}
+    for key, (inst, cfg) in sorted(entries):
+        layer = key[0]
+        plan = sm_plan(ext, inst_id, packs, streams, weights[layer], layer, key, inst, cfg)
+        if plan is None and sm_bf16_twin(inst):
+            plan = sm_plan(ext, inst_id, packs, streams, weights[layer], layer, key, sm_bf16_twin(inst), cfg)
+        if plan is not None:
+            st["plans"][key] = plan
+    del packs
+    return st
 
-def tt_mw_run_m32w(x: torch.Tensor, layer: str, n: int, st: dict) -> torch.Tensor | None:
-    if x.ndim != 2 or x.dtype != torch.bfloat16 or (not x.is_cuda) or (x.device != st['device']):
-        return None
+def run_small_m(x, layer, n, st):
     m = x.shape[0]
-    if not 16 <= m <= 33 or not x.is_contiguous() or x.data_ptr() % 16:
+    if not 1 <= m <= SM_MAX_M:
         return None
-    key = (16 if m <= 16 else 32, layer)
-    plan = st['plans'].get(key)
-    if plan is None:
+    sp = st["plans"].get((layer, "m", m)) or st["plans"].get((layer, "mt", sm_mt(m)))
+    if sp is None or n != sp["rows"] or x.dtype != torch.bfloat16 or x.shape[1] != SM_LAYER_K[layer] or not x.is_cuda:
         return None
-    idx, pk = plan
-    if n != pk['n'] or x.shape[1] != pk['k']:
+    x = x.contiguous()
+    if x.data_ptr() % 16:
         return None
-    out = torch.empty((m, n), device=x.device, dtype=torch.bfloat16)
-    rc = tt_mw_launch_raw(st['ext'], idx, pk, x, out)
-    if rc:
-        raise RuntimeError(f'm32w launch failed: {rc}')
+    out = torch.empty((m, n), dtype=torch.float32 if layer == "router" else torch.bfloat16, device=x.device)
+    if sm_launch_raw(st["ext"], sp["inst_id"], sp, x, out, n, sp["cfg"]) != 0:
+        return None
     return out
 
+
+# ---- piece 1: small_m only; other shapes → SGLang dispatch ----
 
 def _fallback(x: torch.Tensor, layer: str, n: int, state: dict) -> torch.Tensor:
     if layer != "router":
@@ -699,37 +941,22 @@ def _fallback(x: torch.Tensor, layer: str, n: int, state: dict) -> torch.Tensor:
     out += torch.mm(x, state["router_lo_t"], out_dtype=torch.float32)
     return out
 
-def _base_state(weights: Weights) -> dict:
+def prepare(weights: Weights) -> dict:
     state = {name: w.contiguous() for name, w in weights.items()}
     hi = weights["router"].to(torch.bfloat16)
     state["router_hi_t"] = hi.t().contiguous()
     state["router_lo_t"] = (weights["router"] - hi.float()).to(torch.bfloat16).t().contiguous()
     state["router_weight"] = weights["router"]
-    return state
-
-def prepare(weights: Weights) -> dict:
-    state = _base_state(weights)
-    state["new_lt"] = tt_lt_prepare_cublaslt(weights)
-    state["new_mw"] = tt_mw_prepare_m32w(weights)
+    state["sm"] = prepare_small_m(weights)
     torch.cuda.synchronize(weights["qkv_gate"].device)
     return state
 
 def kernel_fn(data: Inputs, state: dict) -> torch.Tensor:
     x, layer, n = data["x"], data["config"]["layer"], data["config"]["n"]
-    m = x.shape[0]
-    out = None
-    if m == 32 and layer == "unpooler":
-        out = tt_mw_run_m32w(x, layer, n, state["new_mw"])
-    if out is None and (m, layer) in ((128, "pooler"), (128, "unpooler"), (256, "pooler"), (256, "qkv_gate")):
-        out = tt_lt_run_cublaslt(x, layer, n, state["new_lt"])
-    if out is None and m in (16, 32) and layer in ("pooler", "unpooler"):
-        out = tt_mw_run_m32w(x, layer, n, state["new_mw"])
+    out = run_small_m(x, layer, n, state["sm"])
     return _fallback(x, layer, n, state) if out is None else out
 
 SELECTED_ROUTES = [
-    {"m": 32, "layer": "unpooler", "name": "mw", "module": "mw"},
-    {"m": 128, "layer": "pooler", "name": "lt", "module": "lt"},
-    {"m": 128, "layer": "unpooler", "name": "lt", "module": "lt"},
-    {"m": 256, "layer": "pooler", "name": "lt", "module": "lt"},
-    {"m": 256, "layer": "qkv_gate", "name": "lt", "module": "lt"},
+    {"m": m, "layer": layer, "name": "small_m", "module": "sm"}
+    for (layer, m) in sorted(SM_TABLE_M)
 ]
