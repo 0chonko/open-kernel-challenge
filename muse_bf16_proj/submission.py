@@ -1,5 +1,5 @@
 # okc: problem=muse_bf16_proj
-"""Assemble step 2/6: small_m + m32. Unclaimed shapes → SGLang."""
+"""Assemble step 3/6: small_m + m32 + router(+router2). Unclaimed → SGLang."""
 
 import hashlib
 import zlib
@@ -1928,6 +1928,951 @@ def run_m32(x, layer, n, st):
         return None
     return out
 
+# ---- router/router_kernels.py ----
+
+def _mma(n):
+    regs = ', '.join(f'%{i}' for i in range(n // 2))
+    outs = ', '.join(f'"+f"(d[{i}])' for i in range(n // 2))
+    return f'''__device__ __forceinline__ void rr_mma_{n}(float* d, uint64_t a, uint64_t b) {{
+    asm volatile("wgmma.mma_async.sync.aligned.m64n{n}k16.f32.bf16.bf16 {{{regs}}}, %{n//2}, %{n//2+1}, 1, 1, 1, 0, 0;" : {outs} : "l"(a), "l"(b));
+}}'''
+
+ROUTER_CUDA = r'''
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <stdint.h>
+#include <algorithm>
+#define RD __device__ __forceinline__
+RD uint32_t rr_smem(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
+RD void rr_init(uint32_t b, int n) { asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(b),"r"(n):"memory"); }
+RD void rr_expect(uint32_t b, int n) { asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(b),"r"(n):"memory"); }
+RD void rr_wait(uint32_t b, int ph) {
+  asm volatile("{ .reg .pred p; wait: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%0], %1; @!p bra wait; }" ::"r"(b),"r"(ph):"memory");
+}
+RD void rr_sync() { asm volatile("barrier.cluster.arrive.release.aligned; barrier.cluster.wait.acquire.aligned;" :::"memory"); }
+RD uint32_t rr_map(uint32_t a, int r) { uint32_t b; asm("mapa.shared::cluster.u32 %0, %1, %2;":"=r"(b):"r"(a),"r"(r));return b; }
+RD void rr_push(uint32_t d, float4 v, uint32_t b) {
+  asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.f32 [%0], {%1,%2,%3,%4}, [%5];" ::"r"(d),"f"(v.x),"f"(v.y),"f"(v.z),"f"(v.w),"r"(b):"memory");
+}
+RD float4 rr_pull(uint32_t d) {
+  float4 v; asm volatile("ld.shared::cluster.v4.f32 {%0,%1,%2,%3}, [%4];":"=f"(v.x),"=f"(v.y),"=f"(v.z),"=f"(v.w):"r"(d):"memory");return v;
+}
+RD void rr_add(float4& a,float4 b) { a.x+=b.x;a.y+=b.y;a.z+=b.z;a.w+=b.w; }
+RD uint64_t rr_desc(uint32_t a) { return (uint64_t)((a&0x3ffff)>>4)|((uint64_t)64<<32)|((uint64_t)1<<62); }
+RD void rr_tma(uint32_t dst, const void* tm, int k,int r,uint32_t bar) {
+  asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2,%3}], [%4];" ::"r"(dst),"l"(tm),"r"(k),"r"(r),"r"(bar):"memory");
+}
+@@MMA@@
+
+template<int BN,int S,int ST,int SW,int RED,int PIPE>
+__global__ __launch_bounds__((PIPE&2)?256:128) void rr_kernel(const __grid_constant__ CUtensorMap tw,
+                                               const __grid_constant__ CUtensorMap tx, float* out, int m) {
+  constexpr int NR=SW?64:BN, TM=SW?BN:64;
+  constexpr int WB=NR*128, XB=TM*128, SB=WB*2+XB;
+  constexpr int NF=64*BN, NV=NF/4, OWN=NV/S;
+  extern __shared__ __align__(1024) unsigned char sm[];
+  const int tid=threadIdx.x, lane=tid&31, warp=tid>>5, rank=blockIdx.x%S;
+  const int row=blockIdx.x/S*NR, tok=blockIdx.y*TM;
+  const uint32_t base=rr_smem(sm), bars=base+ST*SB, empty=bars+ST*8, rb=(empty+((PIPE&2)?ST*8:0)+15)&~15u;
+  const uint32_t recv=rb+16;
+  const int kb=rank*(128/S);
+  auto load=[&](int i) {
+    const int st=i%ST;
+    const uint32_t b=bars+st*8, d=base+st*SB;
+    rr_expect(b,SB);
+    rr_tma(d,&tw,0,((row/NR)*128+kb+i)*NR*2,b);
+    rr_tma(d+2*WB,&tx,(kb+i)*64,tok,b);
+  };
+  if(tid==((PIPE&2)?128:0)) {
+#pragma unroll
+    for(int i=0;i<ST;i++) { rr_init(bars+i*8,1); if constexpr(PIPE&2) rr_init(empty+i*8,4); }
+    asm volatile("fence.proxy.async.shared::cta;" :::"memory");
+    if constexpr(PIPE&4) {
+    if constexpr(RED>=1) {
+      rr_init(rb,1);asm volatile("fence.proxy.async.shared::cta;" :::"memory");rr_expect(rb,(S-1)*OWN*16);
+      asm volatile("fence.mbarrier_init.release.cluster;" :::"memory");
+    }
+    }
+#pragma unroll
+    for(int i=0;i<ST && i<128/S;i++) load(i);
+    if constexpr(!(PIPE&4)) {
+    if constexpr(RED>=1) {
+      rr_init(rb,1);asm volatile("fence.proxy.async.shared::cta;" :::"memory");rr_expect(rb,(S-1)*OWN*16);
+      asm volatile("fence.mbarrier_init.release.cluster;" :::"memory");
+    }
+    }
+  }
+  __syncthreads();
+  if constexpr(RED>=1) asm volatile("barrier.cluster.arrive.relaxed.aligned;" :::"memory");
+  if constexpr(PIPE&2) {
+    if(tid>=128) {
+      if(tid==128) {
+        for(int i=ST;i<128/S;i++) {
+          rr_wait(empty+(i%ST)*8,((i/ST)-1)&1);
+          load(i);
+        }
+      }
+      if constexpr(RED>=1) asm volatile("barrier.cluster.wait.acquire.aligned;" :::"memory");
+      if constexpr(RED!=2) rr_sync();
+      return;
+    }
+  }
+  float acc[BN/2];
+#pragma unroll
+  for(int j=0;j<BN/2;j++) asm volatile("mov.b32 %0, 0;":"=f"(acc[j]));
+  int prev=0;
+#pragma unroll 1
+  for(int i=0;i<128/S;i++) {
+    const int st=i%ST;
+    rr_wait(bars+st*8,(i/ST)&1);
+    const uint32_t w=base+st*SB, x=w+2*WB;
+#pragma unroll
+    for(int j=0;j<BN/2;j++) asm volatile("":"+f"(acc[j])::"memory");
+    asm volatile("wgmma.fence.sync.aligned;" :::"memory");
+#pragma unroll
+    for(int q=0;q<4;q++) {
+      const uint64_t dx=rr_desc(x+q*32),dh=rr_desc(w+q*32),dl=rr_desc(w+WB+q*32);
+      if constexpr(SW) { @@CALL_H@@; @@CALL_L@@; }
+      else { @@CALL_NH@@; @@CALL_NL@@; }
+    }
+    asm volatile("wgmma.commit_group.sync.aligned;" :::"memory");
+    if constexpr(PIPE&1) asm volatile("wgmma.wait_group.sync.aligned 1;" :::"memory");
+    else asm volatile("wgmma.wait_group.sync.aligned 0;" :::"memory");
+#pragma unroll
+    for(int j=0;j<BN/2;j++) asm volatile("":"+f"(acc[j])::"memory");
+    if constexpr(PIPE&2) {
+      if constexpr(PIPE&1) {
+        if(i>0 && prev+ST<128/S && lane==0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(empty+(prev%ST)*8):"memory");
+      } else {
+        if(i+ST<128/S && lane==0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(empty+st*8):"memory");
+      }
+    } else if constexpr(PIPE&1) {
+      if(i>0 && prev+ST<128/S && tid==0) load(prev+ST);
+    } else {
+      if(i+ST<128/S && tid==0) load(i+ST);
+    }
+    prev=i;
+  }
+  asm volatile("wgmma.wait_group.sync.aligned 0;" :::"memory");
+  auto emit=[&](int v,float4 z) {
+    const int t=v%128, j=v/128, ln=t&31, wr=t>>5;
+    const int ar=wr*16+(ln>>2),bc=j*8+(ln&3)*2;
+    const float vv[4]={z.x,z.y,z.z,z.w};
+#pragma unroll
+    for(int c=0;c<4;c++) {
+      const int a=ar+(c/2)*8, b=bc+(c&1);
+      const int tr=tok+(SW?b:a), wc=row+(SW?a:b);
+      if(tr<m) out[tr*256+wc]=vv[c];
+    }
+  };
+  if constexpr(S==1) {
+#pragma unroll
+    for(int j=0;j<BN/8;j++) emit(j*128+tid,make_float4(acc[4*j],acc[4*j+1],acc[4*j+2],acc[4*j+3]));
+  } else if constexpr(RED==0) {
+    float4* part=(float4*)sm;
+#pragma unroll
+    for(int j=0;j<BN/8;j++) part[j*128+tid]=make_float4(acc[4*j],acc[4*j+1],acc[4*j+2],acc[4*j+3]);
+    rr_sync();
+    for(int t=tid;t<OWN;t+=128) {
+      const int v=rank*OWN+t;
+      float4 sum=make_float4(0,0,0,0);
+#pragma unroll
+      for(int r=0;r<S;r++) rr_add(sum,rr_pull(rr_map(base+v*16,r)));
+      emit(v,sum);
+    }
+    rr_sync();
+  } else {
+    asm volatile("barrier.cluster.wait.acquire.aligned;" :::"memory");
+#pragma unroll
+    for(int j=0;j<BN/8;j++) {
+      const int v=j*128+tid, dst=v/OWN, local=v%OWN;
+      const float4 val=make_float4(acc[4*j],acc[4*j+1],acc[4*j+2],acc[4*j+3]);
+      const uint32_t addr=recv+(rank*OWN+local)*16;
+      if(dst==rank) *(float4*)(sm+(addr-base))=val;
+      else rr_push(rr_map(addr,dst),val,rr_map(rb,dst));
+    }
+    if constexpr(PIPE&2) asm volatile("bar.sync 1, 128;" :::"memory"); else __syncthreads();
+    rr_wait(rb,0);
+    for(int t=tid;t<OWN;t+=128) {
+      float4 sum=make_float4(0,0,0,0);
+#pragma unroll
+      for(int r=0;r<S;r++) rr_add(sum,*(float4*)(sm+recv-base+(r*OWN+t)*16));
+      emit(rank*OWN+t,sum);
+    }
+    if constexpr(RED!=2) rr_sync();
+  }
+}
+
+typedef CUresult (*RR_Encode)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*, const cuuint64_t*,
+ const cuuint32_t*, const cuuint32_t*, CUtensorMapInterleave, CUtensorMapSwizzle, CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
+static int rr_map_host(CUtensorMap* tm,int64_t p,int inner,int outer,int box) {
+  static RR_Encode enc=nullptr;
+  if(!enc) { cudaDriverEntryPointQueryResult q; if(cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled",(void**)&enc,12000,cudaEnableDefault,&q)!=cudaSuccess||!enc) return -100; }
+  cuuint64_t dims[2]={(uint64_t)inner,(uint64_t)outer},stride[1]={(uint64_t)inner*2};
+  cuuint32_t sz[2]={64,(uint32_t)box},es[2]={1,1};
+  return (int)enc(tm,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,2,(void*)p,dims,stride,sz,es,CU_TENSOR_MAP_INTERLEAVE_NONE,
+                 CU_TENSOR_MAP_SWIZZLE_128B,CU_TENSOR_MAP_L2_PROMOTION_L2_256B,CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+}
+
+template<int BN,int S,int ST,int SW,int RED,int PIPE>
+int rr_launch_t(int64_t w,int64_t x,int64_t out,int m,int64_t stream,int query) {
+  constexpr int NR=SW?64:BN, TM=SW?BN:64;
+  constexpr int bytes=ST*(2*NR+TM)*128+ST*8*((PIPE&2)?2:1)+48+(RED>=1?64*BN*4:0);
+  auto fn=rr_kernel<BN,S,ST,SW,RED,PIPE>;
+  static bool configured=false;
+  if(!configured) {
+    cudaError_t e=cudaFuncSetAttribute(fn,cudaFuncAttributeMaxDynamicSharedMemorySize,bytes);
+    if(e!=cudaSuccess) return -(int)e;
+    e=cudaFuncSetAttribute(fn,cudaFuncAttributeNonPortableClusterSizeAllowed,1);
+    if(e!=cudaSuccess)return -(int)e;
+    configured=true;
+  }
+  if(query==2){cudaFuncAttributes fa;cudaFuncGetAttributes(&fa,fn);return fa.numRegs*1000+fa.localSizeBytes;}
+  cudaLaunchConfig_t cfg={};
+  cfg.gridDim=dim3(256/NR*S,(m+TM-1)/TM,1);cfg.blockDim=dim3((PIPE&2)?256:128);cfg.dynamicSmemBytes=bytes;cfg.stream=(cudaStream_t)stream;
+  cudaLaunchAttribute attr[1];attr[0].id=cudaLaunchAttributeClusterDimension;attr[0].val.clusterDim={S,1,1};
+  if(S>1){cfg.attrs=attr;cfg.numAttrs=1;}
+  if(query==1){int n=0;cudaError_t e=cudaOccupancyMaxActiveClusters(&n,fn,&cfg);return e==cudaSuccess?n:-(int)e;}
+  CUtensorMap tw,tx;
+  int e=rr_map_host(&tw,w,64,256*128*2,NR*2);if(e)return e;
+  e=rr_map_host(&tx,x,8192,m,TM);if(e)return e;
+  cudaError_t err=cudaLaunchKernelEx(&cfg,fn,tw,tx,(float*)out,m);
+  return err==cudaSuccess?0:(int)err;
+}
+int rr_launch(int id,int64_t w,int64_t x,int64_t out,int m,int64_t stream,int query) {
+ switch(id){@@CASES@@ default:return -99;}
+}
+@@SCALAR@@
+'''
+
+ROUTER_CPP = '''#include <pybind11/pybind11.h>
+#include <stdint.h>
+int rr_launch(int,int64_t,int64_t,int64_t,int,int64_t,int);
+int rr_scalar(int64_t,int64_t,int64_t,int,int64_t,int);
+int rr_small(int64_t,int64_t,int64_t,int,int,int,int64_t,int);
+'''
+
+def build_router(configs):
+    src = ROUTER_CUDA.replace('@@MMA@@', '\n'.join(_mma(n) for n in sorted({c[0] for c in configs})))
+    for tag, a, b in [('H', 'dh', 'dx'), ('L', 'dl', 'dx'), ('NH', 'dx', 'dh'), ('NL', 'dx', 'dl')]:
+        src = src.replace('@@CALL_' + tag + '@@', ' '.join(f'if constexpr(BN=={n}) rr_mma_{n}(acc,{a},{b});' for n in sorted({c[0] for c in configs})))
+    cases = '\n'.join(f'case {i}: return rr_launch_t<{",".join(map(str,c))}>(w,x,out,m,stream,query);' for i,c in enumerate(configs))
+    src = src.replace('@@CASES@@',cases).replace('@@SCALAR@@', ROUTER_SCALAR + ROUTER_SMALL)
+    name = 'router_' + hashlib.sha256(src.encode()).hexdigest()[:12]
+    return load_inline(name, ROUTER_CPP, cuda_sources=src, functions=['rr_launch','rr_scalar','rr_small'],
+                       extra_cuda_cflags=['-O3','-std=c++20','-gencode=arch=compute_90a,code=sm_90a','--ptxas-options=-v'],
+                       no_implicit_headers=True, with_pytorch_error_handling=False,verbose=False)
+
+def pack_router(w, nr):
+    hi = w.to(torch.bfloat16)
+    lo = (w-hi.float()).to(torch.bfloat16)
+    return torch.stack([p.view(256//nr,nr,128,64).permute(0,2,1,3) for p in (hi,lo)],dim=2).contiguous().view(-1,64)
+
+def prepare_candidates(weights, configs):
+    w = weights['router'].contiguous()
+    return {'ext':build_router(configs), 'configs':configs,'weight':w,
+            'packed':{nr:pack_router(w,nr) for nr in {64 if c[3] else c[0] for c in configs}}}
+
+def run_candidate(x, st, index):
+    out = torch.empty((x.shape[0],256),dtype=torch.float32,device=x.device)
+    stream = torch.cuda.current_stream().cuda_stream
+    if index == -1:
+        rc = st['ext'].rr_scalar(st['weight'].data_ptr(),x.data_ptr(),out.data_ptr(),x.shape[0],stream,0)
+    else:
+        cfg = st['configs'][index]
+        w = st['packed'][64 if cfg[3] else cfg[0]]
+        rc = st['ext'].rr_launch(index,w.data_ptr(),x.data_ptr(),out.data_ptr(),x.shape[0],stream,0)
+    if rc:
+        raise RuntimeError(f'router launch failed: config={index}, rc={rc}')
+    return out
+
+# Configuration: WGMMA N, K splits, stages, swap operands, reduction, pipeline flags.
+# Reduction 0 pulls, 1 pushes with a final barrier, 2 relies on destination byte completion.
+# Pipeline bits: 1 keeps one MMA group in flight, 2 adds a producer, 4 initializes reduction first.
+ROUTER_CONFIGS = [(32,16,4,1,2,1), (32,8,4,0,2,1), (64,4,8,1,2,3)]
+
+def prepare_router(weights) -> dict:
+    w = weights.get('router')
+    if w is None or w.shape != (256,8192) or w.dtype != torch.float32 or not w.is_cuda:
+        return {'enabled':False}
+    if torch.cuda.get_device_capability(w.device) != (9,0):
+        return {'enabled':False}
+    st = prepare_candidates(weights, ROUTER_CONFIGS)
+    st['small'] = {(16,8):pack_small_router(w,16,8)}
+    st['enabled'] = True
+    for m in (1,8,16,32,128,256):
+        x = torch.zeros((m,8192),dtype=torch.bfloat16,device=w.device)
+        run_router(x,'router',256,st)
+    torch.cuda.synchronize(w.device)
+    return st
+
+def run_router(x, layer, n, st) -> torch.Tensor | None:
+    if not st.get('enabled') or layer != 'router' or n != 256:
+        return None
+    if x.ndim != 2 or x.shape[1] != 8192 or x.dtype != torch.bfloat16 or not x.is_cuda or not x.is_contiguous():
+        return None
+    if x.device != st['weight'].device or x.data_ptr() % 16:
+        return None
+    m = x.shape[0]
+    if not 1 <= m <= 256:
+        return None
+    if m == 1:
+        return run_candidate(x,st,-1)
+    if m <= 16:
+        return run_small_candidate(x,st)
+    return run_candidate(x,st,0 if m <= 32 else 1 if m <= 128 else 2)
+
+ROUTER_SCALAR = r'''
+template<int M, int NT, int ST>
+__global__ void rr_scalar_kernel(const float* __restrict__ w, const __nv_bfloat16* __restrict__ x,
+                                float* __restrict__ y, int m) {
+  constexpr int K=8192;
+  int tid=threadIdx.x, row=blockIdx.x, lane=tid&31, warp=tid>>5;
+  float acc[M][4]={};
+  float4 ww[ST];
+  uint2 xx[ST][M];
+  auto ld=[&](int slot,int i) {
+    ww[slot]=reinterpret_cast<const float4*>(w+row*K)[i];
+    #pragma unroll
+    for(int t=0;t<M;t++) {
+      if(t<m) xx[slot][t]=reinterpret_cast<const uint2*>(x+t*K)[i];
+    }
+  };
+  #pragma unroll
+  for(int s=0;s<ST;s++) ld(s,tid+s*NT);
+  #pragma unroll 1
+  for(int base=tid;base<K/4;base+=ST*NT) {
+    #pragma unroll
+    for(int s=0;s<ST;s++) {
+      float4 v=ww[s];
+      uint2 a[M];
+      #pragma unroll
+      for(int t=0;t<M;t++) a[t]=xx[s][t];
+      if(base+(s+ST)*NT<K/4) ld(s,base+(s+ST)*NT);
+      #pragma unroll
+      for(int t=0;t<M;t++) if(t<m) {
+        __nv_bfloat162 z0=*reinterpret_cast<__nv_bfloat162*>(&a[t].x);
+        __nv_bfloat162 z1=*reinterpret_cast<__nv_bfloat162*>(&a[t].y);
+        float2 f0=__bfloat1622float2(z0),f1=__bfloat1622float2(z1);
+        acc[t][0]=fmaf(v.x,f0.x,acc[t][0]);
+        acc[t][1]=fmaf(v.y,f0.y,acc[t][1]);
+        acc[t][2]=fmaf(v.z,f1.x,acc[t][2]);
+        acc[t][3]=fmaf(v.w,f1.y,acc[t][3]);
+      }
+    }
+  }
+  __shared__ float sums[M][NT/32];
+  #pragma unroll
+  for(int t=0;t<M;t++) if(t<m) {
+    float v=(acc[t][0]+acc[t][1])+(acc[t][2]+acc[t][3]);
+    #pragma unroll
+    for(int d=16;d;d>>=1) v+=__shfl_down_sync(0xffffffff,v,d);
+    if(lane==0) sums[t][warp]=v;
+  }
+  __syncthreads();
+  if(warp==0) {
+    #pragma unroll
+    for(int t=0;t<M;t++) if(t<m) {
+      float v=lane<NT/32?sums[t][lane]:0.f;
+      #pragma unroll
+      for(int d=16;d;d>>=1) v+=__shfl_down_sync(0xffffffff,v,d);
+      if(lane==0) y[t*256+row]=v;
+    }
+  }
+}
+
+int rr_scalar(int64_t w,int64_t x,int64_t out,int m,int64_t stream,int query) {
+  auto kern=rr_scalar_kernel<1,512,2>;
+  if(query==2) {
+    cudaFuncAttributes fa;
+    if(cudaFuncGetAttributes(&fa,kern)!=cudaSuccess) return -10;
+    return fa.numRegs*1000+(int)std::min<size_t>(fa.localSizeBytes,999);
+  }
+  if(m!=1) return -5;
+  kern<<<256,512,0,(cudaStream_t)stream>>>((const float*)w,(const __nv_bfloat16*)x,(float*)out,m);
+  return cudaGetLastError()==cudaSuccess?0:-8;
+}
+'''
+
+ROUTER_SMALL = r'''
+template<int MT,int S,int WK>
+__global__ __launch_bounds__(WK*32) void rr_small_kernel(const int4* wp,const __nv_bfloat16* x,float* out,int m) {
+  constexpr int KU=128/S/WK, NI=MT*32;
+  const int tid=threadIdx.x,lane=tid&31,warp=tid>>5,rank=blockIdx.x%S,row=blockIdx.x/S*16;
+  const int gw=(rank*16+row/16)*WK+warp;
+  extern __shared__ __align__(16) unsigned char sm[];
+  float4* recv=(float4*)sm;
+  float4* part=recv+S*NI;
+  const uint32_t rb=rr_smem(sm+(S+WK)*NI*16);
+  int4 w[KU][8];uint4 xx[KU][MT][2];
+#pragma unroll
+  for(int k=0;k<KU;k++) {
+#pragma unroll
+    for(int j=0;j<8;j++) {
+      const int4* p=wp+((k*(16*S*WK)+gw)*8+j)*32+lane;
+      asm volatile("ld.global.nc.L1::no_allocate.v4.s32 {%0,%1,%2,%3}, [%4];":"=r"(w[k][j].x),"=r"(w[k][j].y),"=r"(w[k][j].z),"=r"(w[k][j].w):"l"(p));
+    }
+#pragma unroll
+    for(int n=0;n<MT;n++) {
+      const __nv_bfloat16* p=x+min(n*8+(lane>>2),m-1)*8192+((rank*WK+warp)*KU+k)*64+(lane&3)*16;
+#pragma unroll
+      for(int h=0;h<2;h++) asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];":"=r"(xx[k][n][h].x),"=r"(xx[k][n][h].y),"=r"(xx[k][n][h].z),"=r"(xx[k][n][h].w):"l"(p+h*8));
+    }
+  }
+  if(rank==0 && tid==0) {rr_init(rb,1);asm volatile("fence.proxy.async.shared::cta;" :::"memory");}
+  if(rank==0 && warp==0) __syncwarp();
+  if(rank==0 && tid==0) {rr_expect(rb,(S-1)*NI*16);asm volatile("fence.mbarrier_init.release.cluster;" :::"memory");}
+  asm volatile("barrier.cluster.arrive.relaxed.aligned;" :::"memory");
+  float c[2][MT][4]={};
+#pragma unroll
+  for(int k=0;k<KU;k++) {
+#pragma unroll
+    for(int n=0;n<MT;n++) {
+      uint32_t b[8]={xx[k][n][0].x,xx[k][n][0].y,xx[k][n][0].z,xx[k][n][0].w,xx[k][n][1].x,xx[k][n][1].y,xx[k][n][1].z,xx[k][n][1].w};
+#pragma unroll
+      for(int q=0;q<4;q++) {
+#pragma unroll
+        for(int h=0;h<2;h++) {
+          const int4 a=w[k][q+h*4];
+          asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                       :"+f"(c[h][n][0]),"+f"(c[h][n][1]),"+f"(c[h][n][2]),"+f"(c[h][n][3]):"r"(a.x),"r"(a.y),"r"(a.z),"r"(a.w),"r"(b[2*q]),"r"(b[2*q+1]));
+        }
+      }
+    }
+  }
+#pragma unroll
+  for(int n=0;n<MT;n++) part[warp*NI+n*32+lane]=make_float4(c[0][n][0]+c[1][n][0],c[0][n][1]+c[1][n][1],c[0][n][2]+c[1][n][2],c[0][n][3]+c[1][n][3]);
+  __syncthreads();
+  asm volatile("barrier.cluster.wait.acquire.aligned;" :::"memory");
+  for(int v=tid;v<NI;v+=WK*32) {
+    float4 sum=make_float4(0,0,0,0);
+#pragma unroll
+    for(int k=0;k<WK;k++) rr_add(sum,part[k*NI+v]);
+    if(rank==0)recv[v]=sum;
+    else rr_push(rr_map(rr_smem(recv+rank*NI+v),0),sum,rr_map(rb,0));
+  }
+  if(rank==0) {
+    __syncthreads();rr_wait(rb,0);
+    for(int v=tid;v<NI;v+=WK*32) {
+      float4 sum=make_float4(0,0,0,0);
+#pragma unroll
+      for(int s=0;s<S;s++) rr_add(sum,recv[s*NI+v]);
+      const int ln=v%32,tok=(v/32)*8+(ln&3)*2,wr=row+(ln>>2);
+      if(tok<m){out[tok*256+wr]=sum.x;out[tok*256+wr+8]=sum.z;}
+      if(tok+1<m){out[(tok+1)*256+wr]=sum.y;out[(tok+1)*256+wr+8]=sum.w;}
+    }
+  }
+}
+
+template<int MT,int S,int WK>
+int rr_small_t(int64_t w,int64_t x,int64_t out,int m,int64_t stream,int query) {
+  auto fn=rr_small_kernel<MT,S,WK>;
+  constexpr int bytes=(S+WK)*MT*512+16;
+  static bool configured=false;
+  if(!configured){cudaFuncSetAttribute(fn,cudaFuncAttributeMaxDynamicSharedMemorySize,bytes);cudaFuncSetAttribute(fn,cudaFuncAttributeNonPortableClusterSizeAllowed,1);configured=true;}
+  if(query==2){cudaFuncAttributes fa;cudaFuncGetAttributes(&fa,fn);return fa.numRegs*1000+fa.localSizeBytes;}
+  cudaLaunchConfig_t cfg={};cfg.gridDim=dim3(16*S);cfg.blockDim=dim3(WK*32);cfg.dynamicSmemBytes=bytes;cfg.stream=(cudaStream_t)stream;
+  cudaLaunchAttribute at;at.id=cudaLaunchAttributeClusterDimension;at.val.clusterDim={S,1,1};cfg.attrs=&at;cfg.numAttrs=1;
+  return (int)cudaLaunchKernelEx(&cfg,fn,(const int4*)w,(const __nv_bfloat16*)x,(float*)out,m);
+}
+int rr_small(int64_t w,int64_t x,int64_t out,int m,int s,int wk,int64_t stream,int query) {
+#define RSM(S,W) if(s==S && wk==W) {if(m<=8)return rr_small_t<1,S,W>(w,x,out,m,stream,query);if(m<=16)return rr_small_t<2,S,W>(w,x,out,m,stream,query);if(m<=32)return rr_small_t<4,S,W>(w,x,out,m,stream,query);}
+RSM(8,8) RSM(16,8) RSM(16,4)
+return -99;
+}
+
+'''
+
+def pack_small_router(w, s=16, wk=8):
+    hi=w.to(torch.bfloat16);lo=(w-hi.float()).to(torch.bfloat16)
+    def units(v):
+        v=v.view(16,2,8,128,4,4,2,2).permute(0,3,2,4,5,6,1,7).reshape(16,128,32,4,8)
+        return v.permute(0,1,3,2,4)
+    data=torch.cat([units(hi),units(lo)],dim=2).contiguous()
+    ku=128//s//wk
+    return data.view(16,s,wk,ku,8,32,8).permute(3,1,0,2,4,5,6).contiguous()
+
+def run_small_candidate(x,st,s=16,wk=8):
+    out=torch.empty((x.shape[0],256),dtype=torch.float32,device=x.device)
+    rc=st['ext'].rr_small(st['small'][s,wk].data_ptr(),x.data_ptr(),out.data_ptr(),x.shape[0],s,wk,torch.cuda.current_stream().cuda_stream,0)
+    if rc:raise RuntimeError(f'router small launch failed: {rc}')
+    return out
+
+
+# ---- router2/router2_kernels.py ----
+
+def rt2_mma(n):
+    regs = ', '.join(f'%{i}' for i in range(n // 2))
+    outs = ', '.join(f'"+f"(d[{i}])' for i in range(n // 2))
+    return f'''__device__ __forceinline__ void rt2_mma_{n}(float* d, uint64_t a, uint64_t b) {{
+    asm volatile("wgmma.mma_async.sync.aligned.m64n{n}k16.f32.bf16.bf16 {{{regs}}}, %{n//2}, %{n//2+1}, 1, 1, 1, 0, 0;" : {outs} : "l"(a), "l"(b));
+}}'''
+
+rt2_ROUTER_CUDA = r'''
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <stdint.h>
+#include <algorithm>
+#define rt2_RD __device__ __forceinline__
+rt2_RD uint32_t rt2_smem(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
+rt2_RD void rt2_init(uint32_t b, int n) { asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(b),"r"(n):"memory"); }
+rt2_RD void rt2_expect(uint32_t b, int n) { asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(b),"r"(n):"memory"); }
+rt2_RD void rt2_wait(uint32_t b, int ph) {
+  asm volatile("{ .reg .pred p; wait: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%0], %1; @!p bra wait; }" ::"r"(b),"r"(ph):"memory");
+}
+rt2_RD void rt2_sync() { asm volatile("barrier.cluster.arrive.release.aligned; barrier.cluster.wait.acquire.aligned;" :::"memory"); }
+rt2_RD uint32_t rt2_map(uint32_t a, int r) { uint32_t b; asm("mapa.shared::cluster.u32 %0, %1, %2;":"=r"(b):"r"(a),"r"(r));return b; }
+rt2_RD void rt2_push(uint32_t d, float4 v, uint32_t b) {
+  asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.f32 [%0], {%1,%2,%3,%4}, [%5];" ::"r"(d),"f"(v.x),"f"(v.y),"f"(v.z),"f"(v.w),"r"(b):"memory");
+}
+rt2_RD float4 rt2_pull(uint32_t d) {
+  float4 v; asm volatile("ld.shared::cluster.v4.f32 {%0,%1,%2,%3}, [%4];":"=f"(v.x),"=f"(v.y),"=f"(v.z),"=f"(v.w):"r"(d):"memory");return v;
+}
+rt2_RD void rt2_add(float4& a,float4 b) { a.x+=b.x;a.y+=b.y;a.z+=b.z;a.w+=b.w; }
+rt2_RD uint64_t rt2_desc(uint32_t a) { return (uint64_t)((a&0x3ffff)>>4)|((uint64_t)64<<32)|((uint64_t)1<<62); }
+rt2_RD void rt2_tma(uint32_t dst, const void* tm, int k,int r,uint32_t bar) {
+  asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2,%3}], [%4];" ::"r"(dst),"l"(tm),"r"(k),"r"(r),"r"(bar):"memory");
+}
+@@MMA@@
+
+template<int BN,int S,int ST,int SW,int RED,int PIPE>
+__global__ __launch_bounds__((PIPE&2)?256:128) void rt2_kernel(const __grid_constant__ CUtensorMap tw,
+                                               const __grid_constant__ CUtensorMap tx, float* out, int m) {
+  constexpr int NR=SW?64:BN, TM=SW?BN:64;
+  constexpr int WB=NR*128, XB=TM*128, SB=WB*2+XB;
+  constexpr int NF=64*BN, NV=NF/4, OWN=NV/S;
+  extern __shared__ __align__(1024) unsigned char sm[];
+  const int tid=threadIdx.x, lane=tid&31, warp=tid>>5, rank=blockIdx.x%S;
+  const int row=blockIdx.x/S*NR, tok=blockIdx.y*TM;
+  const uint32_t base=rt2_smem(sm), bars=base+ST*SB, empty=bars+ST*8, rb=(empty+((PIPE&2)?ST*8:0)+15)&~15u;
+  const uint32_t recv=rb+16;
+  const int kb=rank*(128/S);
+  auto load=[&](int i) {
+    const int st=i%ST;
+    const uint32_t b=bars+st*8, d=base+st*SB;
+    rt2_expect(b,SB);
+    rt2_tma(d,&tw,0,((row/NR)*128+kb+i)*NR*2,b);
+    rt2_tma(d+2*WB,&tx,(kb+i)*64,tok,b);
+  };
+  if(tid==((PIPE&2)?128:0)) {
+#pragma unroll
+    for(int i=0;i<ST;i++) { rt2_init(bars+i*8,1); if constexpr(PIPE&2) rt2_init(empty+i*8,4); }
+    asm volatile("fence.proxy.async.shared::cta;" :::"memory");
+    if constexpr(PIPE&4) {
+    if constexpr(RED>=1) {
+      rt2_init(rb,1);asm volatile("fence.proxy.async.shared::cta;" :::"memory");rt2_expect(rb,(S-1)*OWN*16);
+      asm volatile("fence.mbarrier_init.release.cluster;" :::"memory");
+    }
+    }
+#pragma unroll
+    for(int i=0;i<ST && i<128/S;i++) load(i);
+    if constexpr(!(PIPE&4)) {
+    if constexpr(RED>=1) {
+      rt2_init(rb,1);asm volatile("fence.proxy.async.shared::cta;" :::"memory");rt2_expect(rb,(S-1)*OWN*16);
+      asm volatile("fence.mbarrier_init.release.cluster;" :::"memory");
+    }
+    }
+  }
+  __syncthreads();
+  if constexpr(RED>=1) asm volatile("barrier.cluster.arrive.relaxed.aligned;" :::"memory");
+  if constexpr(PIPE&2) {
+    if(tid>=128) {
+      if(tid==128) {
+        for(int i=ST;i<128/S;i++) {
+          rt2_wait(empty+(i%ST)*8,((i/ST)-1)&1);
+          load(i);
+        }
+      }
+      if constexpr(RED>=1) asm volatile("barrier.cluster.wait.acquire.aligned;" :::"memory");
+      if constexpr(RED!=2) rt2_sync();
+      return;
+    }
+  }
+  float acc[BN/2];
+#pragma unroll
+  for(int j=0;j<BN/2;j++) asm volatile("mov.b32 %0, 0;":"=f"(acc[j]));
+  int prev=0;
+#pragma unroll 1
+  for(int i=0;i<128/S;i++) {
+    const int st=i%ST;
+    rt2_wait(bars+st*8,(i/ST)&1);
+    const uint32_t w=base+st*SB, x=w+2*WB;
+#pragma unroll
+    for(int j=0;j<BN/2;j++) asm volatile("":"+f"(acc[j])::"memory");
+    asm volatile("wgmma.fence.sync.aligned;" :::"memory");
+#pragma unroll
+    for(int q=0;q<4;q++) {
+      const uint64_t dx=rt2_desc(x+q*32),dh=rt2_desc(w+q*32),dl=rt2_desc(w+WB+q*32);
+      if constexpr(SW) { @@CALL_H@@; @@CALL_L@@; }
+      else { @@CALL_NH@@; @@CALL_NL@@; }
+    }
+    asm volatile("wgmma.commit_group.sync.aligned;" :::"memory");
+    if constexpr(PIPE&1) asm volatile("wgmma.wait_group.sync.aligned 1;" :::"memory");
+    else asm volatile("wgmma.wait_group.sync.aligned 0;" :::"memory");
+#pragma unroll
+    for(int j=0;j<BN/2;j++) asm volatile("":"+f"(acc[j])::"memory");
+    if constexpr(PIPE&2) {
+      if constexpr(PIPE&1) {
+        if(i>0 && prev+ST<128/S && lane==0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(empty+(prev%ST)*8):"memory");
+      } else {
+        if(i+ST<128/S && lane==0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(empty+st*8):"memory");
+      }
+    } else if constexpr(PIPE&1) {
+      if(i>0 && prev+ST<128/S && tid==0) load(prev+ST);
+    } else {
+      if(i+ST<128/S && tid==0) load(i+ST);
+    }
+    prev=i;
+  }
+  asm volatile("wgmma.wait_group.sync.aligned 0;" :::"memory");
+  auto emit=[&](int v,float4 z) {
+    const int t=v%128, j=v/128, ln=t&31, wr=t>>5;
+    const int ar=wr*16+(ln>>2),bc=j*8+(ln&3)*2;
+    const float vv[4]={z.x,z.y,z.z,z.w};
+#pragma unroll
+    for(int c=0;c<4;c++) {
+      const int a=ar+(c/2)*8, b=bc+(c&1);
+      const int tr=tok+(SW?b:a), wc=row+(SW?a:b);
+      if(tr<m) out[tr*256+wc]=vv[c];
+    }
+  };
+  if constexpr(S==1) {
+#pragma unroll
+    for(int j=0;j<BN/8;j++) emit(j*128+tid,make_float4(acc[4*j],acc[4*j+1],acc[4*j+2],acc[4*j+3]));
+  } else if constexpr(RED==0) {
+    float4* part=(float4*)sm;
+#pragma unroll
+    for(int j=0;j<BN/8;j++) part[j*128+tid]=make_float4(acc[4*j],acc[4*j+1],acc[4*j+2],acc[4*j+3]);
+    rt2_sync();
+    for(int t=tid;t<OWN;t+=128) {
+      const int v=rank*OWN+t;
+      float4 sum=make_float4(0,0,0,0);
+#pragma unroll
+      for(int r=0;r<S;r++) rt2_add(sum,rt2_pull(rt2_map(base+v*16,r)));
+      emit(v,sum);
+    }
+    rt2_sync();
+  } else {
+    asm volatile("barrier.cluster.wait.acquire.aligned;" :::"memory");
+#pragma unroll
+    for(int j=0;j<BN/8;j++) {
+      const int v=j*128+tid, dst=v/OWN, local=v%OWN;
+      const float4 val=make_float4(acc[4*j],acc[4*j+1],acc[4*j+2],acc[4*j+3]);
+      const uint32_t addr=recv+(rank*OWN+local)*16;
+      if(dst==rank) *(float4*)(sm+(addr-base))=val;
+      else rt2_push(rt2_map(addr,dst),val,rt2_map(rb,dst));
+    }
+    if constexpr(PIPE&2) asm volatile("bar.sync 1, 128;" :::"memory"); else __syncthreads();
+    rt2_wait(rb,0);
+    for(int t=tid;t<OWN;t+=128) {
+      float4 sum=make_float4(0,0,0,0);
+#pragma unroll
+      for(int r=0;r<S;r++) rt2_add(sum,*(float4*)(sm+recv-base+(r*OWN+t)*16));
+      emit(rank*OWN+t,sum);
+    }
+    if constexpr(RED!=2) rt2_sync();
+  }
+}
+
+typedef CUresult (*rt2_Encode)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*, const cuuint64_t*,
+ const cuuint32_t*, const cuuint32_t*, CUtensorMapInterleave, CUtensorMapSwizzle, CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
+static int rt2_map_host(CUtensorMap* tm,int64_t p,int inner,int outer,int box,int promo) {
+  static rt2_Encode enc=nullptr;
+  if(!enc) { cudaDriverEntryPointQueryResult q; if(cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled",(void**)&enc,12000,cudaEnableDefault,&q)!=cudaSuccess||!enc) return -100; }
+  cuuint64_t dims[2]={(uint64_t)inner,(uint64_t)outer},stride[1]={(uint64_t)inner*2};
+  cuuint32_t sz[2]={64,(uint32_t)box},es[2]={1,1};
+  return (int)enc(tm,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,2,(void*)p,dims,stride,sz,es,CU_TENSOR_MAP_INTERLEAVE_NONE,
+                 CU_TENSOR_MAP_SWIZZLE_128B,(promo==64?CU_TENSOR_MAP_L2_PROMOTION_L2_64B:promo==128?CU_TENSOR_MAP_L2_PROMOTION_L2_128B:promo==0?CU_TENSOR_MAP_L2_PROMOTION_NONE:CU_TENSOR_MAP_L2_PROMOTION_L2_256B),CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+}
+
+template<int BN,int S,int ST,int SW,int RED,int PIPE,int WP=256,int XP=256>
+int rt2_launch_t(int64_t w,int64_t x,int64_t out,int m,int64_t stream,int query) {
+  constexpr int NR=SW?64:BN, TM=SW?BN:64;
+  constexpr int bytes=ST*(2*NR+TM)*128+ST*8*((PIPE&2)?2:1)+48+(RED>=1?64*BN*4:0);
+  auto fn=rt2_kernel<BN,S,ST,SW,RED,PIPE>;
+  static bool configured=false;
+  if(!configured) {
+    cudaError_t e=cudaFuncSetAttribute(fn,cudaFuncAttributeMaxDynamicSharedMemorySize,bytes);
+    if(e!=cudaSuccess) return -(int)e;
+    e=cudaFuncSetAttribute(fn,cudaFuncAttributeNonPortableClusterSizeAllowed,1);
+    if(e!=cudaSuccess)return -(int)e;
+    configured=true;
+  }
+  if(query==2){cudaFuncAttributes fa;cudaFuncGetAttributes(&fa,fn);return fa.numRegs*1000+fa.localSizeBytes;}
+  cudaLaunchConfig_t cfg={};
+  cfg.gridDim=dim3(256/NR*S,(m+TM-1)/TM,1);cfg.blockDim=dim3((PIPE&2)?256:128);cfg.dynamicSmemBytes=bytes;cfg.stream=(cudaStream_t)stream;
+  cudaLaunchAttribute attr[1];attr[0].id=cudaLaunchAttributeClusterDimension;attr[0].val.clusterDim={S,1,1};
+  if(S>1){cfg.attrs=attr;cfg.numAttrs=1;}
+  if(query==1){int n=0;cudaError_t e=cudaOccupancyMaxActiveClusters(&n,fn,&cfg);return e==cudaSuccess?n:-(int)e;}
+  CUtensorMap tw,tx;
+  int e=rt2_map_host(&tw,w,64,256*128*2,NR*2,WP);if(e)return e;
+  e=rt2_map_host(&tx,x,8192,m,TM,XP);if(e)return e;
+  cudaError_t err=cudaLaunchKernelEx(&cfg,fn,tw,tx,(float*)out,m);
+  return err==cudaSuccess?0:(int)err;
+}
+int rt2_launch(int id,int64_t w,int64_t x,int64_t out,int m,int64_t stream,int query) {
+ switch(id){@@CASES@@ default:return -99;}
+}
+@@SCALAR@@
+'''
+
+rt2_ROUTER_CPP = '''#include <pybind11/pybind11.h>
+#include <stdint.h>
+int rt2_launch(int,int64_t,int64_t,int64_t,int,int64_t,int);
+int rt2_scalar(int64_t,int64_t,int64_t,int,int64_t,int);
+int rt2_small(int64_t,int64_t,int64_t,int,int,int,int64_t,int);
+'''
+
+def rt2_build_router(configs):
+    src = rt2_ROUTER_CUDA.replace('@@MMA@@', '\n'.join(rt2_mma(n) for n in sorted({c[0] for c in configs})))
+    for tag, a, b in [('H', 'dh', 'dx'), ('L', 'dl', 'dx'), ('NH', 'dx', 'dh'), ('NL', 'dx', 'dl')]:
+        src = src.replace('@@CALL_' + tag + '@@', ' '.join(f'if constexpr(BN=={n}) rt2_mma_{n}(acc,{a},{b});' for n in sorted({c[0] for c in configs})))
+    cases = '\n'.join(f'case {i}: return rt2_launch_t<{",".join(map(str,c))}>(w,x,out,m,stream,query);' for i,c in enumerate(configs))
+    src = src.replace('@@CASES@@',cases).replace('@@SCALAR@@', rt2_ROUTER_SCALAR + rt2_ROUTER_SMALL)
+    name = 'router2_' + hashlib.sha256(src.encode()).hexdigest()[:12]
+    return load_inline(name, rt2_ROUTER_CPP, cuda_sources=src, functions=['rt2_launch','rt2_scalar','rt2_small'],
+                       extra_cuda_cflags=['-O3','-std=c++20','-gencode=arch=compute_90a,code=sm_90a','--ptxas-options=-v'],
+                       no_implicit_headers=True, with_pytorch_error_handling=False,verbose=False)
+
+def rt2_pack_router(w, nr):
+    hi = w.to(torch.bfloat16)
+    lo = (w-hi.float()).to(torch.bfloat16)
+    return torch.stack([p.view(256//nr,nr,128,64).permute(0,2,1,3) for p in (hi,lo)],dim=2).contiguous().view(-1,64)
+
+def rt2_prepare_candidates(weights, configs):
+    w = weights['router'].contiguous()
+    return {'ext':rt2_build_router(configs), 'configs':configs,'weight':w,
+            'packed':{nr:rt2_pack_router(w,nr) for nr in {64 if c[3] else c[0] for c in configs}}}
+
+def rt2_run_candidate(x, st, index):
+    out = torch.empty((x.shape[0],256),dtype=torch.float32,device=x.device)
+    stream = torch.cuda.current_stream().cuda_stream
+    if index == -1:
+        rc = st['ext'].rt2_scalar(st['weight'].data_ptr(),x.data_ptr(),out.data_ptr(),x.shape[0],stream,0)
+    else:
+        cfg = st['configs'][index]
+        w = st['packed'][64 if cfg[3] else cfg[0]]
+        rc = st['ext'].rt2_launch(index,w.data_ptr(),x.data_ptr(),out.data_ptr(),x.shape[0],stream,0)
+    if rc:
+        raise RuntimeError(f'router launch failed: config={index}, rc={rc}')
+    return out
+
+# Configuration: WGMMA N, K splits, stages, swap, reduction, pipeline, W/x L2 promotion.
+# Reduction 0 pulls, 1 pushes with a final barrier, 2 relies on destination byte completion.
+# Pipeline bits: 1 keeps one MMA group in flight, 2 adds a producer, 4 initializes reduction first.
+rt2_ROUTER_CONFIGS = [(32,16,4,1,2,1,256,256), (32,8,4,0,2,1,256,256),
+                      (64,8,6,1,2,1,64,64), (64,4,8,1,2,3,256,256)]
+
+def prepare_router2(weights) -> dict:
+    w = weights.get('router')
+    if w is None or w.shape != (256,8192) or w.dtype != torch.float32 or not w.is_cuda:
+        return {'enabled':False}
+    if torch.cuda.get_device_capability(w.device) != (9,0):
+        return {'enabled':False}
+    st = rt2_prepare_candidates(weights, rt2_ROUTER_CONFIGS)
+    st['small'] = {(16,8):rt2_pack_small_router(w,16,8)}
+    st['enabled'] = True
+    for m in (1,8,16,32,64,128,256):
+        x = torch.zeros((m,8192),dtype=torch.bfloat16,device=w.device)
+        run_router2(x,'router',256,st)
+    torch.cuda.synchronize(w.device)
+    return st
+
+def run_router2(x, layer, n, st) -> torch.Tensor | None:
+    if not st.get('enabled') or layer != 'router' or n != 256:
+        return None
+    if x.ndim != 2 or x.shape[1] != 8192 or x.dtype != torch.bfloat16 or not x.is_cuda or not x.is_contiguous():
+        return None
+    if x.device != st['weight'].device or x.data_ptr() % 16:
+        return None
+    m = x.shape[0]
+    if not 1 <= m <= 256:
+        return None
+    if m == 1:
+        return rt2_run_candidate(x,st,-1)
+    if m <= 16:
+        return rt2_run_small_candidate(x,st)
+    return rt2_run_candidate(x,st,0 if m <= 32 else 1 if m <= 64 else 2 if m <= 128 else 3)
+
+rt2_ROUTER_SCALAR = r'''
+template<int M, int NT, int ST>
+__global__ void rt2_scalar_kernel(const float* __restrict__ w, const __nv_bfloat16* __restrict__ x,
+                                float* __restrict__ y, int m) {
+  constexpr int K=8192;
+  int tid=threadIdx.x, row=blockIdx.x, lane=tid&31, warp=tid>>5;
+  float acc[M][4]={};
+  float4 ww[ST];
+  uint2 xx[ST][M];
+  auto ld=[&](int slot,int i) {
+    ww[slot]=reinterpret_cast<const float4*>(w+row*K)[i];
+    #pragma unroll
+    for(int t=0;t<M;t++) {
+      if(t<m) xx[slot][t]=reinterpret_cast<const uint2*>(x+t*K)[i];
+    }
+  };
+  #pragma unroll
+  for(int s=0;s<ST;s++) ld(s,tid+s*NT);
+  #pragma unroll 1
+  for(int base=tid;base<K/4;base+=ST*NT) {
+    #pragma unroll
+    for(int s=0;s<ST;s++) {
+      float4 v=ww[s];
+      uint2 a[M];
+      #pragma unroll
+      for(int t=0;t<M;t++) a[t]=xx[s][t];
+      if(base+(s+ST)*NT<K/4) ld(s,base+(s+ST)*NT);
+      #pragma unroll
+      for(int t=0;t<M;t++) if(t<m) {
+        __nv_bfloat162 z0=*reinterpret_cast<__nv_bfloat162*>(&a[t].x);
+        __nv_bfloat162 z1=*reinterpret_cast<__nv_bfloat162*>(&a[t].y);
+        float2 f0=__bfloat1622float2(z0),f1=__bfloat1622float2(z1);
+        acc[t][0]=fmaf(v.x,f0.x,acc[t][0]);
+        acc[t][1]=fmaf(v.y,f0.y,acc[t][1]);
+        acc[t][2]=fmaf(v.z,f1.x,acc[t][2]);
+        acc[t][3]=fmaf(v.w,f1.y,acc[t][3]);
+      }
+    }
+  }
+  __shared__ float sums[M][NT/32];
+  #pragma unroll
+  for(int t=0;t<M;t++) if(t<m) {
+    float v=(acc[t][0]+acc[t][1])+(acc[t][2]+acc[t][3]);
+    #pragma unroll
+    for(int d=16;d;d>>=1) v+=__shfl_down_sync(0xffffffff,v,d);
+    if(lane==0) sums[t][warp]=v;
+  }
+  __syncthreads();
+  if(warp==0) {
+    #pragma unroll
+    for(int t=0;t<M;t++) if(t<m) {
+      float v=lane<NT/32?sums[t][lane]:0.f;
+      #pragma unroll
+      for(int d=16;d;d>>=1) v+=__shfl_down_sync(0xffffffff,v,d);
+      if(lane==0) y[t*256+row]=v;
+    }
+  }
+}
+
+int rt2_scalar(int64_t w,int64_t x,int64_t out,int m,int64_t stream,int query) {
+  auto kern=rt2_scalar_kernel<1,512,2>;
+  if(query==2) {
+    cudaFuncAttributes fa;
+    if(cudaFuncGetAttributes(&fa,kern)!=cudaSuccess) return -10;
+    return fa.numRegs*1000+(int)std::min<size_t>(fa.localSizeBytes,999);
+  }
+  if(m!=1) return -5;
+  kern<<<256,512,0,(cudaStream_t)stream>>>((const float*)w,(const __nv_bfloat16*)x,(float*)out,m);
+  return cudaGetLastError()==cudaSuccess?0:-8;
+}
+'''
+
+rt2_ROUTER_SMALL = r'''
+template<int MT,int S,int WK>
+__global__ __launch_bounds__(WK*32) void rt2_small_kernel(const int4* wp,const __nv_bfloat16* x,float* out,int m) {
+  constexpr int KU=128/S/WK, NI=MT*32;
+  const int tid=threadIdx.x,lane=tid&31,warp=tid>>5,rank=blockIdx.x%S,row=blockIdx.x/S*16;
+  const int gw=(rank*16+row/16)*WK+warp;
+  extern __shared__ __align__(16) unsigned char sm[];
+  float4* recv=(float4*)sm;
+  float4* part=recv+S*NI;
+  const uint32_t rb=rt2_smem(sm+(S+WK)*NI*16);
+  int4 w[KU][8];uint4 xx[KU][MT][2];
+#pragma unroll
+  for(int k=0;k<KU;k++) {
+#pragma unroll
+    for(int j=0;j<8;j++) {
+      const int4* p=wp+((k*(16*S*WK)+gw)*8+j)*32+lane;
+      asm volatile("ld.global.nc.L1::no_allocate.v4.s32 {%0,%1,%2,%3}, [%4];":"=r"(w[k][j].x),"=r"(w[k][j].y),"=r"(w[k][j].z),"=r"(w[k][j].w):"l"(p));
+    }
+#pragma unroll
+    for(int n=0;n<MT;n++) {
+      const __nv_bfloat16* p=x+min(n*8+(lane>>2),m-1)*8192+((rank*WK+warp)*KU+k)*64+(lane&3)*16;
+#pragma unroll
+      for(int h=0;h<2;h++) asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];":"=r"(xx[k][n][h].x),"=r"(xx[k][n][h].y),"=r"(xx[k][n][h].z),"=r"(xx[k][n][h].w):"l"(p+h*8));
+    }
+  }
+  if(rank==0 && tid==0) {rt2_init(rb,1);asm volatile("fence.proxy.async.shared::cta;" :::"memory");}
+  if(rank==0 && warp==0) __syncwarp();
+  if(rank==0 && tid==0) {rt2_expect(rb,(S-1)*NI*16);asm volatile("fence.mbarrier_init.release.cluster;" :::"memory");}
+  asm volatile("barrier.cluster.arrive.relaxed.aligned;" :::"memory");
+  float c[2][MT][4]={};
+#pragma unroll
+  for(int k=0;k<KU;k++) {
+#pragma unroll
+    for(int n=0;n<MT;n++) {
+      uint32_t b[8]={xx[k][n][0].x,xx[k][n][0].y,xx[k][n][0].z,xx[k][n][0].w,xx[k][n][1].x,xx[k][n][1].y,xx[k][n][1].z,xx[k][n][1].w};
+#pragma unroll
+      for(int q=0;q<4;q++) {
+#pragma unroll
+        for(int h=0;h<2;h++) {
+          const int4 a=w[k][q+h*4];
+          asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                       :"+f"(c[h][n][0]),"+f"(c[h][n][1]),"+f"(c[h][n][2]),"+f"(c[h][n][3]):"r"(a.x),"r"(a.y),"r"(a.z),"r"(a.w),"r"(b[2*q]),"r"(b[2*q+1]));
+        }
+      }
+    }
+  }
+#pragma unroll
+  for(int n=0;n<MT;n++) part[warp*NI+n*32+lane]=make_float4(c[0][n][0]+c[1][n][0],c[0][n][1]+c[1][n][1],c[0][n][2]+c[1][n][2],c[0][n][3]+c[1][n][3]);
+  __syncthreads();
+  asm volatile("barrier.cluster.wait.acquire.aligned;" :::"memory");
+  for(int v=tid;v<NI;v+=WK*32) {
+    float4 sum=make_float4(0,0,0,0);
+#pragma unroll
+    for(int k=0;k<WK;k++) rt2_add(sum,part[k*NI+v]);
+    if(rank==0)recv[v]=sum;
+    else rt2_push(rt2_map(rt2_smem(recv+rank*NI+v),0),sum,rt2_map(rb,0));
+  }
+  if(rank==0) {
+    __syncthreads();rt2_wait(rb,0);
+    for(int v=tid;v<NI;v+=WK*32) {
+      float4 sum=make_float4(0,0,0,0);
+#pragma unroll
+      for(int s=0;s<S;s++) rt2_add(sum,recv[s*NI+v]);
+      const int ln=v%32,tok=(v/32)*8+(ln&3)*2,wr=row+(ln>>2);
+      if(tok<m){out[tok*256+wr]=sum.x;out[tok*256+wr+8]=sum.z;}
+      if(tok+1<m){out[(tok+1)*256+wr]=sum.y;out[(tok+1)*256+wr+8]=sum.w;}
+    }
+  }
+}
+
+template<int MT,int S,int WK>
+int rt2_small_t(int64_t w,int64_t x,int64_t out,int m,int64_t stream,int query) {
+  auto fn=rt2_small_kernel<MT,S,WK>;
+  constexpr int bytes=(S+WK)*MT*512+16;
+  static bool configured=false;
+  if(!configured){cudaFuncSetAttribute(fn,cudaFuncAttributeMaxDynamicSharedMemorySize,bytes);cudaFuncSetAttribute(fn,cudaFuncAttributeNonPortableClusterSizeAllowed,1);configured=true;}
+  if(query==2){cudaFuncAttributes fa;cudaFuncGetAttributes(&fa,fn);return fa.numRegs*1000+fa.localSizeBytes;}
+  cudaLaunchConfig_t cfg={};cfg.gridDim=dim3(16*S);cfg.blockDim=dim3(WK*32);cfg.dynamicSmemBytes=bytes;cfg.stream=(cudaStream_t)stream;
+  cudaLaunchAttribute at;at.id=cudaLaunchAttributeClusterDimension;at.val.clusterDim={S,1,1};cfg.attrs=&at;cfg.numAttrs=1;
+  return (int)cudaLaunchKernelEx(&cfg,fn,(const int4*)w,(const __nv_bfloat16*)x,(float*)out,m);
+}
+int rt2_small(int64_t w,int64_t x,int64_t out,int m,int s,int wk,int64_t stream,int query) {
+#define rt2_RSM(S,W) if(s==S && wk==W) {if(m<=8)return rt2_small_t<1,S,W>(w,x,out,m,stream,query);if(m<=16)return rt2_small_t<2,S,W>(w,x,out,m,stream,query);if(m<=32)return rt2_small_t<4,S,W>(w,x,out,m,stream,query);}
+rt2_RSM(8,8) rt2_RSM(16,8) rt2_RSM(16,4)
+return -99;
+}
+
+'''
+
+def rt2_pack_small_router(w, s=16, wk=8):
+    hi=w.to(torch.bfloat16);lo=(w-hi.float()).to(torch.bfloat16)
+    def units(v):
+        v=v.view(16,2,8,128,4,4,2,2).permute(0,3,2,4,5,6,1,7).reshape(16,128,32,4,8)
+        return v.permute(0,1,3,2,4)
+    data=torch.cat([units(hi),units(lo)],dim=2).contiguous()
+    ku=128//s//wk
+    return data.view(16,s,wk,ku,8,32,8).permute(3,1,0,2,4,5,6).contiguous()
+
+def rt2_run_small_candidate(x,st,s=16,wk=8):
+    out=torch.empty((x.shape[0],256),dtype=torch.float32,device=x.device)
+    rc=st['ext'].rt2_small(st['small'][s,wk].data_ptr(),x.data_ptr(),out.data_ptr(),x.shape[0],s,wk,torch.cuda.current_stream().cuda_stream,0)
+    if rc:raise RuntimeError(f'router small launch failed: {rc}')
+    return out
+
+
 def _fallback(x, layer, n, state):
     if layer != "router":
         return _bf16_gemm_dispatch_impl(x, state[layer][:n], None)
@@ -1945,6 +2890,8 @@ def prepare(weights: Weights) -> dict:
     state["router_weight"] = weights["router"]
     state["sm"] = prepare_small_m(weights)
     state["m32"] = prepare_m32(weights)
+    state["router_k"] = prepare_router(weights)
+    state["router2"] = prepare_router2(weights)
     torch.cuda.synchronize(weights["qkv_gate"].device)
     return state
 
@@ -1952,13 +2899,18 @@ def kernel_fn(data: Inputs, state: dict) -> torch.Tensor:
     x, layer, n = data["x"], data["config"]["layer"], data["config"]["n"]
     m = x.shape[0]
     out = None
-    if 9 <= m <= 32:
-        out = run_m32(x, layer, n, state["m32"])
-    if out is None and m <= 32:
-        out = run_small_m(x, layer, n, state["sm"])
+    if layer == "router":
+        if 65 <= m <= 192:
+            out = run_router2(x, layer, n, state["router2"])
+        if out is None:
+            out = run_router(x, layer, n, state["router_k"])
+        if out is None and m <= 32:
+            out = run_small_m(x, layer, n, state["sm"])
+    else:
+        if 9 <= m <= 32:
+            out = run_m32(x, layer, n, state["m32"])
+        if out is None and m <= 32:
+            out = run_small_m(x, layer, n, state["sm"])
     return _fallback(x, layer, n, state) if out is None else out
 
-SELECTED_ROUTES = (
-    [{"m": m, "layer": layer, "name": "small_m", "module": "sm"} for (layer, m) in sorted(SM_TABLE_M)]
-    + [{"m": m, "layer": layer, "name": "m32", "module": "m32"} for (layer, m) in sorted(M32_TABLE_M)]
-)
+SELECTED_ROUTES = [{"m": m, "layer": "router", "name": "router", "module": "router"} for m in (1,8,16,32,128,256)]
