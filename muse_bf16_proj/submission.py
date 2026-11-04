@@ -1,35 +1,21 @@
 # okc: problem=muse_bf16_proj
+"""Piece submission extracted from proven mega paste; unclaimed shapes fall back to SGLang."""
 
-from __future__ import annotations
-
-from pathlib import Path
-from typing import Any, TypedDict
+import hashlib
+import zlib
+from typing import TypedDict
 
 import torch
 import torch.nn.functional as F
 from torch.utils.cpp_extension import load_inline
-
-ROUTER_FP32_MAX_TOKENS = 8
-
-_MM_BF16 = frozenset({
-    ("pooler", 8), ("pooler", 16), ("pooler", 32), ("pooler", 128), ("pooler", 256),
-    ("unpooler", 16), ("unpooler", 32), ("unpooler", 128), ("unpooler", 256),
-    ("qkv_gate", 16), ("qkv_gate", 32), ("qkv_gate", 128), ("qkv_gate", 256),
-    ("o", 128), ("o", 256),
-})
-
-# Same gates as sglang.kernels.ops.gemm.hopper_bf16_gemv
-_MAX_K = 17408
-_MAX_N = 65536
-
+from sglang.srt.layers.quantization.unquant import _bf16_gemm_dispatch_impl
 
 class Weights(TypedDict):
     qkv_gate: torch.Tensor  # bfloat16 [2304, 8192]
     o: torch.Tensor         # bfloat16 [8192, 1024]
     pooler: torch.Tensor    # bfloat16 [4096, 8192]
-    unpooler: torch.Tensor  # bfloat16 [8192, 4096]; up to 8 tokens, only rows 0-1023
+    unpooler: torch.Tensor  # bfloat16 [8192, 4096]
     router: torch.Tensor    # float32 [256, 8192]
-
 
 class Config(TypedDict):
     m: int
@@ -37,747 +23,989 @@ class Config(TypedDict):
     k: int
     layer: str
 
-
 class Inputs(TypedDict):
-    x: torch.Tensor  # bfloat16 [M, K]
+    x: torch.Tensor
     config: Config
 
+# ---- router/router_kernels.py ----
 
-# Original hopper_bf16_gemv.cuh body, torch host launch, Muse (N,K) instantiations.
-# sgl_kernel / tvm deps replaced with equivalent CUDA + ATen helpers (algorithm unchanged).
-_CUDA_SRC = r"""
-#include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <cublasLt.h>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
+def _mma(n):
+    regs = ', '.join(f'%{i}' for i in range(n // 2))
+    outs = ', '.join(f'"+f"(d[{i}])' for i in range(n // 2))
+    return f'''__device__ __forceinline__ void rr_mma_{n}(float* d, uint64_t a, uint64_t b) {{
+    asm volatile("wgmma.mma_async.sync.aligned.m64n{n}k16.f32.bf16.bf16 {{{regs}}}, %{n//2}, %{n//2+1}, 1, 1, 1, 0, 0;" : {outs} : "l"(a), "l"(b));
+}}'''
+
+ROUTER_CUDA = r'''
+#include <cuda.h>
 #include <cuda_runtime.h>
-
-#include <cstdint>
-#include <unordered_map>
-#include <utility>
-
-using bf16_t = __nv_bfloat16;
-using bf16x2_t = __nv_bfloat162;
-using fp32_t = float;
-using fp32x2_t = float2;
-
-template <typename To, typename From>
-__device__ __forceinline__ To cast(From v);
-
-template <>
-__device__ __forceinline__ fp32x2_t cast<fp32x2_t, bf16x2_t>(bf16x2_t v) {
-  return __bfloat1622float2(v);
+#include <cuda_bf16.h>
+#include <stdint.h>
+#include <algorithm>
+#define RD __device__ __forceinline__
+RD uint32_t rr_smem(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
+RD void rr_init(uint32_t b, int n) { asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(b),"r"(n):"memory"); }
+RD void rr_expect(uint32_t b, int n) { asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(b),"r"(n):"memory"); }
+RD void rr_wait(uint32_t b, int ph) {
+  asm volatile("{ .reg .pred p; wait: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%0], %1; @!p bra wait; }" ::"r"(b),"r"(ph):"memory");
 }
-
-template <>
-__device__ __forceinline__ bf16_t cast<bf16_t, fp32_t>(fp32_t v) {
-  return __float2bfloat16_rn(v);
+RD void rr_sync() { asm volatile("barrier.cluster.arrive.release.aligned; barrier.cluster.wait.acquire.aligned;" :::"memory"); }
+RD uint32_t rr_map(uint32_t a, int r) { uint32_t b; asm("mapa.shared::cluster.u32 %0, %1, %2;":"=r"(b):"r"(a),"r"(r));return b; }
+RD void rr_push(uint32_t d, float4 v, uint32_t b) {
+  asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.f32 [%0], {%1,%2,%3,%4}, [%5];" ::"r"(d),"f"(v.x),"f"(v.y),"f"(v.z),"f"(v.w),"r"(b):"memory");
 }
-
-template <bool kUsePDL>
-__device__ __forceinline__ void PDLWaitPrimary() {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-  if constexpr (kUsePDL) {
-    asm volatile("griddepcontrol.wait;" ::: "memory");
-  }
-#endif
+RD float4 rr_pull(uint32_t d) {
+  float4 v; asm volatile("ld.shared::cluster.v4.f32 {%0,%1,%2,%3}, [%4];":"=f"(v.x),"=f"(v.y),"=f"(v.z),"=f"(v.w):"r"(d):"memory");return v;
 }
-
-template <bool kUsePDL>
-__device__ __forceinline__ void PDLTriggerSecondary() {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-  if constexpr (kUsePDL) {
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-  }
-#endif
+RD void rr_add(float4& a,float4 b) { a.x+=b.x;a.y+=b.y;a.z+=b.z;a.w+=b.w; }
+RD uint64_t rr_desc(uint32_t a) { return (uint64_t)((a&0x3ffff)>>4)|((uint64_t)64<<32)|((uint64_t)1<<62); }
+RD void rr_tma(uint32_t dst, const void* tm, int k,int r,uint32_t bar) {
+  asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2,%3}], [%4];" ::"r"(dst),"l"(tm),"r"(k),"r"(r),"r"(bar):"memory");
 }
+@@MMA@@
 
-// ---- from sglang hopper_bf16_gemv.cuh ----
-constexpr uint32_t kGemvVecSize = 16 / sizeof(bf16_t);  // 8 bf16 per 16B load
-
-// .cg: L2 resident, L1 bypass. __ldcs is evict-first and drops W before the next graph replay.
-__device__ __forceinline__ float4 ldg16_cg(const void* p) {
-  float4 r;
-  asm volatile("ld.global.cg.v4.f32 {%0, %1, %2, %3}, [%4];\n"
-               : "=f"(r.x), "=f"(r.y), "=f"(r.z), "=f"(r.w)
-               : "l"(p));
-  return r;
-}
-
-__device__ __forceinline__ float4 lds16(const void* p) {
-  float4 r;
-  unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(p));
-  asm volatile("ld.shared.v4.f32 {%0, %1, %2, %3}, [%4];\n"
-               : "=f"(r.x), "=f"(r.y), "=f"(r.z), "=f"(r.w)
-               : "r"(addr));
-  return r;
-}
-
-__device__ __forceinline__ void sts16(void* p, float4 v) {
-  unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(p));
-  asm volatile("st.shared.v4.f32 [%0], {%1, %2, %3, %4};\n" ::"r"(addr), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w));
-}
-
-__device__ __forceinline__ float2 cvt_bf16x2(unsigned v) {
-  float a, b;
-  asm volatile("{\n\t.reg .b16 lo, hi;\n\tmov.b32 {lo, hi}, %2;\n\t"
-               "cvt.rn.f32.bf16 %0, lo;\n\tcvt.rn.f32.bf16 %1, hi;\n\t}\n"
-               : "=f"(a), "=f"(b)
-               : "r"(v));
-  return float2{a, b};
-}
-
-__device__ __forceinline__ float fma_rn(float a, float b, float c) {
-  float d;
-  asm volatile("fma.rn.f32 %0, %1, %2, %3;\n" : "=f"(d) : "f"(a), "f"(b), "f"(c));
-  return d;
-}
-
-__device__ __forceinline__ float dot8_f32(float4 wv, float4 xv) {
-  unsigned w[4] = {__float_as_uint(wv.x), __float_as_uint(wv.y), __float_as_uint(wv.z), __float_as_uint(wv.w)};
-  unsigned x[4] = {__float_as_uint(xv.x), __float_as_uint(xv.y), __float_as_uint(xv.z), __float_as_uint(xv.w)};
-  float acc = 0.f;
+template<int BN,int S,int ST,int SW,int RED,int PIPE>
+__global__ __launch_bounds__((PIPE&2)?256:128) void rr_kernel(const __grid_constant__ CUtensorMap tw,
+                                               const __grid_constant__ CUtensorMap tx, float* out, int m) {
+  constexpr int NR=SW?64:BN, TM=SW?BN:64;
+  constexpr int WB=NR*128, XB=TM*128, SB=WB*2+XB;
+  constexpr int NF=64*BN, NV=NF/4, OWN=NV/S;
+  extern __shared__ __align__(1024) unsigned char sm[];
+  const int tid=threadIdx.x, lane=tid&31, warp=tid>>5, rank=blockIdx.x%S;
+  const int row=blockIdx.x/S*NR, tok=blockIdx.y*TM;
+  const uint32_t base=rr_smem(sm), bars=base+ST*SB, empty=bars+ST*8, rb=(empty+((PIPE&2)?ST*8:0)+15)&~15u;
+  const uint32_t recv=rb+16;
+  const int kb=rank*(128/S);
+  auto load=[&](int i) {
+    const int st=i%ST;
+    const uint32_t b=bars+st*8, d=base+st*SB;
+    rr_expect(b,SB);
+    rr_tma(d,&tw,0,((row/NR)*128+kb+i)*NR*2,b);
+    rr_tma(d+2*WB,&tx,(kb+i)*64,tok,b);
+  };
+  if(tid==((PIPE&2)?128:0)) {
 #pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    float2 wf = cvt_bf16x2(w[i]);
-    float2 xf = cvt_bf16x2(x[i]);
-    acc = fma_rn(wf.x, xf.x, acc);
-    acc = fma_rn(wf.y, xf.y, acc);
-  }
-  return acc;
-}
-
-template <uint32_t N, uint32_t K, uint32_t kRows, uint32_t kUnroll, uint32_t kNumWarps, bool kUsePDL>
-__global__ void __launch_bounds__(kNumWarps * 32)
-    hopper_bf16_gemv_kernel(bf16_t* __restrict__ out, const bf16_t* __restrict__ x, const bf16_t* __restrict__ w) {
-  __shared__ __align__(16) bf16_t sx[K];
-
-  PDLTriggerSecondary<kUsePDL>();
-  const uint32_t tid = threadIdx.x;
-  PDLWaitPrimary<kUsePDL>();
-  for (uint32_t i = tid * kGemvVecSize; i < K; i += kNumWarps * 32 * kGemvVecSize) {
-    sts16(sx + i, ldg16_cg(x + i));
+    for(int i=0;i<ST;i++) { rr_init(bars+i*8,1); if constexpr(PIPE&2) rr_init(empty+i*8,4); }
+    asm volatile("fence.proxy.async.shared::cta;" :::"memory");
+    if constexpr(PIPE&4) {
+    if constexpr(RED>=1) {
+      rr_init(rb,1);asm volatile("fence.proxy.async.shared::cta;" :::"memory");rr_expect(rb,(S-1)*OWN*16);
+      asm volatile("fence.mbarrier_init.release.cluster;" :::"memory");
+    }
+    }
+#pragma unroll
+    for(int i=0;i<ST && i<128/S;i++) load(i);
+    if constexpr(!(PIPE&4)) {
+    if constexpr(RED>=1) {
+      rr_init(rb,1);asm volatile("fence.proxy.async.shared::cta;" :::"memory");rr_expect(rb,(S-1)*OWN*16);
+      asm volatile("fence.mbarrier_init.release.cluster;" :::"memory");
+    }
+    }
   }
   __syncthreads();
-
-  const uint32_t warp = tid / 32;
-  const uint32_t lane = tid % 32;
-  const uint32_t r0 = (blockIdx.x * kNumWarps + warp) * kRows;
-  if (r0 >= N) {
-    return;
-  }
-
-  float acc[kRows];
-#pragma unroll
-  for (uint32_t r = 0; r < kRows; ++r) {
-    acc[r] = 0.0f;
-  }
-
-  constexpr uint32_t kStep = 32 * kGemvVecSize * kUnroll;
-  if (r0 + kRows <= N) {
-    for (uint32_t k = lane * kGemvVecSize * kUnroll; k < K; k += kStep) {
-      float4 xv[kUnroll];
-#pragma unroll
-      for (uint32_t u = 0; u < kUnroll; ++u) xv[u] = lds16(sx + k + u * kGemvVecSize);
-#pragma unroll
-      for (uint32_t r = 0; r < kRows; ++r) {
-        const bf16_t* wr = w + static_cast<size_t>(r0 + r) * K + k;
-#pragma unroll
-        for (uint32_t u = 0; u < kUnroll; ++u) {
-          acc[r] += dot8_f32(ldg16_cg(wr + u * kGemvVecSize), xv[u]);
+  if constexpr(RED>=1) asm volatile("barrier.cluster.arrive.relaxed.aligned;" :::"memory");
+  if constexpr(PIPE&2) {
+    if(tid>=128) {
+      if(tid==128) {
+        for(int i=ST;i<128/S;i++) {
+          rr_wait(empty+(i%ST)*8,((i/ST)-1)&1);
+          load(i);
         }
       }
-    }
-  } else {
-    for (uint32_t k = lane * kGemvVecSize * kUnroll; k < K; k += kStep) {
-#pragma unroll
-      for (uint32_t r = 0; r < kRows; ++r) {
-        if (r0 + r < N) {
-          const bf16_t* wr = w + static_cast<size_t>(r0 + r) * K + k;
-#pragma unroll
-          for (uint32_t u = 0; u < kUnroll; ++u) {
-            acc[r] += dot8_f32(ldg16_cg(wr + u * kGemvVecSize), lds16(sx + k + u * kGemvVecSize));
-          }
-        }
-      }
+      if constexpr(RED>=1) asm volatile("barrier.cluster.wait.acquire.aligned;" :::"memory");
+      if constexpr(RED!=2) rr_sync();
+      return;
     }
   }
-
+  float acc[BN/2];
 #pragma unroll
-  for (uint32_t r = 0; r < kRows; ++r) {
-#pragma unroll
-    for (uint32_t off = 16; off > 0; off >>= 1) {
-      acc[r] += __shfl_down_sync(0xffffffff, acc[r], off);
-    }
-  }
-  if (lane == 0) {
-#pragma unroll
-    for (uint32_t r = 0; r < kRows; ++r) {
-      if (r0 + r < N) {
-        out[r0 + r] = cast<bf16_t>(acc[r]);
-      }
-    }
-  }
-}
-
-template <uint32_t N, uint32_t K, uint32_t kRows, uint32_t kUnroll, uint32_t kNumWarps, bool kUsePDL>
-void launch_gemv(bf16_t* out, const bf16_t* x, const bf16_t* w, cudaStream_t stream) {
-  constexpr uint32_t kRowsPerBlock = kRows * kNumWarps;
-  constexpr uint32_t kNumBlocks = (N + kRowsPerBlock - 1) / kRowsPerBlock;
-  constexpr uint32_t kThreads = kNumWarps * 32;
-  if constexpr (kUsePDL) {
-    cudaLaunchConfig_t cfg{};
-    cfg.gridDim = dim3(kNumBlocks);
-    cfg.blockDim = dim3(kThreads);
-    cfg.stream = stream;
-    cfg.dynamicSmemBytes = 0;
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = 1;
-    cfg.attrs = attrs;
-    cfg.numAttrs = 1;
-    cudaLaunchKernelEx(
-        &cfg,
-        hopper_bf16_gemv_kernel<N, K, kRows, kUnroll, kNumWarps, kUsePDL>,
-        out, x, w);
-  } else {
-    hopper_bf16_gemv_kernel<N, K, kRows, kUnroll, kNumWarps, kUsePDL>
-        <<<kNumBlocks, kThreads, 0, stream>>>(out, x, w);
-  }
-}
-
-void hopper_bf16_gemv(torch::Tensor x, torch::Tensor w, torch::Tensor out, bool use_pdl) {
-  TORCH_CHECK(x.is_cuda() && w.is_cuda() && out.is_cuda());
-  TORCH_CHECK(x.scalar_type() == at::kBFloat16);
-  TORCH_CHECK(x.size(0) == 1);
-  const int N = w.size(0);
-  const int K = w.size(1);
-  TORCH_CHECK(out.size(0) == 1 && out.size(1) == N && w.size(1) == x.size(1));
-
-  auto* xp = reinterpret_cast<const bf16_t*>(x.data_ptr());
-  auto* wp = reinterpret_cast<const bf16_t*>(w.data_ptr());
-  auto* op = reinterpret_cast<bf16_t*>(out.data_ptr());
-  auto stream = at::cuda::getCurrentCUDAStream();
-
-  // Muse scored m=1 shapes + SGLang _config(n): rows,unroll,warps
-  // n>=8192 -> (2,2,8); else (1,2,8)
-#define DISPATCH(NN, KK, ROWS, UNROLL, WARPS)                                 \
-  do {                                                                        \
-    if (use_pdl)                                                              \
-      launch_gemv<NN, KK, ROWS, UNROLL, WARPS, true>(op, xp, wp, stream);     \
-    else                                                                      \
-      launch_gemv<NN, KK, ROWS, UNROLL, WARPS, false>(op, xp, wp, stream);    \
-    return;                                                                   \
-  } while (0)
-
-  if (N == 2304 && K == 8192) DISPATCH(2304, 8192, 1, 2, 8);  // l-m8-gate: unroll 2 (unroll 4 was 0.91x)
-  if (N == 8192 && K == 1024) DISPATCH(8192, 1024, 2, 2, 8);
-  if (N == 4096 && K == 8192) DISPATCH(4096, 8192, 1, 2, 8);
-  if (N == 1024 && K == 4096) DISPATCH(1024, 4096, 1, 2, 8);
-  if (N == 8192 && K == 4096) DISPATCH(8192, 4096, 2, 2, 8);
-
-  TORCH_CHECK(false, "hopper_bf16_gemv: unsupported Muse shape N=", N, " K=", K);
-#undef DISPATCH
-}
-
-static cublasLtHandle_t g_lt = nullptr;
-
-struct NosplitEntry {
-  cublasLtMatmulDesc_t op{};
-  cublasLtMatrixLayout_t Ad{}, Bd{}, Cd{};
-  cublasLtMatmulAlgo_t algo{};
-  size_t ws = 0;
-};
-
-static std::unordered_map<uint64_t, NosplitEntry> g_nosplit;
-
-static uint64_t nosplit_key(int64_t M, int64_t N, int64_t K) {
-  return (static_cast<uint64_t>(M) << 40) | (static_cast<uint64_t>(N) << 16) | static_cast<uint64_t>(K & 0xffff);
-}
-
-static void ensure_lt() {
-  if (!g_lt) {
-    TORCH_CHECK(cublasLtCreate(&g_lt) == CUBLAS_STATUS_SUCCESS);
-  }
-}
-
-static cublasStatus_t make_row_layout(cublasLtMatrixLayout_t* layout, cudaDataType_t dt, int rows, int cols) {
-  auto st = cublasLtMatrixLayoutCreate(layout, dt, rows, cols, cols);
-  if (st != CUBLAS_STATUS_SUCCESS) return st;
-  cublasLtOrder_t ord = CUBLASLT_ORDER_ROW;
-  return cublasLtMatrixLayoutSetAttribute(*layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &ord, sizeof(ord));
-}
-
-// Returns workspace bytes (>=0) on success; -1 if no nosplit algo. Caches descs for graph-safe run.
-int64_t bf16_mm_pick_nosplit(int64_t M, int64_t N, int64_t K) {
-  ensure_lt();
-  const uint64_t key = nosplit_key(M, N, K);
-  if (g_nosplit.count(key)) {
-    return static_cast<int64_t>(g_nosplit[key].ws);
-  }
-
-  NosplitEntry e;
-  TORCH_CHECK(cublasLtMatmulDescCreate(&e.op, CUBLAS_COMPUTE_32F, CUDA_R_32F) == CUBLAS_STATUS_SUCCESS);
-  cublasOperation_t t = CUBLAS_OP_N;
-  cublasLtMatmulDescSetAttribute(e.op, CUBLASLT_MATMUL_DESC_TRANSA, &t, sizeof(t));
-  cublasLtMatmulDescSetAttribute(e.op, CUBLASLT_MATMUL_DESC_TRANSB, &t, sizeof(t));
-  TORCH_CHECK(make_row_layout(&e.Ad, CUDA_R_16BF, (int)M, (int)K) == CUBLAS_STATUS_SUCCESS);
-  TORCH_CHECK(make_row_layout(&e.Bd, CUDA_R_16BF, (int)K, (int)N) == CUBLAS_STATUS_SUCCESS);
-  TORCH_CHECK(make_row_layout(&e.Cd, CUDA_R_16BF, (int)M, (int)N) == CUBLAS_STATUS_SUCCESS);
-
-  cublasLtMatmulPreference_t pref;
-  TORCH_CHECK(cublasLtMatmulPreferenceCreate(&pref) == CUBLAS_STATUS_SUCCESS);
-  size_t ws_cap = 64ull << 20;
-  cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_cap, sizeof(ws_cap));
-
-  cublasLtMatmulHeuristicResult_t heur[64];
-  int nres = 0;
-  auto st = cublasLtMatmulAlgoGetHeuristic(g_lt, e.op, e.Ad, e.Bd, e.Cd, e.Cd, pref, 64, heur, &nres);
-  int64_t out_ws = -1;
-  if (st == CUBLAS_STATUS_SUCCESS) {
-    for (int i = 0; i < nres; ++i) {
-      if (heur[i].state != CUBLAS_STATUS_SUCCESS) continue;
-      int splitk = 0;
-      size_t written = 0;
-      cublasLtMatmulAlgoConfigGetAttribute(
-          &heur[i].algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &splitk, sizeof(splitk), &written);
-      if (splitk <= 1) {
-        e.algo = heur[i].algo;
-        e.ws = heur[i].workspaceSize;
-        out_ws = static_cast<int64_t>(e.ws);
-        g_nosplit.emplace(key, e);
-        break;
-      }
-    }
-  }
-  cublasLtMatmulPreferenceDestroy(pref);
-  if (out_ws < 0) {
-    cublasLtMatrixLayoutDestroy(e.Ad);
-    cublasLtMatrixLayoutDestroy(e.Bd);
-    cublasLtMatrixLayoutDestroy(e.Cd);
-    cublasLtMatmulDescDestroy(e.op);
-  }
-  return out_ws;
-}
-
-void bf16_mm_run_nosplit(torch::Tensor A, torch::Tensor B, torch::Tensor C, torch::Tensor workspace) {
-  TORCH_CHECK(A.is_cuda() && B.is_cuda() && C.is_cuda());
-  TORCH_CHECK(A.scalar_type() == at::kBFloat16 && B.scalar_type() == at::kBFloat16 && C.scalar_type() == at::kBFloat16);
-  TORCH_CHECK(A.dim() == 2 && B.dim() == 2 && C.dim() == 2);
-  const int M = A.size(0), K = A.size(1), N = B.size(1);
-  TORCH_CHECK(B.size(0) == K && C.size(0) == M && C.size(1) == N);
-  ensure_lt();
-  auto it = g_nosplit.find(nosplit_key(M, N, K));
-  TORCH_CHECK(it != g_nosplit.end(), "bf16_mm_run_nosplit: missing prepare pick");
-  const NosplitEntry& e = it->second;
-  float alpha = 1.f, beta = 0.f;
-  void* ws = workspace.defined() && workspace.numel() > 0 ? workspace.data_ptr() : nullptr;
-  size_t ws_bytes = workspace.defined() ? static_cast<size_t>(workspace.numel() * workspace.element_size()) : 0;
-  auto stream = at::cuda::getCurrentCUDAStream();
-  TORCH_CHECK(
-      cublasLtMatmul(
-          g_lt, e.op, &alpha, A.data_ptr(), e.Ad, B.data_ptr(), e.Bd, &beta, C.data_ptr(), e.Cd, C.data_ptr(), e.Cd,
-          &e.algo, ws, ws_bytes, stream) == CUBLAS_STATUS_SUCCESS);
-}
-
-constexpr int kRouterN = 256;
-constexpr int kRouterK = 8192;
-constexpr int kRouterSplits = 8;
-constexpr int kRouterWarps = 4;
-constexpr int kRouterKChunk = kRouterK / kRouterSplits;  // 1024
-
-template <int BM>
-__global__ void __launch_bounds__(kRouterWarps * 32)
-    router_fp32_splitk_kernel(float* __restrict__ partial, const bf16_t* __restrict__ x,
-                              const float* __restrict__ w, int M) {
-  constexpr int kVecIters = (kRouterKChunk / 4) / 32;  // 8
-  static_assert(kRouterKChunk / 8 == kRouterWarps * 32, "one x float4 per thread");
-  extern __shared__ __align__(16) char smem[];
-  float* sw = reinterpret_cast<float*>(smem);
-  bf16_t* sx = reinterpret_cast<bf16_t*>(sw + kRouterWarps * kRouterKChunk);
-
-  const int split = static_cast<int>(blockIdx.y);
-  const int tid = static_cast<int>(threadIdx.x);
-  const int warp = tid >> 5;
-  const int lane = tid & 31;
-  const int row = static_cast<int>(blockIdx.x) * kRouterWarps + warp;
-  const int k0 = split * kRouterKChunk;
-
-  const float4* wrow4 = reinterpret_cast<const float4*>(w + (static_cast<size_t>(row) * kRouterK + k0));
-  float4* srow4 = reinterpret_cast<float4*>(sw + warp * kRouterKChunk);
-  float4 wreg[kVecIters];
-#pragma unroll
-  for (int s = 0; s < kVecIters; ++s) wreg[s] = ldg16_cg(wrow4 + lane + s * 32);
-#pragma unroll
-  for (int s = 0; s < kVecIters; ++s) srow4[lane + s * 32] = wreg[s];
-  __syncthreads();
-
-  for (int m0 = 0; m0 < M; m0 += BM) {
-#pragma unroll
-    for (int t = 0; t < BM; ++t) {
-      const bf16_t* src = x + (static_cast<size_t>(m0 + t) * kRouterK + k0);
-      bf16_t* dst = sx + t * kRouterKChunk;
-      *reinterpret_cast<float4*>(dst + tid * 8) = *reinterpret_cast<const float4*>(src + tid * 8);
-    }
-    __syncthreads();
-
-    float acc[BM];
-#pragma unroll
-    for (int t = 0; t < BM; ++t) acc[t] = 0.f;
-
-    const float* myw = sw + warp * kRouterKChunk;
+  for(int j=0;j<BN/2;j++) asm volatile("mov.b32 %0, 0;":"=f"(acc[j]));
+  int prev=0;
 #pragma unroll 1
-    for (int s = 0; s < kVecIters; ++s) {
-      int v = lane + s * 32;
-      float4 wv = reinterpret_cast<const float4*>(myw)[v];
-      int kk = v * 4;
+  for(int i=0;i<128/S;i++) {
+    const int st=i%ST;
+    rr_wait(bars+st*8,(i/ST)&1);
+    const uint32_t w=base+st*SB, x=w+2*WB;
 #pragma unroll
-      for (int t = 0; t < BM; ++t) {
-        const unsigned* xp = reinterpret_cast<const unsigned*>(sx + t * kRouterKChunk + kk);
-        float2 a = cvt_bf16x2(xp[0]);
-        float2 b = cvt_bf16x2(xp[1]);
-        acc[t] = fma_rn(wv.x, a.x, acc[t]);
-        acc[t] = fma_rn(wv.y, a.y, acc[t]);
-        acc[t] = fma_rn(wv.z, b.x, acc[t]);
-        acc[t] = fma_rn(wv.w, b.y, acc[t]);
-      }
+    for(int j=0;j<BN/2;j++) asm volatile("":"+f"(acc[j])::"memory");
+    asm volatile("wgmma.fence.sync.aligned;" :::"memory");
+#pragma unroll
+    for(int q=0;q<4;q++) {
+      const uint64_t dx=rr_desc(x+q*32),dh=rr_desc(w+q*32),dl=rr_desc(w+WB+q*32);
+      if constexpr(SW) { @@CALL_H@@; @@CALL_L@@; }
+      else { @@CALL_NH@@; @@CALL_NL@@; }
     }
+    asm volatile("wgmma.commit_group.sync.aligned;" :::"memory");
+    if constexpr(PIPE&1) asm volatile("wgmma.wait_group.sync.aligned 1;" :::"memory");
+    else asm volatile("wgmma.wait_group.sync.aligned 0;" :::"memory");
 #pragma unroll
-    for (int t = 0; t < BM; ++t) {
-      float a = acc[t];
-#pragma unroll
-      for (int off = 16; off > 0; off >>= 1) a += __shfl_down_sync(0xffffffff, a, off);
-      if (lane == 0) {
-        partial[(static_cast<size_t>(split) * static_cast<size_t>(M) + static_cast<size_t>(m0 + t)) * kRouterN +
-                row] = a;
+    for(int j=0;j<BN/2;j++) asm volatile("":"+f"(acc[j])::"memory");
+    if constexpr(PIPE&2) {
+      if constexpr(PIPE&1) {
+        if(i>0 && prev+ST<128/S && lane==0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(empty+(prev%ST)*8):"memory");
+      } else {
+        if(i+ST<128/S && lane==0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(empty+st*8):"memory");
       }
+    } else if constexpr(PIPE&1) {
+      if(i>0 && prev+ST<128/S && tid==0) load(prev+ST);
+    } else {
+      if(i+ST<128/S && tid==0) load(i+ST);
     }
-    __syncthreads();
+    prev=i;
+  }
+  asm volatile("wgmma.wait_group.sync.aligned 0;" :::"memory");
+  auto emit=[&](int v,float4 z) {
+    const int t=v%128, j=v/128, ln=t&31, wr=t>>5;
+    const int ar=wr*16+(ln>>2),bc=j*8+(ln&3)*2;
+    const float vv[4]={z.x,z.y,z.z,z.w};
+#pragma unroll
+    for(int c=0;c<4;c++) {
+      const int a=ar+(c/2)*8, b=bc+(c&1);
+      const int tr=tok+(SW?b:a), wc=row+(SW?a:b);
+      if(tr<m) out[tr*256+wc]=vv[c];
+    }
+  };
+  if constexpr(S==1) {
+#pragma unroll
+    for(int j=0;j<BN/8;j++) emit(j*128+tid,make_float4(acc[4*j],acc[4*j+1],acc[4*j+2],acc[4*j+3]));
+  } else if constexpr(RED==0) {
+    float4* part=(float4*)sm;
+#pragma unroll
+    for(int j=0;j<BN/8;j++) part[j*128+tid]=make_float4(acc[4*j],acc[4*j+1],acc[4*j+2],acc[4*j+3]);
+    rr_sync();
+    for(int t=tid;t<OWN;t+=128) {
+      const int v=rank*OWN+t;
+      float4 sum=make_float4(0,0,0,0);
+#pragma unroll
+      for(int r=0;r<S;r++) rr_add(sum,rr_pull(rr_map(base+v*16,r)));
+      emit(v,sum);
+    }
+    rr_sync();
+  } else {
+    asm volatile("barrier.cluster.wait.acquire.aligned;" :::"memory");
+#pragma unroll
+    for(int j=0;j<BN/8;j++) {
+      const int v=j*128+tid, dst=v/OWN, local=v%OWN;
+      const float4 val=make_float4(acc[4*j],acc[4*j+1],acc[4*j+2],acc[4*j+3]);
+      const uint32_t addr=recv+(rank*OWN+local)*16;
+      if(dst==rank) *(float4*)(sm+(addr-base))=val;
+      else rr_push(rr_map(addr,dst),val,rr_map(rb,dst));
+    }
+    if constexpr(PIPE&2) asm volatile("bar.sync 1, 128;" :::"memory"); else __syncthreads();
+    rr_wait(rb,0);
+    for(int t=tid;t<OWN;t+=128) {
+      float4 sum=make_float4(0,0,0,0);
+#pragma unroll
+      for(int r=0;r<S;r++) rr_add(sum,*(float4*)(sm+recv-base+(r*OWN+t)*16));
+      emit(rank*OWN+t,sum);
+    }
+    if constexpr(RED!=2) rr_sync();
   }
 }
 
-__global__ void router_fp32_reduce_kernel(float* __restrict__ out, const float* __restrict__ partial, int M, int splits) {
-  int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-  int total = M * kRouterN;
-  if (idx >= total) return;
-  float s = 0.f;
-  for (int sp = 0; sp < splits; ++sp) s += partial[static_cast<size_t>(sp) * total + idx];
-  out[idx] = s;
+typedef CUresult (*RR_Encode)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*, const cuuint64_t*,
+ const cuuint32_t*, const cuuint32_t*, CUtensorMapInterleave, CUtensorMapSwizzle, CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
+static int rr_map_host(CUtensorMap* tm,int64_t p,int inner,int outer,int box) {
+  static RR_Encode enc=nullptr;
+  if(!enc) { cudaDriverEntryPointQueryResult q; if(cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled",(void**)&enc,12000,cudaEnableDefault,&q)!=cudaSuccess||!enc) return -100; }
+  cuuint64_t dims[2]={(uint64_t)inner,(uint64_t)outer},stride[1]={(uint64_t)inner*2};
+  cuuint32_t sz[2]={64,(uint32_t)box},es[2]={1,1};
+  return (int)enc(tm,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,2,(void*)p,dims,stride,sz,es,CU_TENSOR_MAP_INTERLEAVE_NONE,
+                 CU_TENSOR_MAP_SWIZZLE_128B,CU_TENSOR_MAP_L2_PROMOTION_L2_256B,CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 }
 
-template <int BM>
-void launch_router_fp32(float* partial, const bf16_t* x, const float* w, float* out, int M, cudaStream_t stream) {
-  int smem = kRouterWarps * kRouterKChunk * static_cast<int>(sizeof(float)) +
-             BM * kRouterKChunk * static_cast<int>(sizeof(bf16_t));
-  dim3 grid(kRouterN / kRouterWarps, kRouterSplits);
-  router_fp32_splitk_kernel<BM><<<grid, kRouterWarps * 32, smem, stream>>>(partial, x, w, M);
-  int total = M * kRouterN;
-  constexpr int threads = 256;
-  int blocks = (total + threads - 1) / threads;
-  router_fp32_reduce_kernel<<<blocks, threads, 0, stream>>>(out, partial, M, kRouterSplits);
+template<int BN,int S,int ST,int SW,int RED,int PIPE>
+int rr_launch_t(int64_t w,int64_t x,int64_t out,int m,int64_t stream,int query) {
+  constexpr int NR=SW?64:BN, TM=SW?BN:64;
+  constexpr int bytes=ST*(2*NR+TM)*128+ST*8*((PIPE&2)?2:1)+48+(RED>=1?64*BN*4:0);
+  auto fn=rr_kernel<BN,S,ST,SW,RED,PIPE>;
+  static bool configured=false;
+  if(!configured) {
+    cudaError_t e=cudaFuncSetAttribute(fn,cudaFuncAttributeMaxDynamicSharedMemorySize,bytes);
+    if(e!=cudaSuccess) return -(int)e;
+    e=cudaFuncSetAttribute(fn,cudaFuncAttributeNonPortableClusterSizeAllowed,1);
+    if(e!=cudaSuccess)return -(int)e;
+    configured=true;
+  }
+  if(query==2){cudaFuncAttributes fa;cudaFuncGetAttributes(&fa,fn);return fa.numRegs*1000+fa.localSizeBytes;}
+  cudaLaunchConfig_t cfg={};
+  cfg.gridDim=dim3(256/NR*S,(m+TM-1)/TM,1);cfg.blockDim=dim3((PIPE&2)?256:128);cfg.dynamicSmemBytes=bytes;cfg.stream=(cudaStream_t)stream;
+  cudaLaunchAttribute attr[1];attr[0].id=cudaLaunchAttributeClusterDimension;attr[0].val.clusterDim={S,1,1};
+  if(S>1){cfg.attrs=attr;cfg.numAttrs=1;}
+  if(query==1){int n=0;cudaError_t e=cudaOccupancyMaxActiveClusters(&n,fn,&cfg);return e==cudaSuccess?n:-(int)e;}
+  CUtensorMap tw,tx;
+  int e=rr_map_host(&tw,w,64,256*128*2,NR*2);if(e)return e;
+  e=rr_map_host(&tx,x,8192,m,TM);if(e)return e;
+  cudaError_t err=cudaLaunchKernelEx(&cfg,fn,tw,tx,(float*)out,m);
+  return err==cudaSuccess?0:(int)err;
 }
-
-void router_fp32_splitk(torch::Tensor x, torch::Tensor w, torch::Tensor partial, torch::Tensor out) {
-  TORCH_CHECK(x.is_cuda() && w.is_cuda() && partial.is_cuda() && out.is_cuda());
-  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && w.scalar_type() == at::kFloat && out.scalar_type() == at::kFloat);
-  const int M = static_cast<int>(x.size(0));
-  const int K = static_cast<int>(x.size(1));
-  const int N = static_cast<int>(w.size(0));
-  TORCH_CHECK(N == kRouterN && K == kRouterK && w.size(1) == K);
-  TORCH_CHECK((M >= 1 && M <= 8) || M == 16);
-  TORCH_CHECK(out.size(0) == M && out.size(1) == N);
-  TORCH_CHECK(partial.numel() >= static_cast<int64_t>(kRouterSplits) * M * N);
-  auto stream = at::cuda::getCurrentCUDAStream();
-  auto* pp = reinterpret_cast<float*>(partial.data_ptr());
-  auto* xp = reinterpret_cast<const bf16_t*>(x.data_ptr());
-  auto* wp = reinterpret_cast<const float*>(w.data_ptr());
-  auto* op = reinterpret_cast<float*>(out.data_ptr());
-  if (M % 8 == 0) launch_router_fp32<8>(pp, xp, wp, op, M, stream);
-  else launch_router_fp32<1>(pp, xp, wp, op, M, stream);
+int rr_launch(int id,int64_t w,int64_t x,int64_t out,int m,int64_t stream,int query) {
+ switch(id){@@CASES@@ default:return -99;}
 }
+@@SCALAR@@
+'''
 
-// Unpooler m=1 N=1024 is 128 CTAs. Split K by 4 → 512 CTAs; fp32 partials, one bf16 reduce.
-template <uint32_t N, uint32_t K, uint32_t SPLITS, uint32_t kRows, uint32_t kUnroll, uint32_t kNumWarps>
-__global__ void __launch_bounds__(kNumWarps * 32)
-    gemv_splitk_kernel(float* __restrict__ partial, const bf16_t* __restrict__ x, const bf16_t* __restrict__ w) {
-  constexpr uint32_t KCHUNK = K / SPLITS;
-  __shared__ __align__(16) bf16_t sx[KCHUNK];
-  const uint32_t split = blockIdx.y;
-  const uint32_t k0 = split * KCHUNK;
-  const uint32_t tid = threadIdx.x;
-  for (uint32_t i = tid * kGemvVecSize; i < KCHUNK; i += kNumWarps * 32 * kGemvVecSize) {
-    sts16(sx + i, ldg16_cg(x + k0 + i));
+ROUTER_CPP = '''#include <pybind11/pybind11.h>
+#include <stdint.h>
+int rr_launch(int,int64_t,int64_t,int64_t,int,int64_t,int);
+int rr_scalar(int64_t,int64_t,int64_t,int,int64_t,int);
+int rr_small(int64_t,int64_t,int64_t,int,int,int,int64_t,int);
+'''
+
+def build_router(configs):
+    src = ROUTER_CUDA.replace('@@MMA@@', '\n'.join(_mma(n) for n in sorted({c[0] for c in configs})))
+    for tag, a, b in [('H', 'dh', 'dx'), ('L', 'dl', 'dx'), ('NH', 'dx', 'dh'), ('NL', 'dx', 'dl')]:
+        src = src.replace('@@CALL_' + tag + '@@', ' '.join(f'if constexpr(BN=={n}) rr_mma_{n}(acc,{a},{b});' for n in sorted({c[0] for c in configs})))
+    cases = '\n'.join(f'case {i}: return rr_launch_t<{",".join(map(str,c))}>(w,x,out,m,stream,query);' for i,c in enumerate(configs))
+    src = src.replace('@@CASES@@',cases).replace('@@SCALAR@@', ROUTER_SCALAR + ROUTER_SMALL)
+    name = 'router_' + hashlib.sha256(src.encode()).hexdigest()[:12]
+    return load_inline(name, ROUTER_CPP, cuda_sources=src, functions=['rr_launch','rr_scalar','rr_small'],
+                       extra_cuda_cflags=['-O3','-std=c++20','-gencode=arch=compute_90a,code=sm_90a','--ptxas-options=-v'],
+                       no_implicit_headers=True, with_pytorch_error_handling=False,verbose=False)
+
+def pack_router(w, nr):
+    hi = w.to(torch.bfloat16)
+    lo = (w-hi.float()).to(torch.bfloat16)
+    return torch.stack([p.view(256//nr,nr,128,64).permute(0,2,1,3) for p in (hi,lo)],dim=2).contiguous().view(-1,64)
+
+def prepare_candidates(weights, configs):
+    w = weights['router'].contiguous()
+    return {'ext':build_router(configs), 'configs':configs,'weight':w,
+            'packed':{nr:pack_router(w,nr) for nr in {64 if c[3] else c[0] for c in configs}}}
+
+def run_candidate(x, st, index):
+    out = torch.empty((x.shape[0],256),dtype=torch.float32,device=x.device)
+    stream = torch.cuda.current_stream().cuda_stream
+    if index == -1:
+        rc = st['ext'].rr_scalar(st['weight'].data_ptr(),x.data_ptr(),out.data_ptr(),x.shape[0],stream,0)
+    else:
+        cfg = st['configs'][index]
+        w = st['packed'][64 if cfg[3] else cfg[0]]
+        rc = st['ext'].rr_launch(index,w.data_ptr(),x.data_ptr(),out.data_ptr(),x.shape[0],stream,0)
+    if rc:
+        raise RuntimeError(f'router launch failed: config={index}, rc={rc}')
+    return out
+
+# Configuration: WGMMA N, K splits, stages, swap operands, reduction, pipeline flags.
+# Reduction 0 pulls, 1 pushes with a final barrier, 2 relies on destination byte completion.
+# Pipeline bits: 1 keeps one MMA group in flight, 2 adds a producer, 4 initializes reduction first.
+ROUTER_CONFIGS = [(32,16,4,1,2,1), (32,8,4,0,2,1), (64,4,8,1,2,3)]
+
+def prepare_router(weights) -> dict:
+    w = weights.get('router')
+    if w is None or w.shape != (256,8192) or w.dtype != torch.float32 or not w.is_cuda:
+        return {'enabled':False}
+    if torch.cuda.get_device_capability(w.device) != (9,0):
+        return {'enabled':False}
+    st = prepare_candidates(weights, ROUTER_CONFIGS)
+    st['small'] = {(16,8):pack_small_router(w,16,8)}
+    st['enabled'] = True
+    for m in (1,8,16,32,128,256):
+        x = torch.zeros((m,8192),dtype=torch.bfloat16,device=w.device)
+        run_router(x,'router',256,st)
+    torch.cuda.synchronize(w.device)
+    return st
+
+def run_router(x, layer, n, st) -> torch.Tensor | None:
+    if not st.get('enabled') or layer != 'router' or n != 256:
+        return None
+    if x.ndim != 2 or x.shape[1] != 8192 or x.dtype != torch.bfloat16 or not x.is_cuda or not x.is_contiguous():
+        return None
+    if x.device != st['weight'].device or x.data_ptr() % 16:
+        return None
+    m = x.shape[0]
+    if not 1 <= m <= 256:
+        return None
+    if m == 1:
+        return run_candidate(x,st,-1)
+    if m <= 16:
+        return run_small_candidate(x,st)
+    return run_candidate(x,st,0 if m <= 32 else 1 if m <= 128 else 2)
+
+ROUTER_SCALAR = r'''
+template<int M, int NT, int ST>
+__global__ void rr_scalar_kernel(const float* __restrict__ w, const __nv_bfloat16* __restrict__ x,
+                                float* __restrict__ y, int m) {
+  constexpr int K=8192;
+  int tid=threadIdx.x, row=blockIdx.x, lane=tid&31, warp=tid>>5;
+  float acc[M][4]={};
+  float4 ww[ST];
+  uint2 xx[ST][M];
+  auto ld=[&](int slot,int i) {
+    ww[slot]=reinterpret_cast<const float4*>(w+row*K)[i];
+    #pragma unroll
+    for(int t=0;t<M;t++) {
+      if(t<m) xx[slot][t]=reinterpret_cast<const uint2*>(x+t*K)[i];
+    }
+  };
+  #pragma unroll
+  for(int s=0;s<ST;s++) ld(s,tid+s*NT);
+  #pragma unroll 1
+  for(int base=tid;base<K/4;base+=ST*NT) {
+    #pragma unroll
+    for(int s=0;s<ST;s++) {
+      float4 v=ww[s];
+      uint2 a[M];
+      #pragma unroll
+      for(int t=0;t<M;t++) a[t]=xx[s][t];
+      if(base+(s+ST)*NT<K/4) ld(s,base+(s+ST)*NT);
+      #pragma unroll
+      for(int t=0;t<M;t++) if(t<m) {
+        __nv_bfloat162 z0=*reinterpret_cast<__nv_bfloat162*>(&a[t].x);
+        __nv_bfloat162 z1=*reinterpret_cast<__nv_bfloat162*>(&a[t].y);
+        float2 f0=__bfloat1622float2(z0),f1=__bfloat1622float2(z1);
+        acc[t][0]=fmaf(v.x,f0.x,acc[t][0]);
+        acc[t][1]=fmaf(v.y,f0.y,acc[t][1]);
+        acc[t][2]=fmaf(v.z,f1.x,acc[t][2]);
+        acc[t][3]=fmaf(v.w,f1.y,acc[t][3]);
+      }
+    }
+  }
+  __shared__ float sums[M][NT/32];
+  #pragma unroll
+  for(int t=0;t<M;t++) if(t<m) {
+    float v=(acc[t][0]+acc[t][1])+(acc[t][2]+acc[t][3]);
+    #pragma unroll
+    for(int d=16;d;d>>=1) v+=__shfl_down_sync(0xffffffff,v,d);
+    if(lane==0) sums[t][warp]=v;
   }
   __syncthreads();
+  if(warp==0) {
+    #pragma unroll
+    for(int t=0;t<M;t++) if(t<m) {
+      float v=lane<NT/32?sums[t][lane]:0.f;
+      #pragma unroll
+      for(int d=16;d;d>>=1) v+=__shfl_down_sync(0xffffffff,v,d);
+      if(lane==0) y[t*256+row]=v;
+    }
+  }
+}
 
-  const uint32_t warp = tid / 32;
-  const uint32_t lane = tid % 32;
-  const uint32_t r0 = (blockIdx.x * kNumWarps + warp) * kRows;
-  if (r0 >= N) return;
+int rr_scalar(int64_t w,int64_t x,int64_t out,int m,int64_t stream,int query) {
+  auto kern=rr_scalar_kernel<1,512,2>;
+  if(query==2) {
+    cudaFuncAttributes fa;
+    if(cudaFuncGetAttributes(&fa,kern)!=cudaSuccess) return -10;
+    return fa.numRegs*1000+(int)std::min<size_t>(fa.localSizeBytes,999);
+  }
+  if(m!=1) return -5;
+  kern<<<256,512,0,(cudaStream_t)stream>>>((const float*)w,(const __nv_bfloat16*)x,(float*)out,m);
+  return cudaGetLastError()==cudaSuccess?0:-8;
+}
+'''
 
-  float acc[kRows];
+ROUTER_SMALL = r'''
+template<int MT,int S,int WK>
+__global__ __launch_bounds__(WK*32) void rr_small_kernel(const int4* wp,const __nv_bfloat16* x,float* out,int m) {
+  constexpr int KU=128/S/WK, NI=MT*32;
+  const int tid=threadIdx.x,lane=tid&31,warp=tid>>5,rank=blockIdx.x%S,row=blockIdx.x/S*16;
+  const int gw=(rank*16+row/16)*WK+warp;
+  extern __shared__ __align__(16) unsigned char sm[];
+  float4* recv=(float4*)sm;
+  float4* part=recv+S*NI;
+  const uint32_t rb=rr_smem(sm+(S+WK)*NI*16);
+  int4 w[KU][8];uint4 xx[KU][MT][2];
 #pragma unroll
-  for (uint32_t r = 0; r < kRows; ++r) acc[r] = 0.f;
-
-  constexpr uint32_t kStep = 32 * kGemvVecSize * kUnroll;
-  for (uint32_t k = lane * kGemvVecSize * kUnroll; k < KCHUNK; k += kStep) {
-    float4 xv[kUnroll];
+  for(int k=0;k<KU;k++) {
 #pragma unroll
-    for (uint32_t u = 0; u < kUnroll; ++u) xv[u] = lds16(sx + k + u * kGemvVecSize);
+    for(int j=0;j<8;j++) {
+      const int4* p=wp+((k*(16*S*WK)+gw)*8+j)*32+lane;
+      asm volatile("ld.global.nc.L1::no_allocate.v4.s32 {%0,%1,%2,%3}, [%4];":"=r"(w[k][j].x),"=r"(w[k][j].y),"=r"(w[k][j].z),"=r"(w[k][j].w):"l"(p));
+    }
 #pragma unroll
-    for (uint32_t r = 0; r < kRows; ++r) {
-      const bf16_t* wr = w + static_cast<size_t>(r0 + r) * K + k0 + k;
+    for(int n=0;n<MT;n++) {
+      const __nv_bfloat16* p=x+min(n*8+(lane>>2),m-1)*8192+((rank*WK+warp)*KU+k)*64+(lane&3)*16;
 #pragma unroll
-      for (uint32_t u = 0; u < kUnroll; ++u) acc[r] += dot8_f32(ldg16_cg(wr + u * kGemvVecSize), xv[u]);
+      for(int h=0;h<2;h++) asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];":"=r"(xx[k][n][h].x),"=r"(xx[k][n][h].y),"=r"(xx[k][n][h].z),"=r"(xx[k][n][h].w):"l"(p+h*8));
+    }
+  }
+  if(rank==0 && tid==0) {rr_init(rb,1);asm volatile("fence.proxy.async.shared::cta;" :::"memory");}
+  if(rank==0 && warp==0) __syncwarp();
+  if(rank==0 && tid==0) {rr_expect(rb,(S-1)*NI*16);asm volatile("fence.mbarrier_init.release.cluster;" :::"memory");}
+  asm volatile("barrier.cluster.arrive.relaxed.aligned;" :::"memory");
+  float c[2][MT][4]={};
+#pragma unroll
+  for(int k=0;k<KU;k++) {
+#pragma unroll
+    for(int n=0;n<MT;n++) {
+      uint32_t b[8]={xx[k][n][0].x,xx[k][n][0].y,xx[k][n][0].z,xx[k][n][0].w,xx[k][n][1].x,xx[k][n][1].y,xx[k][n][1].z,xx[k][n][1].w};
+#pragma unroll
+      for(int q=0;q<4;q++) {
+#pragma unroll
+        for(int h=0;h<2;h++) {
+          const int4 a=w[k][q+h*4];
+          asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                       :"+f"(c[h][n][0]),"+f"(c[h][n][1]),"+f"(c[h][n][2]),"+f"(c[h][n][3]):"r"(a.x),"r"(a.y),"r"(a.z),"r"(a.w),"r"(b[2*q]),"r"(b[2*q+1]));
+        }
+      }
     }
   }
 #pragma unroll
-  for (uint32_t r = 0; r < kRows; ++r) {
+  for(int n=0;n<MT;n++) part[warp*NI+n*32+lane]=make_float4(c[0][n][0]+c[1][n][0],c[0][n][1]+c[1][n][1],c[0][n][2]+c[1][n][2],c[0][n][3]+c[1][n][3]);
+  __syncthreads();
+  asm volatile("barrier.cluster.wait.acquire.aligned;" :::"memory");
+  for(int v=tid;v<NI;v+=WK*32) {
+    float4 sum=make_float4(0,0,0,0);
 #pragma unroll
-    for (uint32_t off = 16; off > 0; off >>= 1) acc[r] += __shfl_down_sync(0xffffffff, acc[r], off);
+    for(int k=0;k<WK;k++) rr_add(sum,part[k*NI+v]);
+    if(rank==0)recv[v]=sum;
+    else rr_push(rr_map(rr_smem(recv+rank*NI+v),0),sum,rr_map(rb,0));
   }
-  if (lane == 0) {
+  if(rank==0) {
+    __syncthreads();rr_wait(rb,0);
+    for(int v=tid;v<NI;v+=WK*32) {
+      float4 sum=make_float4(0,0,0,0);
 #pragma unroll
-    for (uint32_t r = 0; r < kRows; ++r) partial[split * N + r0 + r] = acc[r];
+      for(int s=0;s<S;s++) rr_add(sum,recv[s*NI+v]);
+      const int ln=v%32,tok=(v/32)*8+(ln&3)*2,wr=row+(ln>>2);
+      if(tok<m){out[tok*256+wr]=sum.x;out[tok*256+wr+8]=sum.z;}
+      if(tok+1<m){out[(tok+1)*256+wr]=sum.y;out[(tok+1)*256+wr+8]=sum.w;}
+    }
   }
 }
 
-__global__ void gemv_splitk_reduce(bf16_t* __restrict__ out, const float* __restrict__ partial, int n, int splits) {
-  int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-  if (row >= n) return;
-  float s = 0.f;
-  for (int sp = 0; sp < splits; ++sp) s += partial[static_cast<size_t>(sp) * n + row];
-  out[row] = cast<bf16_t>(s);
+template<int MT,int S,int WK>
+int rr_small_t(int64_t w,int64_t x,int64_t out,int m,int64_t stream,int query) {
+  auto fn=rr_small_kernel<MT,S,WK>;
+  constexpr int bytes=(S+WK)*MT*512+16;
+  static bool configured=false;
+  if(!configured){cudaFuncSetAttribute(fn,cudaFuncAttributeMaxDynamicSharedMemorySize,bytes);cudaFuncSetAttribute(fn,cudaFuncAttributeNonPortableClusterSizeAllowed,1);configured=true;}
+  if(query==2){cudaFuncAttributes fa;cudaFuncGetAttributes(&fa,fn);return fa.numRegs*1000+fa.localSizeBytes;}
+  cudaLaunchConfig_t cfg={};cfg.gridDim=dim3(16*S);cfg.blockDim=dim3(WK*32);cfg.dynamicSmemBytes=bytes;cfg.stream=(cudaStream_t)stream;
+  cudaLaunchAttribute at;at.id=cudaLaunchAttributeClusterDimension;at.val.clusterDim={S,1,1};cfg.attrs=&at;cfg.numAttrs=1;
+  return (int)cudaLaunchKernelEx(&cfg,fn,(const int4*)w,(const __nv_bfloat16*)x,(float*)out,m);
+}
+int rr_small(int64_t w,int64_t x,int64_t out,int m,int s,int wk,int64_t stream,int query) {
+#define RSM(S,W) if(s==S && wk==W) {if(m<=8)return rr_small_t<1,S,W>(w,x,out,m,stream,query);if(m<=16)return rr_small_t<2,S,W>(w,x,out,m,stream,query);if(m<=32)return rr_small_t<4,S,W>(w,x,out,m,stream,query);}
+RSM(8,8) RSM(16,8) RSM(16,4)
+return -99;
 }
 
-void hopper_bf16_gemv_splitk(torch::Tensor x, torch::Tensor w, torch::Tensor out, torch::Tensor partial) {
-  TORCH_CHECK(x.is_cuda() && w.is_cuda() && out.is_cuda() && partial.is_cuda());
-  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.size(0) == 1);
-  constexpr int N = 1024, K = 4096, SPLITS = 4;
-  TORCH_CHECK(w.size(0) == N && w.size(1) == K && out.numel() == N);
-  TORCH_CHECK(partial.numel() >= SPLITS * N);
-  auto* xp = reinterpret_cast<const bf16_t*>(x.data_ptr());
-  auto* wp = reinterpret_cast<const bf16_t*>(w.data_ptr());
-  auto* op = reinterpret_cast<bf16_t*>(out.data_ptr());
-  auto* pp = reinterpret_cast<float*>(partial.data_ptr());
-  auto stream = at::cuda::getCurrentCUDAStream();
-  constexpr int warps = 8;
-  constexpr int blocks_n = N / warps;  // rows=1
-  gemv_splitk_kernel<N, K, SPLITS, 1, 4, warps><<<dim3(blocks_n, SPLITS), warps * 32, 0, stream>>>(pp, xp, wp);
-  gemv_splitk_reduce<<<(N + 255) / 256, 256, 0, stream>>>(op, pp, N, SPLITS);
-}
-"""
+'''
 
-_CPP_DECL = r"""
-void hopper_bf16_gemv(torch::Tensor x, torch::Tensor w, torch::Tensor out, bool use_pdl);
-void hopper_bf16_gemv_splitk(torch::Tensor x, torch::Tensor w, torch::Tensor out, torch::Tensor partial);
-void router_fp32_splitk(torch::Tensor x, torch::Tensor w, torch::Tensor partial, torch::Tensor out);
-int64_t bf16_mm_pick_nosplit(int64_t M, int64_t N, int64_t K);
-void bf16_mm_run_nosplit(torch::Tensor A, torch::Tensor B, torch::Tensor C, torch::Tensor workspace);
-"""
+def pack_small_router(w, s=16, wk=8):
+    hi=w.to(torch.bfloat16);lo=(w-hi.float()).to(torch.bfloat16)
+    def units(v):
+        v=v.view(16,2,8,128,4,4,2,2).permute(0,3,2,4,5,6,1,7).reshape(16,128,32,4,8)
+        return v.permute(0,1,3,2,4)
+    data=torch.cat([units(hi),units(lo)],dim=2).contiguous()
+    ku=128//s//wk
+    return data.view(16,s,wk,ku,8,32,8).permute(3,1,0,2,4,5,6).contiguous()
 
-
-def _use_hopper_bf16_gemv(m: int, n: int, k: int) -> bool:
-    if not (
-        m == 1
-        and k % 512 == 0
-        and 512 <= k <= _MAX_K
-        and n % 8 == 0
-        and 64 <= n <= _MAX_N
-    ):
-        return False
-    if k == 5120 and n <= 512:
-        return False
-    return n < 12288 or n >= 32768
-
-
-def _align16(t: torch.Tensor) -> torch.Tensor:
-    if t.data_ptr() % 16 == 0 and t.is_contiguous():
-        return t
-    out = torch.empty_like(t)
-    out.copy_(t)
+def run_small_candidate(x,st,s=16,wk=8):
+    out=torch.empty((x.shape[0],256),dtype=torch.float32,device=x.device)
+    rc=st['ext'].rr_small(st['small'][s,wk].data_ptr(),x.data_ptr(),out.data_ptr(),x.shape[0],s,wk,torch.cuda.current_stream().cuda_stream,0)
+    if rc:raise RuntimeError(f'router small launch failed: {rc}')
     return out
 
 
-def _build_ext(device: torch.device):
-    major, minor = torch.cuda.get_device_capability(device)
-    arch = f"sm_{major}{minor}"
-    gencode = f"-gencode=arch=compute_{major}{minor},code={arch}"
-    build_dir = Path.home() / ".cache" / "muse_bf16_impl_l" / arch
-    build_dir.mkdir(parents=True, exist_ok=True)
-    return load_inline(
-        name=f"muse_bf16_impl_l_{arch}",
-        cpp_sources=[_CPP_DECL],
-        cuda_sources=[_CUDA_SRC],
-        functions=[
-            "hopper_bf16_gemv",
-            "hopper_bf16_gemv_splitk",
-            "router_fp32_splitk",
-            "bf16_mm_pick_nosplit",
-            "bf16_mm_run_nosplit",
-        ],
-        extra_cuda_cflags=[
-            "-O3",
-            "--use_fast_math",
-            "-std=c++20",
-            "--expt-relaxed-constexpr",
-            gencode,
-        ],
-        extra_ldflags=["-lcublasLt"],
-        build_directory=str(build_dir),
-        verbose=False,
-    )
+# ---- router2/router2_kernels.py ----
 
+def rt2_mma(n):
+    regs = ', '.join(f'%{i}' for i in range(n // 2))
+    outs = ', '.join(f'"+f"(d[{i}])' for i in range(n // 2))
+    return f'''__device__ __forceinline__ void rt2_mma_{n}(float* d, uint64_t a, uint64_t b) {{
+    asm volatile("wgmma.mma_async.sync.aligned.m64n{n}k16.f32.bf16.bf16 {{{regs}}}, %{n//2}, %{n//2+1}, 1, 1, 1, 0, 0;" : {outs} : "l"(a), "l"(b));
+}}'''
 
-def _probe_mm_bf16_backend(device: torch.device) -> str | None:
-    try:
-        from flashinfer.gemm import mm_bf16
-    except ImportError:
-        return None
-    x = torch.zeros(8, 1024, dtype=torch.bfloat16, device=device)
-    b = torch.zeros(1024, 1024, dtype=torch.bfloat16, device=device)
-    for backend in ("tgv", "cute-dsl", "cutlass", "cublaslt", "auto"):
-        try:
-            y = mm_bf16(x, b, backend=backend)
-            torch.cuda.synchronize(device)
-            if y.shape == (8, 1024):
-                return backend
-        except Exception:
-            continue
-    return None
+rt2_ROUTER_CUDA = r'''
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <stdint.h>
+#include <algorithm>
+#define rt2_RD __device__ __forceinline__
+rt2_RD uint32_t rt2_smem(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
+rt2_RD void rt2_init(uint32_t b, int n) { asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(b),"r"(n):"memory"); }
+rt2_RD void rt2_expect(uint32_t b, int n) { asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(b),"r"(n):"memory"); }
+rt2_RD void rt2_wait(uint32_t b, int ph) {
+  asm volatile("{ .reg .pred p; wait: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%0], %1; @!p bra wait; }" ::"r"(b),"r"(ph):"memory");
+}
+rt2_RD void rt2_sync() { asm volatile("barrier.cluster.arrive.release.aligned; barrier.cluster.wait.acquire.aligned;" :::"memory"); }
+rt2_RD uint32_t rt2_map(uint32_t a, int r) { uint32_t b; asm("mapa.shared::cluster.u32 %0, %1, %2;":"=r"(b):"r"(a),"r"(r));return b; }
+rt2_RD void rt2_push(uint32_t d, float4 v, uint32_t b) {
+  asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.f32 [%0], {%1,%2,%3,%4}, [%5];" ::"r"(d),"f"(v.x),"f"(v.y),"f"(v.z),"f"(v.w),"r"(b):"memory");
+}
+rt2_RD float4 rt2_pull(uint32_t d) {
+  float4 v; asm volatile("ld.shared::cluster.v4.f32 {%0,%1,%2,%3}, [%4];":"=f"(v.x),"=f"(v.y),"=f"(v.z),"=f"(v.w):"r"(d):"memory");return v;
+}
+rt2_RD void rt2_add(float4& a,float4 b) { a.x+=b.x;a.y+=b.y;a.z+=b.z;a.w+=b.w; }
+rt2_RD uint64_t rt2_desc(uint32_t a) { return (uint64_t)((a&0x3ffff)>>4)|((uint64_t)64<<32)|((uint64_t)1<<62); }
+rt2_RD void rt2_tma(uint32_t dst, const void* tm, int k,int r,uint32_t bar) {
+  asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2,%3}], [%4];" ::"r"(dst),"l"(tm),"r"(k),"r"(r),"r"(bar):"memory");
+}
+@@MMA@@
 
-
-def _graph_median_ms(fn) -> float | None:
-    try:
-        side = torch.cuda.Stream()
-        side.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side):
-            fn()
-            fn()
-        torch.cuda.current_stream().wait_stream(side)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            fn()
-        start, end = torch.cuda.Event(True), torch.cuda.Event(True)
-        samples = []
-        for _ in range(7):
-            start.record()
-            graph.replay()
-            end.record()
-            end.synchronize()
-            samples.append(start.elapsed_time(end))
-        samples.sort()
-        return samples[len(samples) // 2]
-    except Exception:
-        return None
-
-
-def prepare(weights: Weights) -> dict[str, Any]:
-    state: dict[str, Any] = {
-        name: _align16(w.contiguous()) for name, w in weights.items()
+template<int BN,int S,int ST,int SW,int RED,int PIPE>
+__global__ __launch_bounds__((PIPE&2)?256:128) void rt2_kernel(const __grid_constant__ CUtensorMap tw,
+                                               const __grid_constant__ CUtensorMap tx, float* out, int m) {
+  constexpr int NR=SW?64:BN, TM=SW?BN:64;
+  constexpr int WB=NR*128, XB=TM*128, SB=WB*2+XB;
+  constexpr int NF=64*BN, NV=NF/4, OWN=NV/S;
+  extern __shared__ __align__(1024) unsigned char sm[];
+  const int tid=threadIdx.x, lane=tid&31, warp=tid>>5, rank=blockIdx.x%S;
+  const int row=blockIdx.x/S*NR, tok=blockIdx.y*TM;
+  const uint32_t base=rt2_smem(sm), bars=base+ST*SB, empty=bars+ST*8, rb=(empty+((PIPE&2)?ST*8:0)+15)&~15u;
+  const uint32_t recv=rb+16;
+  const int kb=rank*(128/S);
+  auto load=[&](int i) {
+    const int st=i%ST;
+    const uint32_t b=bars+st*8, d=base+st*SB;
+    rt2_expect(b,SB);
+    rt2_tma(d,&tw,0,((row/NR)*128+kb+i)*NR*2,b);
+    rt2_tma(d+2*WB,&tx,(kb+i)*64,tok,b);
+  };
+  if(tid==((PIPE&2)?128:0)) {
+#pragma unroll
+    for(int i=0;i<ST;i++) { rt2_init(bars+i*8,1); if constexpr(PIPE&2) rt2_init(empty+i*8,4); }
+    asm volatile("fence.proxy.async.shared::cta;" :::"memory");
+    if constexpr(PIPE&4) {
+    if constexpr(RED>=1) {
+      rt2_init(rb,1);asm volatile("fence.proxy.async.shared::cta;" :::"memory");rt2_expect(rb,(S-1)*OWN*16);
+      asm volatile("fence.mbarrier_init.release.cluster;" :::"memory");
     }
-    for name in ("qkv_gate", "o", "pooler", "unpooler"):
-        state[f"{name}_t"] = state[name].t().contiguous()
-    router = state["router"]
-    hi = router.to(torch.bfloat16)
-    lo = (router - hi.float()).to(torch.bfloat16)
+    }
+#pragma unroll
+    for(int i=0;i<ST && i<128/S;i++) load(i);
+    if constexpr(!(PIPE&4)) {
+    if constexpr(RED>=1) {
+      rt2_init(rb,1);asm volatile("fence.proxy.async.shared::cta;" :::"memory");rt2_expect(rb,(S-1)*OWN*16);
+      asm volatile("fence.mbarrier_init.release.cluster;" :::"memory");
+    }
+    }
+  }
+  __syncthreads();
+  if constexpr(RED>=1) asm volatile("barrier.cluster.arrive.relaxed.aligned;" :::"memory");
+  if constexpr(PIPE&2) {
+    if(tid>=128) {
+      if(tid==128) {
+        for(int i=ST;i<128/S;i++) {
+          rt2_wait(empty+(i%ST)*8,((i/ST)-1)&1);
+          load(i);
+        }
+      }
+      if constexpr(RED>=1) asm volatile("barrier.cluster.wait.acquire.aligned;" :::"memory");
+      if constexpr(RED!=2) rt2_sync();
+      return;
+    }
+  }
+  float acc[BN/2];
+#pragma unroll
+  for(int j=0;j<BN/2;j++) asm volatile("mov.b32 %0, 0;":"=f"(acc[j]));
+  int prev=0;
+#pragma unroll 1
+  for(int i=0;i<128/S;i++) {
+    const int st=i%ST;
+    rt2_wait(bars+st*8,(i/ST)&1);
+    const uint32_t w=base+st*SB, x=w+2*WB;
+#pragma unroll
+    for(int j=0;j<BN/2;j++) asm volatile("":"+f"(acc[j])::"memory");
+    asm volatile("wgmma.fence.sync.aligned;" :::"memory");
+#pragma unroll
+    for(int q=0;q<4;q++) {
+      const uint64_t dx=rt2_desc(x+q*32),dh=rt2_desc(w+q*32),dl=rt2_desc(w+WB+q*32);
+      if constexpr(SW) { @@CALL_H@@; @@CALL_L@@; }
+      else { @@CALL_NH@@; @@CALL_NL@@; }
+    }
+    asm volatile("wgmma.commit_group.sync.aligned;" :::"memory");
+    if constexpr(PIPE&1) asm volatile("wgmma.wait_group.sync.aligned 1;" :::"memory");
+    else asm volatile("wgmma.wait_group.sync.aligned 0;" :::"memory");
+#pragma unroll
+    for(int j=0;j<BN/2;j++) asm volatile("":"+f"(acc[j])::"memory");
+    if constexpr(PIPE&2) {
+      if constexpr(PIPE&1) {
+        if(i>0 && prev+ST<128/S && lane==0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(empty+(prev%ST)*8):"memory");
+      } else {
+        if(i+ST<128/S && lane==0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(empty+st*8):"memory");
+      }
+    } else if constexpr(PIPE&1) {
+      if(i>0 && prev+ST<128/S && tid==0) load(prev+ST);
+    } else {
+      if(i+ST<128/S && tid==0) load(i+ST);
+    }
+    prev=i;
+  }
+  asm volatile("wgmma.wait_group.sync.aligned 0;" :::"memory");
+  auto emit=[&](int v,float4 z) {
+    const int t=v%128, j=v/128, ln=t&31, wr=t>>5;
+    const int ar=wr*16+(ln>>2),bc=j*8+(ln&3)*2;
+    const float vv[4]={z.x,z.y,z.z,z.w};
+#pragma unroll
+    for(int c=0;c<4;c++) {
+      const int a=ar+(c/2)*8, b=bc+(c&1);
+      const int tr=tok+(SW?b:a), wc=row+(SW?a:b);
+      if(tr<m) out[tr*256+wc]=vv[c];
+    }
+  };
+  if constexpr(S==1) {
+#pragma unroll
+    for(int j=0;j<BN/8;j++) emit(j*128+tid,make_float4(acc[4*j],acc[4*j+1],acc[4*j+2],acc[4*j+3]));
+  } else if constexpr(RED==0) {
+    float4* part=(float4*)sm;
+#pragma unroll
+    for(int j=0;j<BN/8;j++) part[j*128+tid]=make_float4(acc[4*j],acc[4*j+1],acc[4*j+2],acc[4*j+3]);
+    rt2_sync();
+    for(int t=tid;t<OWN;t+=128) {
+      const int v=rank*OWN+t;
+      float4 sum=make_float4(0,0,0,0);
+#pragma unroll
+      for(int r=0;r<S;r++) rt2_add(sum,rt2_pull(rt2_map(base+v*16,r)));
+      emit(v,sum);
+    }
+    rt2_sync();
+  } else {
+    asm volatile("barrier.cluster.wait.acquire.aligned;" :::"memory");
+#pragma unroll
+    for(int j=0;j<BN/8;j++) {
+      const int v=j*128+tid, dst=v/OWN, local=v%OWN;
+      const float4 val=make_float4(acc[4*j],acc[4*j+1],acc[4*j+2],acc[4*j+3]);
+      const uint32_t addr=recv+(rank*OWN+local)*16;
+      if(dst==rank) *(float4*)(sm+(addr-base))=val;
+      else rt2_push(rt2_map(addr,dst),val,rt2_map(rb,dst));
+    }
+    if constexpr(PIPE&2) asm volatile("bar.sync 1, 128;" :::"memory"); else __syncthreads();
+    rt2_wait(rb,0);
+    for(int t=tid;t<OWN;t+=128) {
+      float4 sum=make_float4(0,0,0,0);
+#pragma unroll
+      for(int r=0;r<S;r++) rt2_add(sum,*(float4*)(sm+recv-base+(r*OWN+t)*16));
+      emit(rank*OWN+t,sum);
+    }
+    if constexpr(RED!=2) rt2_sync();
+  }
+}
+
+typedef CUresult (*rt2_Encode)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*, const cuuint64_t*,
+ const cuuint32_t*, const cuuint32_t*, CUtensorMapInterleave, CUtensorMapSwizzle, CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
+static int rt2_map_host(CUtensorMap* tm,int64_t p,int inner,int outer,int box,int promo) {
+  static rt2_Encode enc=nullptr;
+  if(!enc) { cudaDriverEntryPointQueryResult q; if(cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled",(void**)&enc,12000,cudaEnableDefault,&q)!=cudaSuccess||!enc) return -100; }
+  cuuint64_t dims[2]={(uint64_t)inner,(uint64_t)outer},stride[1]={(uint64_t)inner*2};
+  cuuint32_t sz[2]={64,(uint32_t)box},es[2]={1,1};
+  return (int)enc(tm,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,2,(void*)p,dims,stride,sz,es,CU_TENSOR_MAP_INTERLEAVE_NONE,
+                 CU_TENSOR_MAP_SWIZZLE_128B,(promo==64?CU_TENSOR_MAP_L2_PROMOTION_L2_64B:promo==128?CU_TENSOR_MAP_L2_PROMOTION_L2_128B:promo==0?CU_TENSOR_MAP_L2_PROMOTION_NONE:CU_TENSOR_MAP_L2_PROMOTION_L2_256B),CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+}
+
+template<int BN,int S,int ST,int SW,int RED,int PIPE,int WP=256,int XP=256>
+int rt2_launch_t(int64_t w,int64_t x,int64_t out,int m,int64_t stream,int query) {
+  constexpr int NR=SW?64:BN, TM=SW?BN:64;
+  constexpr int bytes=ST*(2*NR+TM)*128+ST*8*((PIPE&2)?2:1)+48+(RED>=1?64*BN*4:0);
+  auto fn=rt2_kernel<BN,S,ST,SW,RED,PIPE>;
+  static bool configured=false;
+  if(!configured) {
+    cudaError_t e=cudaFuncSetAttribute(fn,cudaFuncAttributeMaxDynamicSharedMemorySize,bytes);
+    if(e!=cudaSuccess) return -(int)e;
+    e=cudaFuncSetAttribute(fn,cudaFuncAttributeNonPortableClusterSizeAllowed,1);
+    if(e!=cudaSuccess)return -(int)e;
+    configured=true;
+  }
+  if(query==2){cudaFuncAttributes fa;cudaFuncGetAttributes(&fa,fn);return fa.numRegs*1000+fa.localSizeBytes;}
+  cudaLaunchConfig_t cfg={};
+  cfg.gridDim=dim3(256/NR*S,(m+TM-1)/TM,1);cfg.blockDim=dim3((PIPE&2)?256:128);cfg.dynamicSmemBytes=bytes;cfg.stream=(cudaStream_t)stream;
+  cudaLaunchAttribute attr[1];attr[0].id=cudaLaunchAttributeClusterDimension;attr[0].val.clusterDim={S,1,1};
+  if(S>1){cfg.attrs=attr;cfg.numAttrs=1;}
+  if(query==1){int n=0;cudaError_t e=cudaOccupancyMaxActiveClusters(&n,fn,&cfg);return e==cudaSuccess?n:-(int)e;}
+  CUtensorMap tw,tx;
+  int e=rt2_map_host(&tw,w,64,256*128*2,NR*2,WP);if(e)return e;
+  e=rt2_map_host(&tx,x,8192,m,TM,XP);if(e)return e;
+  cudaError_t err=cudaLaunchKernelEx(&cfg,fn,tw,tx,(float*)out,m);
+  return err==cudaSuccess?0:(int)err;
+}
+int rt2_launch(int id,int64_t w,int64_t x,int64_t out,int m,int64_t stream,int query) {
+ switch(id){@@CASES@@ default:return -99;}
+}
+@@SCALAR@@
+'''
+
+rt2_ROUTER_CPP = '''#include <pybind11/pybind11.h>
+#include <stdint.h>
+int rt2_launch(int,int64_t,int64_t,int64_t,int,int64_t,int);
+int rt2_scalar(int64_t,int64_t,int64_t,int,int64_t,int);
+int rt2_small(int64_t,int64_t,int64_t,int,int,int,int64_t,int);
+'''
+
+def rt2_build_router(configs):
+    src = rt2_ROUTER_CUDA.replace('@@MMA@@', '\n'.join(rt2_mma(n) for n in sorted({c[0] for c in configs})))
+    for tag, a, b in [('H', 'dh', 'dx'), ('L', 'dl', 'dx'), ('NH', 'dx', 'dh'), ('NL', 'dx', 'dl')]:
+        src = src.replace('@@CALL_' + tag + '@@', ' '.join(f'if constexpr(BN=={n}) rt2_mma_{n}(acc,{a},{b});' for n in sorted({c[0] for c in configs})))
+    cases = '\n'.join(f'case {i}: return rt2_launch_t<{",".join(map(str,c))}>(w,x,out,m,stream,query);' for i,c in enumerate(configs))
+    src = src.replace('@@CASES@@',cases).replace('@@SCALAR@@', rt2_ROUTER_SCALAR + rt2_ROUTER_SMALL)
+    name = 'router2_' + hashlib.sha256(src.encode()).hexdigest()[:12]
+    return load_inline(name, rt2_ROUTER_CPP, cuda_sources=src, functions=['rt2_launch','rt2_scalar','rt2_small'],
+                       extra_cuda_cflags=['-O3','-std=c++20','-gencode=arch=compute_90a,code=sm_90a','--ptxas-options=-v'],
+                       no_implicit_headers=True, with_pytorch_error_handling=False,verbose=False)
+
+def rt2_pack_router(w, nr):
+    hi = w.to(torch.bfloat16)
+    lo = (w-hi.float()).to(torch.bfloat16)
+    return torch.stack([p.view(256//nr,nr,128,64).permute(0,2,1,3) for p in (hi,lo)],dim=2).contiguous().view(-1,64)
+
+def rt2_prepare_candidates(weights, configs):
+    w = weights['router'].contiguous()
+    return {'ext':rt2_build_router(configs), 'configs':configs,'weight':w,
+            'packed':{nr:rt2_pack_router(w,nr) for nr in {64 if c[3] else c[0] for c in configs}}}
+
+def rt2_run_candidate(x, st, index):
+    out = torch.empty((x.shape[0],256),dtype=torch.float32,device=x.device)
+    stream = torch.cuda.current_stream().cuda_stream
+    if index == -1:
+        rc = st['ext'].rt2_scalar(st['weight'].data_ptr(),x.data_ptr(),out.data_ptr(),x.shape[0],stream,0)
+    else:
+        cfg = st['configs'][index]
+        w = st['packed'][64 if cfg[3] else cfg[0]]
+        rc = st['ext'].rt2_launch(index,w.data_ptr(),x.data_ptr(),out.data_ptr(),x.shape[0],stream,0)
+    if rc:
+        raise RuntimeError(f'router launch failed: config={index}, rc={rc}')
+    return out
+
+# Configuration: WGMMA N, K splits, stages, swap, reduction, pipeline, W/x L2 promotion.
+# Reduction 0 pulls, 1 pushes with a final barrier, 2 relies on destination byte completion.
+# Pipeline bits: 1 keeps one MMA group in flight, 2 adds a producer, 4 initializes reduction first.
+rt2_ROUTER_CONFIGS = [(32,16,4,1,2,1,256,256), (32,8,4,0,2,1,256,256),
+                      (64,8,6,1,2,1,64,64), (64,4,8,1,2,3,256,256)]
+
+def prepare_router2(weights) -> dict:
+    w = weights.get('router')
+    if w is None or w.shape != (256,8192) or w.dtype != torch.float32 or not w.is_cuda:
+        return {'enabled':False}
+    if torch.cuda.get_device_capability(w.device) != (9,0):
+        return {'enabled':False}
+    st = rt2_prepare_candidates(weights, rt2_ROUTER_CONFIGS)
+    st['small'] = {(16,8):rt2_pack_small_router(w,16,8)}
+    st['enabled'] = True
+    for m in (1,8,16,32,64,128,256):
+        x = torch.zeros((m,8192),dtype=torch.bfloat16,device=w.device)
+        run_router2(x,'router',256,st)
+    torch.cuda.synchronize(w.device)
+    return st
+
+def run_router2(x, layer, n, st) -> torch.Tensor | None:
+    if not st.get('enabled') or layer != 'router' or n != 256:
+        return None
+    if x.ndim != 2 or x.shape[1] != 8192 or x.dtype != torch.bfloat16 or not x.is_cuda or not x.is_contiguous():
+        return None
+    if x.device != st['weight'].device or x.data_ptr() % 16:
+        return None
+    m = x.shape[0]
+    if not 1 <= m <= 256:
+        return None
+    if m == 1:
+        return rt2_run_candidate(x,st,-1)
+    if m <= 16:
+        return rt2_run_small_candidate(x,st)
+    return rt2_run_candidate(x,st,0 if m <= 32 else 1 if m <= 64 else 2 if m <= 128 else 3)
+
+rt2_ROUTER_SCALAR = r'''
+template<int M, int NT, int ST>
+__global__ void rt2_scalar_kernel(const float* __restrict__ w, const __nv_bfloat16* __restrict__ x,
+                                float* __restrict__ y, int m) {
+  constexpr int K=8192;
+  int tid=threadIdx.x, row=blockIdx.x, lane=tid&31, warp=tid>>5;
+  float acc[M][4]={};
+  float4 ww[ST];
+  uint2 xx[ST][M];
+  auto ld=[&](int slot,int i) {
+    ww[slot]=reinterpret_cast<const float4*>(w+row*K)[i];
+    #pragma unroll
+    for(int t=0;t<M;t++) {
+      if(t<m) xx[slot][t]=reinterpret_cast<const uint2*>(x+t*K)[i];
+    }
+  };
+  #pragma unroll
+  for(int s=0;s<ST;s++) ld(s,tid+s*NT);
+  #pragma unroll 1
+  for(int base=tid;base<K/4;base+=ST*NT) {
+    #pragma unroll
+    for(int s=0;s<ST;s++) {
+      float4 v=ww[s];
+      uint2 a[M];
+      #pragma unroll
+      for(int t=0;t<M;t++) a[t]=xx[s][t];
+      if(base+(s+ST)*NT<K/4) ld(s,base+(s+ST)*NT);
+      #pragma unroll
+      for(int t=0;t<M;t++) if(t<m) {
+        __nv_bfloat162 z0=*reinterpret_cast<__nv_bfloat162*>(&a[t].x);
+        __nv_bfloat162 z1=*reinterpret_cast<__nv_bfloat162*>(&a[t].y);
+        float2 f0=__bfloat1622float2(z0),f1=__bfloat1622float2(z1);
+        acc[t][0]=fmaf(v.x,f0.x,acc[t][0]);
+        acc[t][1]=fmaf(v.y,f0.y,acc[t][1]);
+        acc[t][2]=fmaf(v.z,f1.x,acc[t][2]);
+        acc[t][3]=fmaf(v.w,f1.y,acc[t][3]);
+      }
+    }
+  }
+  __shared__ float sums[M][NT/32];
+  #pragma unroll
+  for(int t=0;t<M;t++) if(t<m) {
+    float v=(acc[t][0]+acc[t][1])+(acc[t][2]+acc[t][3]);
+    #pragma unroll
+    for(int d=16;d;d>>=1) v+=__shfl_down_sync(0xffffffff,v,d);
+    if(lane==0) sums[t][warp]=v;
+  }
+  __syncthreads();
+  if(warp==0) {
+    #pragma unroll
+    for(int t=0;t<M;t++) if(t<m) {
+      float v=lane<NT/32?sums[t][lane]:0.f;
+      #pragma unroll
+      for(int d=16;d;d>>=1) v+=__shfl_down_sync(0xffffffff,v,d);
+      if(lane==0) y[t*256+row]=v;
+    }
+  }
+}
+
+int rt2_scalar(int64_t w,int64_t x,int64_t out,int m,int64_t stream,int query) {
+  auto kern=rt2_scalar_kernel<1,512,2>;
+  if(query==2) {
+    cudaFuncAttributes fa;
+    if(cudaFuncGetAttributes(&fa,kern)!=cudaSuccess) return -10;
+    return fa.numRegs*1000+(int)std::min<size_t>(fa.localSizeBytes,999);
+  }
+  if(m!=1) return -5;
+  kern<<<256,512,0,(cudaStream_t)stream>>>((const float*)w,(const __nv_bfloat16*)x,(float*)out,m);
+  return cudaGetLastError()==cudaSuccess?0:-8;
+}
+'''
+
+rt2_ROUTER_SMALL = r'''
+template<int MT,int S,int WK>
+__global__ __launch_bounds__(WK*32) void rt2_small_kernel(const int4* wp,const __nv_bfloat16* x,float* out,int m) {
+  constexpr int KU=128/S/WK, NI=MT*32;
+  const int tid=threadIdx.x,lane=tid&31,warp=tid>>5,rank=blockIdx.x%S,row=blockIdx.x/S*16;
+  const int gw=(rank*16+row/16)*WK+warp;
+  extern __shared__ __align__(16) unsigned char sm[];
+  float4* recv=(float4*)sm;
+  float4* part=recv+S*NI;
+  const uint32_t rb=rt2_smem(sm+(S+WK)*NI*16);
+  int4 w[KU][8];uint4 xx[KU][MT][2];
+#pragma unroll
+  for(int k=0;k<KU;k++) {
+#pragma unroll
+    for(int j=0;j<8;j++) {
+      const int4* p=wp+((k*(16*S*WK)+gw)*8+j)*32+lane;
+      asm volatile("ld.global.nc.L1::no_allocate.v4.s32 {%0,%1,%2,%3}, [%4];":"=r"(w[k][j].x),"=r"(w[k][j].y),"=r"(w[k][j].z),"=r"(w[k][j].w):"l"(p));
+    }
+#pragma unroll
+    for(int n=0;n<MT;n++) {
+      const __nv_bfloat16* p=x+min(n*8+(lane>>2),m-1)*8192+((rank*WK+warp)*KU+k)*64+(lane&3)*16;
+#pragma unroll
+      for(int h=0;h<2;h++) asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];":"=r"(xx[k][n][h].x),"=r"(xx[k][n][h].y),"=r"(xx[k][n][h].z),"=r"(xx[k][n][h].w):"l"(p+h*8));
+    }
+  }
+  if(rank==0 && tid==0) {rt2_init(rb,1);asm volatile("fence.proxy.async.shared::cta;" :::"memory");}
+  if(rank==0 && warp==0) __syncwarp();
+  if(rank==0 && tid==0) {rt2_expect(rb,(S-1)*NI*16);asm volatile("fence.mbarrier_init.release.cluster;" :::"memory");}
+  asm volatile("barrier.cluster.arrive.relaxed.aligned;" :::"memory");
+  float c[2][MT][4]={};
+#pragma unroll
+  for(int k=0;k<KU;k++) {
+#pragma unroll
+    for(int n=0;n<MT;n++) {
+      uint32_t b[8]={xx[k][n][0].x,xx[k][n][0].y,xx[k][n][0].z,xx[k][n][0].w,xx[k][n][1].x,xx[k][n][1].y,xx[k][n][1].z,xx[k][n][1].w};
+#pragma unroll
+      for(int q=0;q<4;q++) {
+#pragma unroll
+        for(int h=0;h<2;h++) {
+          const int4 a=w[k][q+h*4];
+          asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                       :"+f"(c[h][n][0]),"+f"(c[h][n][1]),"+f"(c[h][n][2]),"+f"(c[h][n][3]):"r"(a.x),"r"(a.y),"r"(a.z),"r"(a.w),"r"(b[2*q]),"r"(b[2*q+1]));
+        }
+      }
+    }
+  }
+#pragma unroll
+  for(int n=0;n<MT;n++) part[warp*NI+n*32+lane]=make_float4(c[0][n][0]+c[1][n][0],c[0][n][1]+c[1][n][1],c[0][n][2]+c[1][n][2],c[0][n][3]+c[1][n][3]);
+  __syncthreads();
+  asm volatile("barrier.cluster.wait.acquire.aligned;" :::"memory");
+  for(int v=tid;v<NI;v+=WK*32) {
+    float4 sum=make_float4(0,0,0,0);
+#pragma unroll
+    for(int k=0;k<WK;k++) rt2_add(sum,part[k*NI+v]);
+    if(rank==0)recv[v]=sum;
+    else rt2_push(rt2_map(rt2_smem(recv+rank*NI+v),0),sum,rt2_map(rb,0));
+  }
+  if(rank==0) {
+    __syncthreads();rt2_wait(rb,0);
+    for(int v=tid;v<NI;v+=WK*32) {
+      float4 sum=make_float4(0,0,0,0);
+#pragma unroll
+      for(int s=0;s<S;s++) rt2_add(sum,recv[s*NI+v]);
+      const int ln=v%32,tok=(v/32)*8+(ln&3)*2,wr=row+(ln>>2);
+      if(tok<m){out[tok*256+wr]=sum.x;out[tok*256+wr+8]=sum.z;}
+      if(tok+1<m){out[(tok+1)*256+wr]=sum.y;out[(tok+1)*256+wr+8]=sum.w;}
+    }
+  }
+}
+
+template<int MT,int S,int WK>
+int rt2_small_t(int64_t w,int64_t x,int64_t out,int m,int64_t stream,int query) {
+  auto fn=rt2_small_kernel<MT,S,WK>;
+  constexpr int bytes=(S+WK)*MT*512+16;
+  static bool configured=false;
+  if(!configured){cudaFuncSetAttribute(fn,cudaFuncAttributeMaxDynamicSharedMemorySize,bytes);cudaFuncSetAttribute(fn,cudaFuncAttributeNonPortableClusterSizeAllowed,1);configured=true;}
+  if(query==2){cudaFuncAttributes fa;cudaFuncGetAttributes(&fa,fn);return fa.numRegs*1000+fa.localSizeBytes;}
+  cudaLaunchConfig_t cfg={};cfg.gridDim=dim3(16*S);cfg.blockDim=dim3(WK*32);cfg.dynamicSmemBytes=bytes;cfg.stream=(cudaStream_t)stream;
+  cudaLaunchAttribute at;at.id=cudaLaunchAttributeClusterDimension;at.val.clusterDim={S,1,1};cfg.attrs=&at;cfg.numAttrs=1;
+  return (int)cudaLaunchKernelEx(&cfg,fn,(const int4*)w,(const __nv_bfloat16*)x,(float*)out,m);
+}
+int rt2_small(int64_t w,int64_t x,int64_t out,int m,int s,int wk,int64_t stream,int query) {
+#define rt2_RSM(S,W) if(s==S && wk==W) {if(m<=8)return rt2_small_t<1,S,W>(w,x,out,m,stream,query);if(m<=16)return rt2_small_t<2,S,W>(w,x,out,m,stream,query);if(m<=32)return rt2_small_t<4,S,W>(w,x,out,m,stream,query);}
+rt2_RSM(8,8) rt2_RSM(16,8) rt2_RSM(16,4)
+return -99;
+}
+
+'''
+
+def rt2_pack_small_router(w, s=16, wk=8):
+    hi=w.to(torch.bfloat16);lo=(w-hi.float()).to(torch.bfloat16)
+    def units(v):
+        v=v.view(16,2,8,128,4,4,2,2).permute(0,3,2,4,5,6,1,7).reshape(16,128,32,4,8)
+        return v.permute(0,1,3,2,4)
+    data=torch.cat([units(hi),units(lo)],dim=2).contiguous()
+    ku=128//s//wk
+    return data.view(16,s,wk,ku,8,32,8).permute(3,1,0,2,4,5,6).contiguous()
+
+def rt2_run_small_candidate(x,st,s=16,wk=8):
+    out=torch.empty((x.shape[0],256),dtype=torch.float32,device=x.device)
+    rc=st['ext'].rt2_small(st['small'][s,wk].data_ptr(),x.data_ptr(),out.data_ptr(),x.shape[0],s,wk,torch.cuda.current_stream().cuda_stream,0)
+    if rc:raise RuntimeError(f'router small launch failed: {rc}')
+    return out
+
+
+
+def _fallback(x: torch.Tensor, layer: str, n: int, state: dict) -> torch.Tensor:
+    if layer != "router":
+        return _bf16_gemm_dispatch_impl(x, state[layer][:n], None)
+    if x.shape[0] <= 8:
+        return F.linear(x.float(), state["router_weight"])
+    out = torch.mm(x, state["router_hi_t"], out_dtype=torch.float32)
+    out += torch.mm(x, state["router_lo_t"], out_dtype=torch.float32)
+    return out
+
+def _base_state(weights: Weights) -> dict:
+    state = {name: w.contiguous() for name, w in weights.items()}
+    hi = weights["router"].to(torch.bfloat16)
     state["router_hi_t"] = hi.t().contiguous()
-    state["router_lo_t"] = lo.t().contiguous()
-
-    device = router.device
-    state["ext"] = None
-    state["use_pdl"] = False
-    state["mm_backend"] = None
-    state["mm_bf16"] = None
-    state["router_partial"] = None
-    state["gemv_partial"] = None
-    state["nosplit_qkv"] = set()
-    state["nosplit_ws"] = None
-    if device.type == "cuda":
-        major, _ = torch.cuda.get_device_capability(device)
-        state["use_pdl"] = major >= 9
-        try:
-            state["ext"] = _build_ext(device)
-        except Exception:
-            state["ext"] = None
-        state["mm_backend"] = _probe_mm_bf16_backend(device)
-        if state["mm_backend"] is not None:
-            from flashinfer.gemm import mm_bf16
-
-            state["mm_bf16"] = mm_bf16
-        ext = state["ext"]
-        if ext is not None:
-            state["router_partial"] = torch.empty(8 * 1024 * 256, dtype=torch.float32, device=device)
-            state["gemv_partial"] = torch.empty(4 * 1024, dtype=torch.float32, device=device)
-            Wt = state["qkv_gate_t"]
-            k, n = Wt.shape
-            picks = [(m, int(ext.bf16_mm_pick_nosplit(m, n, k))) for m in (16, 32)]
-            picks = [(m, ws) for m, ws in picks if ws >= 0]
-            if picks:
-                buf = torch.empty(max(ws for _, ws in picks), dtype=torch.uint8, device=device)
-                kept = set()
-                for m, _ws in picks:
-                    xw = torch.randn(m, k, dtype=torch.bfloat16, device=device)
-                    ref = torch.empty(m, n, dtype=torch.bfloat16, device=device)
-                    alt = torch.empty(m, n, dtype=torch.bfloat16, device=device)
-                    ref_us = _graph_median_ms(lambda: torch.mm(xw, Wt, out=ref))
-                    alt_us = _graph_median_ms(lambda: ext.bf16_mm_run_nosplit(xw, Wt, alt, buf))
-                    if ref_us is not None and alt_us is not None and alt_us < ref_us:
-                        kept.add(m)
-                if kept:
-                    state["nosplit_qkv"] = kept
-                    state["nosplit_ws"] = buf
+    state["router_lo_t"] = (weights["router"] - hi.float()).to(torch.bfloat16).t().contiguous()
+    state["router_weight"] = weights["router"]
     return state
 
+def prepare(weights: Weights) -> dict:
+    state = _base_state(weights)
+    state["router_k"] = prepare_router(weights)
+    state["router2"] = prepare_router2(weights)
+    torch.cuda.synchronize(weights["qkv_gate"].device)
+    return state
 
-def kernel_fn(data: Inputs, state: dict[str, Any]) -> torch.Tensor:
-    x, layer = data["x"], data["config"]["layer"]
+def kernel_fn(data: Inputs, state: dict) -> torch.Tensor:
+    x, layer, n = data["x"], data["config"]["layer"], data["config"]["n"]
+    out = None
     if layer == "router":
-        m = x.numel() // x.shape[-1]
-        ext = state["ext"]
-        if ext is not None and state["router_partial"] is not None and (
-            1 <= m <= ROUTER_FP32_MAX_TOKENS or m == 16
-        ):
-            x2 = _align16(x.view(m, -1))
-            out = torch.empty((m, state["router"].shape[0]), dtype=torch.float32, device=x.device)
-            ext.router_fp32_splitk(x2, state["router"], state["router_partial"], out)
-            return out
-        if m <= ROUTER_FP32_MAX_TOKENS:
-            return F.linear(x.float(), state["router"])
-        acc = torch.mm(x, state["router_hi_t"], out_dtype=torch.float32)
-        acc += torch.mm(x, state["router_lo_t"], out_dtype=torch.float32)
-        return acc
+        m = x.shape[0]
+        if 65 <= m <= 192:
+            out = run_router2(x, layer, n, state["router2"])
+        if out is None:
+            out = run_router(x, layer, n, state["router_k"])
+    return _fallback(x, layer, n, state) if out is None else out
 
-    n = data["config"]["n"]
-    W = state[layer][:n]
-    m = x.numel() // x.shape[-1]
-    ext = state["ext"]
-    if (
-        ext is not None
-        and _use_hopper_bf16_gemv(m, W.shape[0], W.shape[1])
-        and x.is_contiguous()
-        and W.is_contiguous()
-        and x.data_ptr() % 16 == 0
-        and W.data_ptr() % 16 == 0
-    ):
-        x1 = _align16(x.view(-1, x.shape[-1]))
-        out = torch.empty((1, W.shape[0]), dtype=x.dtype, device=x.device)
-        if W.shape[0] == 1024 and W.shape[1] == 4096 and state["gemv_partial"] is not None:
-            ext.hopper_bf16_gemv_splitk(x1, W, out, state["gemv_partial"])
-        else:
-            ext.hopper_bf16_gemv(x1, W, out, bool(state["use_pdl"]))
-        return out.view(*x.shape[:-1], -1)
-
-    if layer == "qkv_gate" and m in state["nosplit_qkv"]:
-        x2 = x.view(-1, x.shape[-1])
-        out = torch.empty(x2.shape[0], n, dtype=x.dtype, device=x.device)
-        state["ext"].bf16_mm_run_nosplit(x2, state["qkv_gate_t"][:, :n], out, state["nosplit_ws"])
-        return out.view(*x.shape[:-1], n)
-
-    if state["mm_bf16"] is not None and (layer, m) in _MM_BF16:
-        return state["mm_bf16"](
-            x.view(-1, x.shape[-1]), state[f"{layer}_t"][:, :n], backend=state["mm_backend"]
-        ).view(*x.shape[:-1], n)
-
-    return F.linear(x, W, None)
+SELECTED_ROUTES = [{"m": m, "layer": "router", "name": "router_hi_lo", "module": "router"} for m in (1, 8, 16, 32, 128, 256)]
