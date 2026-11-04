@@ -1,35 +1,21 @@
 # okc: problem=muse_bf16_proj
+"""Piece submission extracted from proven mega paste; unclaimed shapes fall back to SGLang."""
 
-from __future__ import annotations
-
-from pathlib import Path
-from typing import Any, TypedDict
+import hashlib
+import zlib
+from typing import TypedDict
 
 import torch
 import torch.nn.functional as F
 from torch.utils.cpp_extension import load_inline
-
-ROUTER_FP32_MAX_TOKENS = 8
-
-_MM_BF16 = frozenset({
-    ("pooler", 8), ("pooler", 16), ("pooler", 32), ("pooler", 128), ("pooler", 256),
-    ("unpooler", 16), ("unpooler", 32), ("unpooler", 128), ("unpooler", 256),
-    ("qkv_gate", 16), ("qkv_gate", 32), ("qkv_gate", 128), ("qkv_gate", 256),
-    ("o", 128), ("o", 256),
-})
-
-# Same gates as sglang.kernels.ops.gemm.hopper_bf16_gemv
-_MAX_K = 17408
-_MAX_N = 65536
-
+from sglang.srt.layers.quantization.unquant import _bf16_gemm_dispatch_impl
 
 class Weights(TypedDict):
     qkv_gate: torch.Tensor  # bfloat16 [2304, 8192]
     o: torch.Tensor         # bfloat16 [8192, 1024]
     pooler: torch.Tensor    # bfloat16 [4096, 8192]
-    unpooler: torch.Tensor  # bfloat16 [8192, 4096]; up to 8 tokens, only rows 0-1023
+    unpooler: torch.Tensor  # bfloat16 [8192, 4096]
     router: torch.Tensor    # float32 [256, 8192]
-
 
 class Config(TypedDict):
     m: int
@@ -37,747 +23,713 @@ class Config(TypedDict):
     k: int
     layer: str
 
-
 class Inputs(TypedDict):
-    x: torch.Tensor  # bfloat16 [M, K]
+    x: torch.Tensor
     config: Config
 
-
-# Original hopper_bf16_gemv.cuh body, torch host launch, Muse (N,K) instantiations.
-# sgl_kernel / tvm deps replaced with equivalent CUDA + ATen helpers (algorithm unchanged).
-_CUDA_SRC = r"""
+tt_lt__LT_CPP = r'''
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cublasLt.h>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include <algorithm>
+#include <array>
+#include <memory>
+#include <set>
+#include <vector>
 
-#include <cstdint>
-#include <unordered_map>
-#include <utility>
+#define LT_OK(call) TORCH_CHECK((call) == CUBLAS_STATUS_SUCCESS, "cuBLASLt failure: ", #call)
 
-using bf16_t = __nv_bfloat16;
-using bf16x2_t = __nv_bfloat162;
-using fp32_t = float;
-using fp32x2_t = float2;
+using Config = std::array<int64_t, 9>;
 
-template <typename To, typename From>
-__device__ __forceinline__ To cast(From v);
-
-template <>
-__device__ __forceinline__ fp32x2_t cast<fp32x2_t, bf16x2_t>(bf16x2_t v) {
-  return __bfloat1622float2(v);
-}
-
-template <>
-__device__ __forceinline__ bf16_t cast<bf16_t, fp32_t>(fp32_t v) {
-  return __float2bfloat16_rn(v);
-}
-
-template <bool kUsePDL>
-__device__ __forceinline__ void PDLWaitPrimary() {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-  if constexpr (kUsePDL) {
-    asm volatile("griddepcontrol.wait;" ::: "memory");
-  }
-#endif
-}
-
-template <bool kUsePDL>
-__device__ __forceinline__ void PDLTriggerSecondary() {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-  if constexpr (kUsePDL) {
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-  }
-#endif
-}
-
-// ---- from sglang hopper_bf16_gemv.cuh ----
-constexpr uint32_t kGemvVecSize = 16 / sizeof(bf16_t);  // 8 bf16 per 16B load
-
-// .cg: L2 resident, L1 bypass. __ldcs is evict-first and drops W before the next graph replay.
-__device__ __forceinline__ float4 ldg16_cg(const void* p) {
-  float4 r;
-  asm volatile("ld.global.cg.v4.f32 {%0, %1, %2, %3}, [%4];\n"
-               : "=f"(r.x), "=f"(r.y), "=f"(r.z), "=f"(r.w)
-               : "l"(p));
-  return r;
-}
-
-__device__ __forceinline__ float4 lds16(const void* p) {
-  float4 r;
-  unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(p));
-  asm volatile("ld.shared.v4.f32 {%0, %1, %2, %3}, [%4];\n"
-               : "=f"(r.x), "=f"(r.y), "=f"(r.z), "=f"(r.w)
-               : "r"(addr));
-  return r;
-}
-
-__device__ __forceinline__ void sts16(void* p, float4 v) {
-  unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(p));
-  asm volatile("st.shared.v4.f32 [%0], {%1, %2, %3, %4};\n" ::"r"(addr), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w));
-}
-
-__device__ __forceinline__ float2 cvt_bf16x2(unsigned v) {
-  float a, b;
-  asm volatile("{\n\t.reg .b16 lo, hi;\n\tmov.b32 {lo, hi}, %2;\n\t"
-               "cvt.rn.f32.bf16 %0, lo;\n\tcvt.rn.f32.bf16 %1, hi;\n\t}\n"
-               : "=f"(a), "=f"(b)
-               : "r"(v));
-  return float2{a, b};
-}
-
-__device__ __forceinline__ float fma_rn(float a, float b, float c) {
-  float d;
-  asm volatile("fma.rn.f32 %0, %1, %2, %3;\n" : "=f"(d) : "f"(a), "f"(b), "f"(c));
-  return d;
-}
-
-__device__ __forceinline__ float dot8_f32(float4 wv, float4 xv) {
-  unsigned w[4] = {__float_as_uint(wv.x), __float_as_uint(wv.y), __float_as_uint(wv.z), __float_as_uint(wv.w)};
-  unsigned x[4] = {__float_as_uint(xv.x), __float_as_uint(xv.y), __float_as_uint(xv.z), __float_as_uint(xv.w)};
-  float acc = 0.f;
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    float2 wf = cvt_bf16x2(w[i]);
-    float2 xf = cvt_bf16x2(x[i]);
-    acc = fma_rn(wf.x, xf.x, acc);
-    acc = fma_rn(wf.y, xf.y, acc);
-  }
-  return acc;
-}
-
-template <uint32_t N, uint32_t K, uint32_t kRows, uint32_t kUnroll, uint32_t kNumWarps, bool kUsePDL>
-__global__ void __launch_bounds__(kNumWarps * 32)
-    hopper_bf16_gemv_kernel(bf16_t* __restrict__ out, const bf16_t* __restrict__ x, const bf16_t* __restrict__ w) {
-  __shared__ __align__(16) bf16_t sx[K];
-
-  PDLTriggerSecondary<kUsePDL>();
-  const uint32_t tid = threadIdx.x;
-  PDLWaitPrimary<kUsePDL>();
-  for (uint32_t i = tid * kGemvVecSize; i < K; i += kNumWarps * 32 * kGemvVecSize) {
-    sts16(sx + i, ldg16_cg(x + i));
-  }
-  __syncthreads();
-
-  const uint32_t warp = tid / 32;
-  const uint32_t lane = tid % 32;
-  const uint32_t r0 = (blockIdx.x * kNumWarps + warp) * kRows;
-  if (r0 >= N) {
-    return;
-  }
-
-  float acc[kRows];
-#pragma unroll
-  for (uint32_t r = 0; r < kRows; ++r) {
-    acc[r] = 0.0f;
-  }
-
-  constexpr uint32_t kStep = 32 * kGemvVecSize * kUnroll;
-  if (r0 + kRows <= N) {
-    for (uint32_t k = lane * kGemvVecSize * kUnroll; k < K; k += kStep) {
-      float4 xv[kUnroll];
-#pragma unroll
-      for (uint32_t u = 0; u < kUnroll; ++u) xv[u] = lds16(sx + k + u * kGemvVecSize);
-#pragma unroll
-      for (uint32_t r = 0; r < kRows; ++r) {
-        const bf16_t* wr = w + static_cast<size_t>(r0 + r) * K + k;
-#pragma unroll
-        for (uint32_t u = 0; u < kUnroll; ++u) {
-          acc[r] += dot8_f32(ldg16_cg(wr + u * kGemvVecSize), xv[u]);
-        }
-      }
+Config config_of(const cublasLtMatmulAlgo_t& a) {
+  Config c{};
+  for (int i = 0; i < 9; ++i) {
+    size_t written = 0;
+    if (i >= 7) {
+      uint16_t value = 0;
+      cublasLtMatmulAlgoConfigGetAttribute(&a, (cublasLtMatmulAlgoConfigAttributes_t)i,
+                                          &value, sizeof(value), &written);
+      c[i] = value;
+    } else {
+      uint32_t value = 0;
+      cublasLtMatmulAlgoConfigGetAttribute(&a, (cublasLtMatmulAlgoConfigAttributes_t)i,
+                                          &value, sizeof(value), &written);
+      c[i] = value;
     }
-  } else {
-    for (uint32_t k = lane * kGemvVecSize * kUnroll; k < K; k += kStep) {
-#pragma unroll
-      for (uint32_t r = 0; r < kRows; ++r) {
-        if (r0 + r < N) {
-          const bf16_t* wr = w + static_cast<size_t>(r0 + r) * K + k;
-#pragma unroll
-          for (uint32_t u = 0; u < kUnroll; ++u) {
-            acc[r] += dot8_f32(ldg16_cg(wr + u * kGemvVecSize), lds16(sx + k + u * kGemvVecSize));
+  }
+  return c;
+}
+
+bool set_config(cublasLtMatmulAlgo_t& a, int attr, int value) {
+  if (attr >= 7) {
+    uint16_t v = value;
+    return cublasLtMatmulAlgoConfigSetAttribute(&a,
+      (cublasLtMatmulAlgoConfigAttributes_t)attr, &v, sizeof(v)) == CUBLAS_STATUS_SUCCESS;
+  }
+  uint32_t v = value;
+  return cublasLtMatmulAlgoConfigSetAttribute(&a,
+    (cublasLtMatmulAlgoConfigAttributes_t)attr, &v, sizeof(v)) == CUBLAS_STATUS_SUCCESS;
+}
+
+std::vector<uint32_t> cap_list(const cublasLtMatmulAlgo_t& a, cublasLtMatmulAlgoCapAttributes_t attr) {
+  size_t bytes = 0;
+  cublasLtMatmulAlgoCapGetAttribute(&a, attr, nullptr, 0, &bytes);
+  if (!bytes) return {0};
+  std::vector<uint32_t> values(bytes / sizeof(uint32_t));
+  if (cublasLtMatmulAlgoCapGetAttribute(&a, attr, values.data(), bytes, &bytes) != CUBLAS_STATUS_SUCCESS)
+    return {0};
+  return values;
+}
+
+uint32_t cap_int(const cublasLtMatmulAlgo_t& a, cublasLtMatmulAlgoCapAttributes_t attr) {
+  uint32_t v = 0;
+  size_t written = 0;
+  cublasLtMatmulAlgoCapGetAttribute(&a, attr, &v, sizeof(v), &written);
+  return v;
+}
+
+struct LtContext {
+  cublasLtHandle_t handle = nullptr;
+  torch::Tensor workspace;
+  explicit LtContext(torch::Tensor ws) : workspace(ws) {
+    c10::cuda::CUDAGuard guard(ws.device());
+    LT_OK(cublasLtCreate(&handle));
+  }
+  ~LtContext() { if (handle) cublasLtDestroy(handle); }
+};
+
+struct LtPlan {
+  std::shared_ptr<LtContext> context;
+  cublasLtMatmulDesc_t operation = nullptr;
+  cublasLtMatrixLayout_t a_layout = nullptr, b_layout = nullptr, d_layout = nullptr;
+  torch::Tensor weight, bias;
+  int m, n, k, layout, epilogue;
+  std::vector<cublasLtMatmulAlgo_t> algorithms;
+  std::vector<size_t> workspaces;
+  std::set<Config> seen;
+  std::vector<std::vector<int64_t>> diagnostics;
+  int checked = 0, heuristic_count = 0, id_count = 0;
+
+  LtPlan(std::shared_ptr<LtContext> ctx, torch::Tensor w, int rows, int cols,
+         int inner, int variant, int epi)
+      : context(ctx), weight(w), m(rows), n(cols), k(inner), layout(variant), epilogue(epi) {
+    c10::cuda::CUDAGuard guard(w.device());
+    LT_OK(cublasLtMatmulDescCreate(&operation, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    int8_t fast = 0;
+    LT_OK(cublasLtMatmulDescSetAttribute(operation, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fast, sizeof(fast)));
+    bool is_row = layout % 2;
+    bool is_packed = layout >= 2;
+    cublasOperation_t trans_a = !is_row && !is_packed ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasOperation_t trans_b = is_row && !is_packed ? CUBLAS_OP_T : CUBLAS_OP_N;
+    LT_OK(cublasLtMatmulDescSetAttribute(operation, CUBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)));
+    LT_OK(cublasLtMatmulDescSetAttribute(operation, CUBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)));
+    if (is_row) {
+      LT_OK(cublasLtMatrixLayoutCreate(&a_layout, CUDA_R_16BF, m, k, k));
+      LT_OK(cublasLtMatrixLayoutCreate(&b_layout, CUDA_R_16BF, is_packed ? k : n,
+                                      is_packed ? n : k, is_packed ? n : k));
+      LT_OK(cublasLtMatrixLayoutCreate(&d_layout, CUDA_R_16BF, m, n, n));
+      cublasLtOrder_t order = CUBLASLT_ORDER_ROW;
+      for (auto d : {a_layout, b_layout, d_layout})
+        LT_OK(cublasLtMatrixLayoutSetAttribute(d, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)));
+    } else {
+      LT_OK(cublasLtMatrixLayoutCreate(&a_layout, CUDA_R_16BF, is_packed ? n : k,
+                                      is_packed ? k : n, is_packed ? n : k));
+      LT_OK(cublasLtMatrixLayoutCreate(&b_layout, CUDA_R_16BF, k, m, k));
+      LT_OK(cublasLtMatrixLayoutCreate(&d_layout, CUDA_R_16BF, n, m, n));
+    }
+    cublasLtEpilogue_t e = epi ? CUBLASLT_EPILOGUE_BIAS : CUBLASLT_EPILOGUE_DEFAULT;
+    LT_OK(cublasLtMatmulDescSetAttribute(operation, CUBLASLT_MATMUL_DESC_EPILOGUE, &e, sizeof(e)));
+    if (epi) {
+      bias = torch::zeros({std::max(m, n)}, w.options());
+      void* ptr = bias.data_ptr();
+      LT_OK(cublasLtMatmulDescSetAttribute(operation, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &ptr, sizeof(ptr)));
+    }
+  }
+
+  ~LtPlan() {
+    if (operation) cublasLtMatmulDescDestroy(operation);
+    if (a_layout) cublasLtMatrixLayoutDestroy(a_layout);
+    if (b_layout) cublasLtMatrixLayoutDestroy(b_layout);
+    if (d_layout) cublasLtMatrixLayoutDestroy(d_layout);
+  }
+
+  bool add(const cublasLtMatmulAlgo_t& algo) {
+    Config c = config_of(algo);
+    if (seen.count(c)) return false;
+    seen.insert(c);
+    ++checked;
+    if (diagnostics.size() < 32) {
+      uint64_t flags = 0;
+      size_t written = 0;
+      int status = cublasLtMatmulAlgoCapGetAttribute(&algo, CUBLASLT_ALGO_CAP_NUMERICAL_IMPL_FLAGS,
+        &flags, sizeof(flags), &written);
+      std::vector<int64_t> row(c.begin(), c.end());
+      row.push_back(flags);
+      row.push_back(status);
+      diagnostics.push_back(row);
+    }
+    if (c[3] != CUBLASLT_REDUCTION_SCHEME_NONE && c[3] != CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE)
+      return false;
+    if (c[2] > 1 && c[3] != CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE) return false;
+    uint64_t flags = 0;
+    size_t written = 0;
+    if (cublasLtMatmulAlgoCapGetAttribute(&algo, CUBLASLT_ALGO_CAP_NUMERICAL_IMPL_FLAGS,
+                                         &flags, sizeof(flags), &written) != CUBLAS_STATUS_SUCCESS) return false;
+    if ((flags & CUBLASLT_NUMERICAL_IMPL_FLAGS_ACCUMULATOR_TYPE_MASK) != CUBLASLT_NUMERICAL_IMPL_FLAGS_ACCUMULATOR_32F)
+      return false;
+    // Algo 66 reports INPUT_16F even for CUDA_R_16BF descriptors in cuBLASLt 13.
+    // The descriptors fix BF16 storage; reject TF32 and require FP32 accumulators.
+    if (flags & CUBLASLT_NUMERICAL_IMPL_FLAGS_INPUT_TF32)
+      return false;
+    cublasLtMatmulHeuristicResult_t result{};
+    if (cublasLtMatmulAlgoCheck(context->handle, operation, a_layout, b_layout,
+                               d_layout, d_layout, &algo, &result) != CUBLAS_STATUS_SUCCESS) return false;
+    if (result.state != CUBLAS_STATUS_SUCCESS || result.workspaceSize > size_t(context->workspace.numel())) return false;
+    algorithms.push_back(algo);
+    workspaces.push_back(result.workspaceSize);
+    return true;
+  }
+
+  int restore(std::vector<int64_t> values) {
+    TORCH_CHECK(values.size() == 9, "expected nine cuBLASLt configuration fields");
+    cublasLtMatmulAlgo_t algo{};
+    if (cublasLtMatmulAlgoInit(context->handle, CUBLAS_COMPUTE_32F, CUDA_R_32F,
+        CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF, values[0], &algo) != CUBLAS_STATUS_SUCCESS) return -1;
+    for (int i = 1; i < 9; ++i) {
+      if (!set_config(algo, i, values[i]) && values[i] != 0) return -1;
+    }
+    if (!add(algo)) return -1;
+    return algorithms.size() - 1;
+  }
+
+  void enumerate(bool exhaustive) {
+    c10::cuda::CUDAGuard guard(weight.device());
+    cublasLtMatmulPreference_t pref;
+    LT_OK(cublasLtMatmulPreferenceCreate(&pref));
+    uint32_t reduction = CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE;
+    LT_OK(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
+                                             &reduction, sizeof(reduction)));
+    for (size_t ws : {size_t(0), size_t(4 << 20), size_t(32 << 20), size_t(128 << 20)}) {
+      ws = std::min(ws, size_t(context->workspace.numel()));
+      LT_OK(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)));
+      std::vector<cublasLtMatmulHeuristicResult_t> result(256);
+      int count = 0;
+      auto rc = cublasLtMatmulAlgoGetHeuristic(context->handle, operation, a_layout, b_layout,
+                                               d_layout, d_layout, pref, 256, result.data(), &count);
+      if (rc != CUBLAS_STATUS_SUCCESS) continue;
+      heuristic_count += count;
+      for (int i = 0; i < count; ++i) if (result[i].state == CUBLAS_STATUS_SUCCESS) add(result[i].algo);
+    }
+    cublasLtMatmulPreferenceDestroy(pref);
+    if (!exhaustive) return;
+    std::array<int, 256> ids{};
+    LT_OK(cublasLtMatmulAlgoGetIds(context->handle, CUBLAS_COMPUTE_32F, CUDA_R_32F,
+      CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF, ids.size(), ids.data(), &id_count));
+    for (int i = 0; i < id_count; ++i) {
+      cublasLtMatmulAlgo_t a{};
+      if (cublasLtMatmulAlgoInit(context->handle, CUBLAS_COMPUTE_32F, CUDA_R_32F,
+          CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF, ids[i], &a) != CUBLAS_STATUS_SUCCESS) continue;
+      auto tiles = cap_list(a, CUBLASLT_ALGO_CAP_TILE_IDS);
+      auto stages = cap_list(a, CUBLASLT_ALGO_CAP_STAGES_IDS);
+      for (auto tile : tiles) for (auto stage : stages) {
+        auto b = a;
+        if (!set_config(b, 1, tile) || !set_config(b, 6, stage)) continue;
+        add(b);
+        if (tiles.size() > 100) {
+          for (int cluster : {2, 3, 4, 5, 6, 7, 8, 9, 11, 12}) {
+            auto s = b;
+            if (set_config(s, 8, cluster)) add(s);
           }
         }
       }
     }
   }
 
-#pragma unroll
-  for (uint32_t r = 0; r < kRows; ++r) {
-#pragma unroll
-    for (uint32_t off = 16; off > 0; off >>= 1) {
-      acc[r] += __shfl_down_sync(0xffffffff, acc[r], off);
-    }
-  }
-  if (lane == 0) {
-#pragma unroll
-    for (uint32_t r = 0; r < kRows; ++r) {
-      if (r0 + r < N) {
-        out[r0 + r] = cast<bf16_t>(acc[r]);
+  void expand(std::vector<int> indices) {
+    for (int index : indices) {
+      auto a = algorithms.at(index);
+      if (cap_int(a, CUBLASLT_ALGO_CAP_SPLITK_SUPPORT) &&
+          (cap_int(a, CUBLASLT_ALGO_CAP_REDUCTION_SCHEME_MASK) & CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE)) {
+        for (int split : {2, 3, 4, 6, 8, 12, 16}) {
+          auto b = a;
+          if (set_config(b, 2, split) && set_config(b, 3, CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE)) add(b);
+        }
+      }
+      auto stages = cap_list(a, CUBLASLT_ALGO_CAP_STAGES_IDS);
+      for (auto stage : stages) {
+        auto b = a;
+        if (set_config(b, 6, stage)) add(b);
+      }
+      for (int swizzle = 0; swizzle <= int(cap_int(a, CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT)); ++swizzle) {
+        for (int custom = 0; custom <= int(cap_int(a, CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX)); ++custom) {
+          for (int cluster : {0, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12}) {
+            auto b = a;
+            if (set_config(b, 4, swizzle) && set_config(b, 5, custom) && set_config(b, 8, cluster)) add(b);
+          }
+        }
       }
     }
   }
-}
 
-template <uint32_t N, uint32_t K, uint32_t kRows, uint32_t kUnroll, uint32_t kNumWarps, bool kUsePDL>
-void launch_gemv(bf16_t* out, const bf16_t* x, const bf16_t* w, cudaStream_t stream) {
-  constexpr uint32_t kRowsPerBlock = kRows * kNumWarps;
-  constexpr uint32_t kNumBlocks = (N + kRowsPerBlock - 1) / kRowsPerBlock;
-  constexpr uint32_t kThreads = kNumWarps * 32;
-  if constexpr (kUsePDL) {
-    cudaLaunchConfig_t cfg{};
-    cfg.gridDim = dim3(kNumBlocks);
-    cfg.blockDim = dim3(kThreads);
-    cfg.stream = stream;
-    cfg.dynamicSmemBytes = 0;
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = 1;
-    cfg.attrs = attrs;
-    cfg.numAttrs = 1;
-    cudaLaunchKernelEx(
-        &cfg,
-        hopper_bf16_gemv_kernel<N, K, kRows, kUnroll, kNumWarps, kUsePDL>,
-        out, x, w);
-  } else {
-    hopper_bf16_gemv_kernel<N, K, kRows, kUnroll, kNumWarps, kUsePDL>
-        <<<kNumBlocks, kThreads, 0, stream>>>(out, x, w);
+  std::vector<std::vector<int64_t>> metadata() const {
+    std::vector<std::vector<int64_t>> result;
+    for (size_t i = 0; i < algorithms.size(); ++i) {
+      Config c = config_of(algorithms[i]);
+      std::vector<int64_t> row(c.begin(), c.end());
+      row.push_back(workspaces[i]);
+      result.push_back(row);
+    }
+    return result;
   }
-}
 
-void hopper_bf16_gemv(torch::Tensor x, torch::Tensor w, torch::Tensor out, bool use_pdl) {
-  TORCH_CHECK(x.is_cuda() && w.is_cuda() && out.is_cuda());
-  TORCH_CHECK(x.scalar_type() == at::kBFloat16);
-  TORCH_CHECK(x.size(0) == 1);
-  const int N = w.size(0);
-  const int K = w.size(1);
-  TORCH_CHECK(out.size(0) == 1 && out.size(1) == N && w.size(1) == x.size(1));
-
-  auto* xp = reinterpret_cast<const bf16_t*>(x.data_ptr());
-  auto* wp = reinterpret_cast<const bf16_t*>(w.data_ptr());
-  auto* op = reinterpret_cast<bf16_t*>(out.data_ptr());
-  auto stream = at::cuda::getCurrentCUDAStream();
-
-  // Muse scored m=1 shapes + SGLang _config(n): rows,unroll,warps
-  // n>=8192 -> (2,2,8); else (1,2,8)
-#define DISPATCH(NN, KK, ROWS, UNROLL, WARPS)                                 \
-  do {                                                                        \
-    if (use_pdl)                                                              \
-      launch_gemv<NN, KK, ROWS, UNROLL, WARPS, true>(op, xp, wp, stream);     \
-    else                                                                      \
-      launch_gemv<NN, KK, ROWS, UNROLL, WARPS, false>(op, xp, wp, stream);    \
-    return;                                                                   \
-  } while (0)
-
-  if (N == 2304 && K == 8192) DISPATCH(2304, 8192, 1, 2, 8);  // l-m8-gate: unroll 2 (unroll 4 was 0.91x)
-  if (N == 8192 && K == 1024) DISPATCH(8192, 1024, 2, 2, 8);
-  if (N == 4096 && K == 8192) DISPATCH(4096, 8192, 1, 2, 8);
-  if (N == 1024 && K == 4096) DISPATCH(1024, 4096, 1, 2, 8);
-  if (N == 8192 && K == 4096) DISPATCH(8192, 4096, 2, 2, 8);
-
-  TORCH_CHECK(false, "hopper_bf16_gemv: unsupported Muse shape N=", N, " K=", K);
-#undef DISPATCH
-}
-
-static cublasLtHandle_t g_lt = nullptr;
-
-struct NosplitEntry {
-  cublasLtMatmulDesc_t op{};
-  cublasLtMatrixLayout_t Ad{}, Bd{}, Cd{};
-  cublasLtMatmulAlgo_t algo{};
-  size_t ws = 0;
+  int run(torch::Tensor x, torch::Tensor out, int index) {
+    const float alpha = 1.0f, beta = 0.0f;
+    const void* a = layout % 2 ? x.data_ptr() : weight.data_ptr();
+    const void* b = layout % 2 ? weight.data_ptr() : x.data_ptr();
+    return int(cublasLtMatmul(context->handle, operation, &alpha, a, a_layout, b, b_layout,
+      &beta, out.data_ptr(), d_layout, out.data_ptr(), d_layout, &algorithms.at(index),
+      context->workspace.data_ptr(), workspaces.at(index), at::cuda::getCurrentCUDAStream(x.get_device())));
+  }
 };
 
-static std::unordered_map<uint64_t, NosplitEntry> g_nosplit;
-
-static uint64_t nosplit_key(int64_t M, int64_t N, int64_t K) {
-  return (static_cast<uint64_t>(M) << 40) | (static_cast<uint64_t>(N) << 16) | static_cast<uint64_t>(K & 0xffff);
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("version", []() { return cublasLtGetVersion(); });
+  pybind11::class_<LtContext, std::shared_ptr<LtContext>>(m, "Context")
+    .def(pybind11::init<torch::Tensor>());
+  pybind11::class_<LtPlan, std::shared_ptr<LtPlan>>(m, "Plan")
+    .def(pybind11::init<std::shared_ptr<LtContext>, torch::Tensor, int, int, int, int, int>())
+    .def("enumerate", &LtPlan::enumerate).def("expand", &LtPlan::expand)
+    .def("metadata", &LtPlan::metadata).def("restore", &LtPlan::restore).def("run", &LtPlan::run)
+    .def_readonly("checked", &LtPlan::checked).def_readonly("heuristic_count", &LtPlan::heuristic_count)
+    .def_readonly("diagnostics", &LtPlan::diagnostics)
+    .def_readonly("id_count", &LtPlan::id_count);
 }
+'''
+tt_lt__LT_EXT = None
+tt_lt__LT_WORKSPACE_BYTES = 128 << 20
+tt_lt__LT_LAYERS = ('qkv_gate', 'o', 'pooler', 'unpooler')
+tt_lt__LT_H200_FIXED = {(256, 'o'): (2, 0, [66, 17, 1, 0, 0, 0, 35, 0, 2]), (128, 'unpooler'): (2, 0, [66, 18, 1, 0, 0, 3, 35, 0, 5]), (256, 'unpooler'): (3, 0, [66, 20, 1, 0, 0, 4, 35, 0, 2]), (128, 'qkv_gate'): (0, 0, [66, 92, 1, 0, 0, 0, 35, 0, 5]), (256, 'qkv_gate'): (0, 0, [66, 124, 1, 0, 0, 0, 35, 0, 2]), (128, 'pooler'): (2, 0, [66, 15, 1, 0, 0, 4, 35, 0, 2]), (256, 'pooler'): (3, 0, [66, 18, 1, 0, 0, 0, 35, 0, 2])}
+tt_lt__LT_H200_VERSION = 130101
+tt_lt__LT_SEARCH_SEEDS = {(128, 'qkv_gate'): [(2, 0, [66, 15, 1, 0, 0, 0, 35, 0, 2]), (2, 0, [66, 15, 1, 0, 0, 1, 35, 0, 2]), (2, 0, [66, 15, 1, 0, 0, 0, 35, 0, 4])], (128, 'o'): [(2, 0, [66, 18, 1, 0, 0, 4, 35, 0, 2]), (2, 0, [66, 17, 1, 0, 0, 0, 35, 0, 2]), (3, 0, [66, 18, 1, 0, 0, 2, 35, 0, 5]), (3, 0, [66, 18, 1, 0, 0, 5, 35, 0, 2])], (128, 'pooler'): [(2, 0, [66, 15, 1, 0, 0, 1, 35, 0, 2]), (2, 0, [66, 15, 1, 0, 0, 0, 35, 0, 2]), (2, 0, [66, 15, 1, 0, 0, 2, 35, 0, 5])], (128, 'unpooler'): [(2, 0, [66, 18, 1, 0, 0, 0, 35, 0, 2]), (2, 0, [66, 18, 1, 0, 0, 6, 35, 0, 5]), (2, 0, [66, 28, 1, 0, 0, 2, 35, 0, 2]), (3, 0, [66, 18, 1, 0, 0, 5, 35, 0, 2])], (256, 'qkv_gate'): [(0, 0, [66, 134, 1, 0, 0, 0, 35, 0, 9]), (1, 0, [66, 134, 1, 0, 0, 2, 35, 0, 9]), (0, 0, [66, 134, 1, 0, 0, 0, 35, 0, 2])], (256, 'o'): [(1, 0, [66, 20, 1, 0, 0, 7, 35, 0, 5]), (2, 0, [66, 20, 1, 0, 0, 4, 35, 0, 5]), (3, 0, [66, 20, 1, 0, 0, 5, 35, 0, 3]), (2, 0, [66, 20, 1, 0, 0, 0, 35, 0, 5])], (256, 'pooler'): [(3, 0, [66, 18, 1, 0, 0, 0, 35, 0, 2]), (3, 0, [66, 18, 1, 0, 0, 4, 35, 0, 3]), (0, 0, [66, 183, 1, 0, 0, 0, 35, 0, 8]), (0, 0, [66, 183, 1, 0, 0, 0, 35, 0, 9])], (256, 'unpooler'): [(2, 0, [66, 20, 1, 0, 0, 0, 35, 0, 5]), (2, 0, [66, 20, 1, 0, 0, 5, 35, 0, 2]), (3, 0, [66, 20, 1, 0, 0, 0, 35, 0, 3])]}
 
-static void ensure_lt() {
-  if (!g_lt) {
-    TORCH_CHECK(cublasLtCreate(&g_lt) == CUBLAS_STATUS_SUCCESS);
-  }
-}
+def tt_lt__lt_build():
+    global tt_lt__LT_EXT
+    if tt_lt__LT_EXT is None:
+        tt_lt__LT_EXT = load_inline(name='muse_cublaslt_v1', cpp_sources=tt_lt__LT_CPP, with_cuda=True, extra_cflags=['-O3', '-std=c++20'], extra_ldflags=['-l:libcublasLt.so.13'], verbose=False)
+    return tt_lt__LT_EXT
 
-static cublasStatus_t make_row_layout(cublasLtMatrixLayout_t* layout, cudaDataType_t dt, int rows, int cols) {
-  auto st = cublasLtMatrixLayoutCreate(layout, dt, rows, cols, cols);
-  if (st != CUBLAS_STATUS_SUCCESS) return st;
-  cublasLtOrder_t ord = CUBLASLT_ORDER_ROW;
-  return cublasLtMatrixLayoutSetAttribute(*layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &ord, sizeof(ord));
-}
+def tt_lt__lt_state(weights: dict) -> dict:
+    ext = tt_lt__lt_build()
+    device = weights['qkv_gate'].device
+    workspace = torch.empty(tt_lt__LT_WORKSPACE_BYTES, device=device, dtype=torch.uint8)
+    return {'ext': ext, 'version': ext.version(), 'context': ext.Context(workspace), 'configs': {}, 'weights': {name: weights[name].contiguous() for name in tt_lt__LT_LAYERS}, 'packed': {}, 'workspace': workspace}
 
-// Returns workspace bytes (>=0) on success; -1 if no nosplit algo. Caches descs for graph-safe run.
-int64_t bf16_mm_pick_nosplit(int64_t M, int64_t N, int64_t K) {
-  ensure_lt();
-  const uint64_t key = nosplit_key(M, N, K);
-  if (g_nosplit.count(key)) {
-    return static_cast<int64_t>(g_nosplit[key].ws);
-  }
+def tt_lt__lt_plan(st: dict, layer: str, m: int, layout: int, epilogue: int):
+    w = st['weights'][layer]
+    n, k = w.shape
+    if layout >= 2:
+        if layer not in st['packed']:
+            st['packed'][layer] = w.t().contiguous()
+        w = st['packed'][layer]
+    return st['ext'].Plan(st['context'], w, m, n, k, layout, epilogue)
 
-  NosplitEntry e;
-  TORCH_CHECK(cublasLtMatmulDescCreate(&e.op, CUBLAS_COMPUTE_32F, CUDA_R_32F) == CUBLAS_STATUS_SUCCESS);
-  cublasOperation_t t = CUBLAS_OP_N;
-  cublasLtMatmulDescSetAttribute(e.op, CUBLASLT_MATMUL_DESC_TRANSA, &t, sizeof(t));
-  cublasLtMatmulDescSetAttribute(e.op, CUBLASLT_MATMUL_DESC_TRANSB, &t, sizeof(t));
-  TORCH_CHECK(make_row_layout(&e.Ad, CUDA_R_16BF, (int)M, (int)K) == CUBLAS_STATUS_SUCCESS);
-  TORCH_CHECK(make_row_layout(&e.Bd, CUDA_R_16BF, (int)K, (int)N) == CUBLAS_STATUS_SUCCESS);
-  TORCH_CHECK(make_row_layout(&e.Cd, CUDA_R_16BF, (int)M, (int)N) == CUBLAS_STATUS_SUCCESS);
+def tt_lt_prepare_cublaslt(weights: dict) -> dict:
+    device = weights['qkv_gate'].device
+    props = torch.cuda.get_device_properties(device)
+    if (props.major, props.minor) != (9, 0) or not tt_lt__LT_H200_FIXED:
+        return {'configs': {}}
+    st = tt_lt__lt_state(weights)
+    if tt_lt__LT_H200_VERSION is not None and st['version'] != tt_lt__LT_H200_VERSION:
+        return {'configs': {}}
+    for key, descriptor in tt_lt__LT_H200_FIXED.items():
+        m, layer = key
+        layout, epilogue, config = descriptor
+        plan = tt_lt__lt_plan(st, layer, m, layout, epilogue)
+        index = plan.restore(list(config))
+        if index < 0 or plan.metadata()[index][:9] != list(config):
+            continue
+        x = torch.zeros((m, st['weights'][layer].shape[1]), device=device, dtype=torch.bfloat16)
+        out = torch.empty((m, st['weights'][layer].shape[0]), device=device, dtype=torch.bfloat16)
+        if plan.run(x, out, index) == 0:
+            st['configs'][key] = (plan, index)
+    torch.cuda.synchronize(device)
+    return st
 
-  cublasLtMatmulPreference_t pref;
-  TORCH_CHECK(cublasLtMatmulPreferenceCreate(&pref) == CUBLAS_STATUS_SUCCESS);
-  size_t ws_cap = 64ull << 20;
-  cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_cap, sizeof(ws_cap));
+def tt_lt_run_cublaslt(x: torch.Tensor, layer: str, n: int, st: dict) -> torch.Tensor | None:
+    entry = st['configs'].get((x.shape[0], layer))
+    if entry is None or not x.is_cuda or x.dtype != torch.bfloat16 or (not x.is_contiguous()):
+        return None
+    w = st['weights'][layer]
+    if x.device != w.device or w.dtype != torch.bfloat16 or tuple(w.shape) != (n, x.shape[1]) or x.data_ptr() % 256:
+        return None
+    out = torch.empty((x.shape[0], n), device=x.device, dtype=torch.bfloat16)
+    rc = entry[0].run(x, out, entry[1])
+    if rc:
+        raise RuntimeError(f'cuBLASLt launch failed: status {rc}')
+    return out
 
-  cublasLtMatmulHeuristicResult_t heur[64];
-  int nres = 0;
-  auto st = cublasLtMatmulAlgoGetHeuristic(g_lt, e.op, e.Ad, e.Bd, e.Cd, e.Cd, pref, 64, heur, &nres);
-  int64_t out_ws = -1;
-  if (st == CUBLAS_STATUS_SUCCESS) {
-    for (int i = 0; i < nres; ++i) {
-      if (heur[i].state != CUBLAS_STATUS_SUCCESS) continue;
-      int splitk = 0;
-      size_t written = 0;
-      cublasLtMatmulAlgoConfigGetAttribute(
-          &heur[i].algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &splitk, sizeof(splitk), &written);
-      if (splitk <= 1) {
-        e.algo = heur[i].algo;
-        e.ws = heur[i].workspaceSize;
-        out_ws = static_cast<int64_t>(e.ws);
-        g_nosplit.emplace(key, e);
-        break;
-      }
-    }
-  }
-  cublasLtMatmulPreferenceDestroy(pref);
-  if (out_ws < 0) {
-    cublasLtMatrixLayoutDestroy(e.Ad);
-    cublasLtMatrixLayoutDestroy(e.Bd);
-    cublasLtMatrixLayoutDestroy(e.Cd);
-    cublasLtMatmulDescDestroy(e.op);
-  }
-  return out_ws;
-}
+"""Experimental lossless BF16 register-A WGMMA projections, one launch per call."""
+import hashlib
+import torch
+from torch.utils.cpp_extension import load_inline
 
-void bf16_mm_run_nosplit(torch::Tensor A, torch::Tensor B, torch::Tensor C, torch::Tensor workspace) {
-  TORCH_CHECK(A.is_cuda() && B.is_cuda() && C.is_cuda());
-  TORCH_CHECK(A.scalar_type() == at::kBFloat16 && B.scalar_type() == at::kBFloat16 && C.scalar_type() == at::kBFloat16);
-  TORCH_CHECK(A.dim() == 2 && B.dim() == 2 && C.dim() == 2);
-  const int M = A.size(0), K = A.size(1), N = B.size(1);
-  TORCH_CHECK(B.size(0) == K && C.size(0) == M && C.size(1) == N);
-  ensure_lt();
-  auto it = g_nosplit.find(nosplit_key(M, N, K));
-  TORCH_CHECK(it != g_nosplit.end(), "bf16_mm_run_nosplit: missing prepare pick");
-  const NosplitEntry& e = it->second;
-  float alpha = 1.f, beta = 0.f;
-  void* ws = workspace.defined() && workspace.numel() > 0 ? workspace.data_ptr() : nullptr;
-  size_t ws_bytes = workspace.defined() ? static_cast<size_t>(workspace.numel() * workspace.element_size()) : 0;
-  auto stream = at::cuda::getCurrentCUDAStream();
-  TORCH_CHECK(
-      cublasLtMatmul(
-          g_lt, e.op, &alpha, A.data_ptr(), e.Ad, B.data_ptr(), e.Bd, &beta, C.data_ptr(), e.Cd, C.data_ptr(), e.Cd,
-          &e.algo, ws, ws_bytes, stream) == CUBLAS_STATUS_SUCCESS);
-}
+def tt_mw_mma(n):
+    nr = n // 2
+    regs = ','.join((f'%{i}' for i in range(nr)))
+    outs = ','.join((f'"+f"(d[{i}])' for i in range(nr)))
+    inputs = ','.join([f'"r"(a[{i}])' for i in range(16)] + [f'"l"(b+{2 * i})' for i in range(4)])
+    ops = ['wgmma.fence.sync.aligned;']
+    for kk in range(4):
+        ar = ','.join((f'%{nr + 4 * kk + i}' for i in range(4)))
+        ops.append(f'wgmma.mma_async.sync.aligned.m64n{n}k16.f32.bf16.bf16 {{{regs}}}, {{{ar}}}, %{nr + 16 + kk}, 1, 1, 1, 0;')
+    ops.append('wgmma.commit_group.sync.aligned; wgmma.wait_group.sync.aligned 0;')
+    return f'D void mma{n}(float* d,uint32_t* a,uint64_t b) {{asm volatile("' + ' '.join(ops) + f'" : {outs} : {inputs} : "memory");}}'
+tt_mw_CUDA_PREFIX = '\n\n#include <cuda.h>\n#include <cuda_runtime.h>\n#include <cuda_bf16.h>\n#include <stdint.h>\n#define D __device__ __forceinline__\nD uint32_t addr(void* p) { return uint32_t(__cvta_generic_to_shared(p)); }\nD void waitbar(uint32_t b,int p) {\n  asm volatile("{.reg .pred p; W: mbarrier.try_wait.parity.shared::cta.b64 p,[%0],%1; @!p bra W;}" :: "r"(b),"r"(p) : "memory");\n}\nD void arrive(uint32_t b) { asm volatile("mbarrier.arrive.shared::cta.b64 _,[%0];" :: "r"(b) : "memory"); }\nD void cluster_sync() { asm volatile("barrier.cluster.arrive.release.aligned; barrier.cluster.wait.acquire.aligned;" ::: "memory"); }\nD uint64_t desc(uint32_t a) { return uint64_t((a&0x3ffff)>>4) | (uint64_t(64)<<32) | (uint64_t(1)<<62); }\nD void tma(uint32_t d,const void* map,int k,int row,uint32_t b,uint64_t pol) {\n  asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0],[%1,{%2,%3}],[%4],%5;" :: "r"(d),"l"(map),"r"(k),"r"(row),"r"(b),"l"(pol) : "memory");\n}\nD uint4 ldw(const uint4* p,uint64_t policy) {\n  uint4 v;\n  asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.v4.u32 {%0,%1,%2,%3},[%4],%5;" : "=r"(v.x),"=r"(v.y),"=r"(v.z),"=r"(v.w) : "l"(p),"l"(policy));\n  return v;\n}\nD uint32_t prmt(uint32_t a,uint32_t b,uint32_t s) {\n  uint32_t d;asm("prmt.b32 %0,%1,%2,%3;":"=r"(d):"r"(a),"r"(b),"r"(s));return d;\n}\nD void dec(uint32_t l0,uint32_t l1,uint32_t c,uint32_t t0,uint32_t t1,uint32_t* a) {\n  uint32_t cm=c&0x77777777u,lo=prmt(t0,t1,cm),hi=prmt(t0,t1,cm>>16);\n  a[0]=prmt(l0,lo,0x5140u)|((c<<12)&0x80008000u);\n  a[1]=prmt(l0,lo,0x7362u)|((c<<8)&0x80008000u);\n  a[2]=prmt(l1,hi,0x5140u)|((c<<4)&0x80008000u);\n  a[3]=prmt(l1,hi,0x7362u)|(c&0x80008000u);\n}\nD void patch(uint32_t* a,uint32_t e) {\n  uint32_t reg=(e>>8)&31u,xr=(e&127u)<<(8+((e>>7)&1u)*16);\n  #pragma unroll\n  for(int r=0;r<16;r++) if(reg==r)a[r]^=xr;\n}\n\n'
+tt_mw_CUDA_CORE = r'''
 
-constexpr int kRouterN = 256;
-constexpr int kRouterK = 8192;
-constexpr int kRouterSplits = 8;
-constexpr int kRouterWarps = 4;
-constexpr int kRouterKChunk = kRouterK / kRouterSplits;  // 1024
-
-template <int BM>
-__global__ void __launch_bounds__(kRouterWarps * 32)
-    router_fp32_splitk_kernel(float* __restrict__ partial, const bf16_t* __restrict__ x,
-                              const float* __restrict__ w, int M) {
-  constexpr int kVecIters = (kRouterKChunk / 4) / 32;  // 8
-  static_assert(kRouterKChunk / 8 == kRouterWarps * 32, "one x float4 per thread");
-  extern __shared__ __align__(16) char smem[];
-  float* sw = reinterpret_cast<float*>(smem);
-  bf16_t* sx = reinterpret_cast<bf16_t*>(sw + kRouterWarps * kRouterKChunk);
-
-  const int split = static_cast<int>(blockIdx.y);
-  const int tid = static_cast<int>(threadIdx.x);
-  const int warp = tid >> 5;
-  const int lane = tid & 31;
-  const int row = static_cast<int>(blockIdx.x) * kRouterWarps + warp;
-  const int k0 = split * kRouterKChunk;
-
-  const float4* wrow4 = reinterpret_cast<const float4*>(w + (static_cast<size_t>(row) * kRouterK + k0));
-  float4* srow4 = reinterpret_cast<float4*>(sw + warp * kRouterKChunk);
-  float4 wreg[kVecIters];
-#pragma unroll
-  for (int s = 0; s < kVecIters; ++s) wreg[s] = ldg16_cg(wrow4 + lane + s * 32);
-#pragma unroll
-  for (int s = 0; s < kVecIters; ++s) srow4[lane + s * 32] = wreg[s];
-  __syncthreads();
-
-  for (int m0 = 0; m0 < M; m0 += BM) {
-#pragma unroll
-    for (int t = 0; t < BM; ++t) {
-      const bf16_t* src = x + (static_cast<size_t>(m0 + t) * kRouterK + k0);
-      bf16_t* dst = sx + t * kRouterKChunk;
-      *reinterpret_cast<float4*>(dst + tid * 8) = *reinterpret_cast<const float4*>(src + tid * 8);
-    }
-    __syncthreads();
-
-    float acc[BM];
-#pragma unroll
-    for (int t = 0; t < BM; ++t) acc[t] = 0.f;
-
-    const float* myw = sw + warp * kRouterKChunk;
-#pragma unroll 1
-    for (int s = 0; s < kVecIters; ++s) {
-      int v = lane + s * 32;
-      float4 wv = reinterpret_cast<const float4*>(myw)[v];
-      int kk = v * 4;
-#pragma unroll
-      for (int t = 0; t < BM; ++t) {
-        const unsigned* xp = reinterpret_cast<const unsigned*>(sx + t * kRouterKChunk + kk);
-        float2 a = cvt_bf16x2(xp[0]);
-        float2 b = cvt_bf16x2(xp[1]);
-        acc[t] = fma_rn(wv.x, a.x, acc[t]);
-        acc[t] = fma_rn(wv.y, a.y, acc[t]);
-        acc[t] = fma_rn(wv.z, b.x, acc[t]);
-        acc[t] = fma_rn(wv.w, b.y, acc[t]);
-      }
-    }
-#pragma unroll
-    for (int t = 0; t < BM; ++t) {
-      float a = acc[t];
-#pragma unroll
-      for (int off = 16; off > 0; off >>= 1) a += __shfl_down_sync(0xffffffff, a, off);
-      if (lane == 0) {
-        partial[(static_cast<size_t>(split) * static_cast<size_t>(M) + static_cast<size_t>(m0 + t)) * kRouterN +
-                row] = a;
-      }
-    }
-    __syncthreads();
-  }
-}
-
-__global__ void router_fp32_reduce_kernel(float* __restrict__ out, const float* __restrict__ partial, int M, int splits) {
-  int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-  int total = M * kRouterN;
-  if (idx >= total) return;
-  float s = 0.f;
-  for (int sp = 0; sp < splits; ++sp) s += partial[static_cast<size_t>(sp) * total + idx];
-  out[idx] = s;
-}
-
-template <int BM>
-void launch_router_fp32(float* partial, const bf16_t* x, const float* w, float* out, int M, cudaStream_t stream) {
-  int smem = kRouterWarps * kRouterKChunk * static_cast<int>(sizeof(float)) +
-             BM * kRouterKChunk * static_cast<int>(sizeof(bf16_t));
-  dim3 grid(kRouterN / kRouterWarps, kRouterSplits);
-  router_fp32_splitk_kernel<BM><<<grid, kRouterWarps * 32, smem, stream>>>(partial, x, w, M);
-  int total = M * kRouterN;
-  constexpr int threads = 256;
-  int blocks = (total + threads - 1) / threads;
-  router_fp32_reduce_kernel<<<blocks, threads, 0, stream>>>(out, partial, M, kRouterSplits);
-}
-
-void router_fp32_splitk(torch::Tensor x, torch::Tensor w, torch::Tensor partial, torch::Tensor out) {
-  TORCH_CHECK(x.is_cuda() && w.is_cuda() && partial.is_cuda() && out.is_cuda());
-  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && w.scalar_type() == at::kFloat && out.scalar_type() == at::kFloat);
-  const int M = static_cast<int>(x.size(0));
-  const int K = static_cast<int>(x.size(1));
-  const int N = static_cast<int>(w.size(0));
-  TORCH_CHECK(N == kRouterN && K == kRouterK && w.size(1) == K);
-  TORCH_CHECK((M >= 1 && M <= 8) || M == 16);
-  TORCH_CHECK(out.size(0) == M && out.size(1) == N);
-  TORCH_CHECK(partial.numel() >= static_cast<int64_t>(kRouterSplits) * M * N);
-  auto stream = at::cuda::getCurrentCUDAStream();
-  auto* pp = reinterpret_cast<float*>(partial.data_ptr());
-  auto* xp = reinterpret_cast<const bf16_t*>(x.data_ptr());
-  auto* wp = reinterpret_cast<const float*>(w.data_ptr());
-  auto* op = reinterpret_cast<float*>(out.data_ptr());
-  if (M % 8 == 0) launch_router_fp32<8>(pp, xp, wp, op, M, stream);
-  else launch_router_fp32<1>(pp, xp, wp, op, M, stream);
-}
-
-// Unpooler m=1 N=1024 is 128 CTAs. Split K by 4 → 512 CTAs; fp32 partials, one bf16 reduce.
-template <uint32_t N, uint32_t K, uint32_t SPLITS, uint32_t kRows, uint32_t kUnroll, uint32_t kNumWarps>
-__global__ void __launch_bounds__(kNumWarps * 32)
-    gemv_splitk_kernel(float* __restrict__ partial, const bf16_t* __restrict__ x, const bf16_t* __restrict__ w) {
-  constexpr uint32_t KCHUNK = K / SPLITS;
-  __shared__ __align__(16) bf16_t sx[KCHUNK];
-  const uint32_t split = blockIdx.y;
-  const uint32_t k0 = split * KCHUNK;
-  const uint32_t tid = threadIdx.x;
-  for (uint32_t i = tid * kGemvVecSize; i < KCHUNK; i += kNumWarps * 32 * kGemvVecSize) {
-    sts16(sx + i, ldg16_cg(x + k0 + i));
+template<int BN,int R,int WK,int PF,int Q,bool C12,int CAP>
+__global__ __launch_bounds__(128*WK,CAP) void m32w_gemm(
+    const __grid_constant__ CUtensorMap tx,const uint4* __restrict__ w,
+    const uint32_t* __restrict__ esc,__nv_bfloat16* out,int m,int n,int k,int split,uint32_t t0,uint32_t t1) {
+  extern __shared__ __align__(1024) uint8_t sm[];
+  constexpr int RW=R/16,NT=128*WK,RP=R+4,SB=BN*128,WS=(Q*(SB+8)+1023)/1024*1024,NL=C12?3:4;
+  int tid=threadIdx.x,wg=tid/128,warp=tid%128/32,lane=tid%32;
+  uint32_t base0=addr(sm),base=base0+wg*WS,full=base+Q*SB;
+  int rank=blockIdx.x%split,nt=blockIdx.x/split,mt=blockIdx.y;
+  int kb0=(k/64)*(rank*WK+wg)/(split*WK),nkb=(k/64)*(rank*WK+wg+1)/(split*WK)-kb0;
+  uint64_t pw,px;
+  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0,1.0;":"=l"(pw));
+  asm volatile("createpolicy.fractional.L2::evict_last.b64 %0,1.0;":"=l"(px));
+  if(tid%128==0) {
+    for(int s=0;s<Q;s++)asm volatile("mbarrier.init.shared::cta.b64 [%0],1;" :: "r"(full+s*8) : "memory");
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
   __syncthreads();
-
-  const uint32_t warp = tid / 32;
-  const uint32_t lane = tid % 32;
-  const uint32_t r0 = (blockIdx.x * kNumWarps + warp) * kRows;
-  if (r0 >= N) return;
-
-  float acc[kRows];
-#pragma unroll
-  for (uint32_t r = 0; r < kRows; ++r) acc[r] = 0.f;
-
-  constexpr uint32_t kStep = 32 * kGemvVecSize * kUnroll;
-  for (uint32_t k = lane * kGemvVecSize * kUnroll; k < KCHUNK; k += kStep) {
-    float4 xv[kUnroll];
-#pragma unroll
-    for (uint32_t u = 0; u < kUnroll; ++u) xv[u] = lds16(sx + k + u * kGemvVecSize);
-#pragma unroll
-    for (uint32_t r = 0; r < kRows; ++r) {
-      const bf16_t* wr = w + static_cast<size_t>(r0 + r) * K + k0 + k;
-#pragma unroll
-      for (uint32_t u = 0; u < kUnroll; ++u) acc[r] += dot8_f32(ldg16_cg(wr + u * kGemvVecSize), xv[u]);
+  auto loadx=[&](int i) {
+    if(tid%128==0 && i<nkb) {
+      int s=i%Q;
+      asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _,[%0],%1;" :: "r"(full+s*8),"r"(SB) : "memory");
+      tma(base+s*SB,&tx,(kb0+i)*64,mt*BN,full+s*8,px);
+    }
+  };
+  #pragma unroll
+  for(int s=0;s<Q;s++)loadx(s);
+  uint32_t e0=0xffffffffu,e1=0xffffffffu,nxt=0xffffffffu;int ep=0;
+  if(C12 && warp<RW) {
+    const uint32_t* el=esc+((nt*split*WK+rank*WK+wg)*RW+warp)*64;
+    e0=el[lane];e1=el[lane+32];nxt=__shfl_sync(0xffffffffu,e0,0);
+  }
+  uint4 raw[PF][NL]={};
+  auto load=[&](int slot,int i) {
+    if(i<nkb && warp<RW) {
+      const uint4* src=w+((long)(nt*(k/64)+kb0+i)*RW+warp)*NL*32+lane;
+      #pragma unroll
+      for(int l=0;l<NL;l++)raw[slot][l]=ldw(src+l*32,pw);
+    }
+  };
+  #pragma unroll
+  for(int p=0;p<PF;p++)load(p,p);
+  float acc[BN/2];
+  #pragma unroll
+  for(int j=0;j<BN/2;j++)asm volatile("mov.b32 %0,0;":"=f"(acc[j]));
+  #pragma unroll 1
+  for(int ib=0;ib<nkb;ib+=PF) {
+    #pragma unroll
+    for(int p=0;p<PF;p++) {
+      int i=ib+p;if(i>=nkb)break;
+      uint32_t a[16];
+      if constexpr(C12) {
+        dec(raw[p][0].x,raw[p][0].y,raw[p][2].x,t0,t1,a);
+        dec(raw[p][0].z,raw[p][0].w,raw[p][2].y,t0,t1,a+4);
+        dec(raw[p][1].x,raw[p][1].y,raw[p][2].z,t0,t1,a+8);
+        dec(raw[p][1].z,raw[p][1].w,raw[p][2].w,t0,t1,a+12);
+      } else {
+        #pragma unroll
+        for(int l=0;l<4;l++) {
+          a[4*l]=raw[p][l].x;a[4*l+1]=raw[p][l].y;a[4*l+2]=raw[p][l].z;a[4*l+3]=raw[p][l].w;
+        }
+      }
+      load(p,i+PF);
+      if constexpr(C12) {
+        while((nxt>>18)==uint32_t(i)) {
+          if(lane==int((nxt>>13)&31u))patch(a,nxt);
+          ++ep;
+          uint32_t ev=ep<32?e0:e1;
+          nxt=__shfl_sync(0xffffffffu,ev,ep&31);
+          if(ep>=64)nxt=0xffffffffu;
+        }
+      }
+      int s=i%Q;
+      waitbar(full+s*8,(i/Q)&1);
+      #pragma unroll
+      for(int j=0;j<BN/2;j++)asm volatile("":"+f"(acc[j])::"memory");
+      if constexpr(BN==16)mma16(acc,a,desc(base+s*SB));
+      if constexpr(BN==32)mma32(acc,a,desc(base+s*SB));
+      if constexpr(BN==64)mma64(acc,a,desc(base+s*SB));
+      #pragma unroll
+      for(int j=0;j<BN/2;j++)asm volatile("":"+f"(acc[j])::"memory");
+      loadx(i+Q);
     }
   }
-#pragma unroll
-  for (uint32_t r = 0; r < kRows; ++r) {
-#pragma unroll
-    for (uint32_t off = 16; off > 0; off >>= 1) acc[r] += __shfl_down_sync(0xffffffff, acc[r], off);
+  __syncthreads();
+  if(tid%128==0) {
+    for(int s=0;s<Q;s++)asm volatile("mbarrier.inval.shared::cta.b64 [%0];" :: "r"(full+s*8) : "memory");
   }
-  if (lane == 0) {
-#pragma unroll
-    for (uint32_t r = 0; r < kRows; ++r) partial[split * N + r0 + r] = acc[r];
+  __syncthreads();
+  int row=warp*16+lane/4,col=2*(lane%4);
+  #pragma unroll
+  for(int j=0;j<BN/8;j++) {
+    #pragma unroll
+    for(int h=0;h<2;h++) {
+      if(warp>=RW)continue;
+      ((float*)sm)[(wg*BN+col+8*j)*RP+row+8*h]=acc[4*j+2*h];
+      ((float*)sm)[(wg*BN+col+8*j+1)*RP+row+8*h]=acc[4*j+2*h+1];
+    }
   }
+  __syncthreads();
+  if(split>1)cluster_sync();
+  for(int q=tid+rank*NT;q<BN*(R/4);q+=NT*split) {
+    int token=q/(R/4),row=(q%(R/4))*4;
+    if(mt*BN+token>=m)continue;
+    float4 sum=make_float4(0,0,0,0);
+    for(int pp=0;pp<split*WK;pp++) {
+      int s=pp/WK;
+      uint32_t remote=base0+((pp%WK*BN+token)*RP+row)*4;
+      if(split>1)asm volatile("mapa.shared::cluster.u32 %0,%1,%2;":"=r"(remote):"r"(remote),"r"(s));
+      float4 v;
+      asm volatile("ld.shared::cluster.v4.f32 {%0,%1,%2,%3},[%4];":"=f"(v.x),"=f"(v.y),"=f"(v.z),"=f"(v.w):"r"(remote):"memory");
+      sum.x+=v.x;sum.y+=v.y;sum.z+=v.z;sum.w+=v.w;
+    }
+    __nv_bfloat162 lo=__floats2bfloat162_rn(sum.x,sum.y),hi=__floats2bfloat162_rn(sum.z,sum.w);
+    *(uint2*)(out+(long)(mt*BN+token)*n+nt*R+row)=make_uint2(*(uint32_t*)&lo,*(uint32_t*)&hi);
+  }
+  __syncthreads();
+  if(split>1)cluster_sync();
 }
 
-__global__ void gemv_splitk_reduce(bf16_t* __restrict__ out, const float* __restrict__ partial, int n, int splits) {
-  int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-  if (row >= n) return;
-  float s = 0.f;
-  for (int sp = 0; sp < splits; ++sp) s += partial[static_cast<size_t>(sp) * n + row];
-  out[row] = cast<bf16_t>(s);
-}
+'''
+tt_mw_CUDA_MAP = '\nusing EncodeFn=decltype(&cuTensorMapEncodeTiled);\nint map(CUtensorMap* tm,const void* ptr,int rows,int k,int box) {\n  static EncodeFn encode=nullptr;\n  if(!encode) {cudaDriverEntryPointQueryResult q;cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled",(void**)&encode,12000,cudaEnableDefault,&q);}\n  uint64_t dims[]={uint64_t(k),uint64_t(rows)},stride[]={uint64_t(k)*2};uint32_t b[]={64,uint32_t(box)},es[]={1,1};\n  return int(encode(tm,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,2,(void*)ptr,dims,stride,b,es,CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_128B,CU_TENSOR_MAP_L2_PROMOTION_L2_256B,CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));\n}\n\n'
+tt_mw_CUDA_HOST = '\ntemplate<int BN,int R,int WK,int PF,int Q,bool C12,int CAP>\nint launch_t(const void* x,const void* w,const void* e,void* out,int m,int n,int k,int split,uint64_t tab,cudaStream_t st) {\n  CUtensorMap tx;int rc=map(&tx,x,m,k,BN);if(rc)return rc;\n  constexpr int a=WK*((Q*(BN*128+8)+1023)/1024*1024),b=WK*BN*(R+4)*4,smem=a>b?a:b;\n  auto kern=m32w_gemm<BN,R,WK,PF,Q,C12,CAP>;\n  static bool ready=false;\n  if(!ready) {\n    rc=int(cudaFuncSetAttribute(kern,cudaFuncAttributeMaxDynamicSharedMemorySize,smem));if(rc)return rc;\n    rc=int(cudaFuncSetAttribute(kern,cudaFuncAttributeNonPortableClusterSizeAllowed,1));if(rc)return rc;\n    ready=true;\n  }\n  cudaLaunchConfig_t cfg={};cfg.gridDim=dim3((n/R)*split,(m+BN-1)/BN);cfg.blockDim=dim3(128*WK);cfg.dynamicSmemBytes=smem;cfg.stream=st;\n  cudaLaunchAttribute attr={};attr.id=cudaLaunchAttributeClusterDimension;attr.val.clusterDim={unsigned(split),1,1};\n  if(split>1){cfg.attrs=&attr;cfg.numAttrs=1;}\n  return int(cudaLaunchKernelEx(&cfg,kern,tx,(const uint4*)w,(const uint32_t*)e,(__nv_bfloat16*)out,m,n,k,split,uint32_t(tab),uint32_t(tab>>32)));\n}\nint launch(int id,uint64_t x,uint64_t w,uint64_t e,uint64_t out,int m,int n,int k,int split,uint64_t tab,uint64_t st) {\n  switch(id) {DISPATCH}\n  return -1;\n}\nint info(int id){cudaFuncAttributes fa={};switch(id){INFO}return fa.numRegs*10000+fa.localSizeBytes;}\n'
+tt_mw_CPP = '\n#include <pybind11/pybind11.h>\n#include <stdint.h>\nint launch(int,uint64_t,uint64_t,uint64_t,uint64_t,int,int,int,int,uint64_t,uint64_t);\nint info(int);\n'
 
-void hopper_bf16_gemv_splitk(torch::Tensor x, torch::Tensor w, torch::Tensor out, torch::Tensor partial) {
-  TORCH_CHECK(x.is_cuda() && w.is_cuda() && out.is_cuda() && partial.is_cuda());
-  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.size(0) == 1);
-  constexpr int N = 1024, K = 4096, SPLITS = 4;
-  TORCH_CHECK(w.size(0) == N && w.size(1) == K && out.numel() == N);
-  TORCH_CHECK(partial.numel() >= SPLITS * N);
-  auto* xp = reinterpret_cast<const bf16_t*>(x.data_ptr());
-  auto* wp = reinterpret_cast<const bf16_t*>(w.data_ptr());
-  auto* op = reinterpret_cast<bf16_t*>(out.data_ptr());
-  auto* pp = reinterpret_cast<float*>(partial.data_ptr());
-  auto stream = at::cuda::getCurrentCUDAStream();
-  constexpr int warps = 8;
-  constexpr int blocks_n = N / warps;  // rows=1
-  gemv_splitk_kernel<N, K, SPLITS, 1, 4, warps><<<dim3(blocks_n, SPLITS), warps * 32, 0, stream>>>(pp, xp, wp);
-  gemv_splitk_reduce<<<(N + 255) / 256, 256, 0, stream>>>(op, pp, N, SPLITS);
-}
-"""
+def tt_mw_cuda_source(instances):
+    cases = []
+    attrs = []
+    for i, inst in enumerate(instances):
+        bn, r, wk, pf, q, c, cap = inst
+        params = f'{bn},{r},{wk},{pf},{q},{str(c).lower()},{cap}'
+        cases.append(f'case {i}: return launch_t<{params}>((void*)x,(void*)w,(void*)e,(void*)out,m,n,k,split,tab,(cudaStream_t)st);')
+        attrs.append(f'case {i}:cudaFuncGetAttributes(&fa,m32w_gemm<{params}>);break;')
+    return tt_mw_CUDA_PREFIX + '\n'.join((tt_mw_mma(n) for n in (16, 32, 64))) + tt_mw_CUDA_CORE + tt_mw_CUDA_MAP + tt_mw_CUDA_HOST.replace('DISPATCH', '\n'.join(cases)).replace('INFO', '\n'.join(attrs))
 
-_CPP_DECL = r"""
-void hopper_bf16_gemv(torch::Tensor x, torch::Tensor w, torch::Tensor out, bool use_pdl);
-void hopper_bf16_gemv_splitk(torch::Tensor x, torch::Tensor w, torch::Tensor out, torch::Tensor partial);
-void router_fp32_splitk(torch::Tensor x, torch::Tensor w, torch::Tensor partial, torch::Tensor out);
-int64_t bf16_mm_pick_nosplit(int64_t M, int64_t N, int64_t K);
-void bf16_mm_run_nosplit(torch::Tensor A, torch::Tensor B, torch::Tensor C, torch::Tensor workspace);
-"""
+def tt_mw_build(instances):
+    src = tt_mw_cuda_source(instances)
+    name = 'm32w_' + hashlib.sha256(src.encode()).hexdigest()[:12]
+    return load_inline(name, tt_mw_CPP, cuda_sources=src, functions=['launch', 'info'], no_implicit_headers=True, with_pytorch_error_handling=False, extra_cuda_cflags=['-O3', '-std=c++20', '-lineinfo', '-gencode=arch=compute_90a,code=sm_90a'])
+tt_mw_SM_SIGN_POS = (3, 19, 7, 23, 11, 27, 15, 31)
 
+def tt_mw__to_i16(v):
+    return torch.where(v >= 32768, v - 65536, v).to(torch.int16)
 
-def _use_hopper_bf16_gemv(m: int, n: int, k: int) -> bool:
-    if not (
-        m == 1
-        and k % 512 == 0
-        and 512 <= k <= _MAX_K
-        and n % 8 == 0
-        and 64 <= n <= _MAX_N
-    ):
-        return False
-    if k == 5120 and n <= 512:
-        return False
-    return n < 12288 or n >= 32768
+def tt_mw__to_i32(v):
+    return torch.where(v >= 2 ** 31, v - 2 ** 32, v).to(torch.int32)
 
+def tt_mw_sm_bf16_bytes(v):
+    r, c = v.shape[:2]
+    words = tt_mw__to_i16(v.view(r, c, 32, 4, 8).permute(0, 1, 3, 2, 4)).contiguous()
+    return words.view(torch.uint8).view(r, c, 2048)
 
-def _align16(t: torch.Tensor) -> torch.Tensor:
-    if t.data_ptr() % 16 == 0 and t.is_contiguous():
-        return t
-    out = torch.empty_like(t)
-    out.copy_(t)
+def tt_mw_sm_c12_bytes(v):
+    """Packs units into the 12-bit format. Returns (bytes [r, c, 1536], base, escapes (r, c, lane, value, xor7))."""
+    r, c = v.shape[:2]
+    dev = v.device
+    lo = v & 255
+    sign = v >> 15
+    eh = v >> 8 & 127
+    hist = torch.bincount(eh.flatten(), minlength=128).cpu()
+    window = torch.stack([hist[b:b + 8].sum() for b in range(121)])
+    base = int(window.argmax())
+    d = eh - base
+    inwin = (d >= 0) & (d < 8)
+    d = torch.where(inwin, d, torch.zeros_like(d))
+    nib = (torch.arange(8, device=dev) * 4).long()
+    pos = torch.tensor(tt_mw_SM_SIGN_POS, device=dev).long()
+    code = ((d.view(r, c, 32, 4, 8).long() << nib) + (sign.view(r, c, 32, 4, 8).long() << pos)).sum(-1)
+    code = tt_mw__to_i32(code).contiguous().view(torch.uint8).view(r, c, 32, 16)
+    lo8 = lo.to(torch.uint8)
+    data = torch.stack([lo8[..., :16], lo8[..., 16:], code], dim=2).reshape(r, c, 1536).contiguous()
+    er, ec, el, ev = (~inwin).nonzero().unbind(1)
+    xor7 = eh[er, ec, el, ev] ^ base
+    return (data, base, (er, ec, el, ev, xor7))
+
+def tt_mw_sm_c12_unpack(data, base, esc):
+    """Inverse of sm_c12_bytes, used to prove the packing is exact."""
+    r, c = data.shape[:2]
+    dev = data.device
+    p = data.view(r, c, 3, 32, 16)
+    lo = torch.cat([p[:, :, 0], p[:, :, 1]], dim=-1).to(torch.int32)
+    code = p[:, :, 2].contiguous().view(torch.int32).view(r, c, 32, 4).long() & 4294967295
+    nib = (torch.arange(8, device=dev) * 4).long()
+    pos = torch.tensor(tt_mw_SM_SIGN_POS, device=dev).long()
+    d = (code[..., None] >> nib & 7).reshape(r, c, 32, 32)
+    sg = (code[..., None] >> pos & 1).reshape(r, c, 32, 32)
+    val = (sg << 15 | base + d << 8).to(torch.int32) | lo
+    er, ec, el, ev, xor7 = esc
+    val[er, ec, el, ev] ^= (xor7 << 8).to(torch.int32)
+    return val
+
+def tt_mw_sm_table(base):
+    t0 = base | base + 1 << 8 | base + 2 << 16 | base + 3 << 24
+    t1 = base + 4 | base + 5 << 8 | base + 6 << 16 | base + 7 << 24
+    v = t0 | t1 << 32
+    return v - 2 ** 64 if v >= 2 ** 63 else v
+
+def tt_mw_pack_weight(w, r, wk, split, compressed=True):
+    n, k = w.shape
+    total = wk * split
+    rw = r // 16
+    if w.dtype != torch.bfloat16 or r not in (32, 64) or n % r or k % 64 or (k // 64 < total):
+        return None
+    bits = w.contiguous().view(torch.int16).to(torch.int32) & 65535
+    v = bits.view(n // 16, 2, 8, k // 64, 4, 2, 4, 2).permute(0, 3, 2, 6, 4, 5, 1, 7).reshape(n // 16, k // 64, 32, 32)
+    esc = torch.full((n // r * total * rw, 64), -1, dtype=torch.int32, device=w.device)
+    table, max_esc, escapes = (0, 0, 0)
+    if compressed:
+        data, b, entries = tt_mw_sm_c12_bytes(v)
+        if not torch.equal(tt_mw_sm_c12_unpack(data, b, entries), v):
+            return None
+        table = tt_mw_sm_table(b) & 18446744073709551615
+        er, ec, el, ev, xor7 = entries
+        escapes = er.numel()
+        if escapes:
+            boundaries = torch.tensor([k // 64 * s // total for s in range(1, total)], device=w.device)
+            rank = torch.bucketize(ec, boundaries, right=True)
+            seq = ec - k // 64 * rank // total
+            group = (er // rw * total + rank) * rw + er % rw
+            max_esc = int(torch.bincount(group, minlength=esc.shape[0]).max())
+            if max_esc > 64 or int(seq.max()) >= (1 << 14) - 1:
+                return None
+            order = torch.argsort(group * (1 << 14) + seq)
+            gs = group[order]
+            ss = seq[order]
+            pos = torch.arange(len(gs), device=w.device) - torch.searchsorted(gs, gs)
+            entry = ss.long() << 18 | el[order].long() << 13 | (ev[order] // 2).long() << 8 | (ev[order] % 2).long() << 7 | xor7[order].long()
+            esc[gs, pos] = tt_mw__to_i32(entry)
+    else:
+        data = tt_mw_sm_bf16_bytes(v)
+    payload = data.view(n // r, rw, k // 64, -1).permute(0, 2, 1, 3).contiguous().view(-1)
+    return dict(w=payload, esc=esc, table=table, r=r, wk=wk, split=split, compressed=compressed, n=n, k=k, escapes=escapes, max_esc=max_esc, pack_exact=True)
+
+def tt_mw_launch_raw(ext, idx, pk, x, out):
+    return ext.launch(idx, x.data_ptr(), pk['w'].data_ptr(), pk['esc'].data_ptr(), out.data_ptr(), x.shape[0], pk['n'], pk['k'], pk['split'], pk['table'], torch.cuda.current_stream().cuda_stream)
+
+def tt_mw_verify_onehot(ext, idx, pk, w, m=32):
+    n, k = w.shape
+    eye = torch.eye(k, device=w.device, dtype=torch.bfloat16)
+    out = torch.empty((k, n), device=w.device, dtype=torch.bfloat16)
+    for start in range(0, k, m):
+        if tt_mw_launch_raw(ext, idx, pk, eye[start:start + m], out[start:start + m]):
+            return False
+    return bool(torch.equal(out.view(torch.int16), w.T.contiguous().view(torch.int16)))
+tt_mw_CONFIGS = {(16, 'pooler'): ((16, 64, 1, 2, 2, True, 1), 8), (16, 'unpooler'): ((16, 64, 4, 2, 2, True, 1), 1), (16, 'qkv_gate'): ((16, 64, 1, 2, 2, True, 1), 8), (32, 'pooler'): ((32, 64, 1, 2, 2, True, 1), 8), (32, 'unpooler'): ((32, 64, 4, 2, 2, True, 1), 1), (32, 'qkv_gate'): ((32, 64, 1, 2, 2, True, 1), 8)}
+
+def tt_mw_prepare_m32w(weights, configs=None) -> dict:
+    configs = tt_mw_CONFIGS if configs is None else configs
+    device = next(iter(weights.values())).device
+    state = {'plans': {}, 'device': device}
+    if device.type != 'cuda' or torch.cuda.get_device_capability(device) != (9, 0):
+        return state
+    instances = []
+    for inst, split in configs.values():
+        for c in (inst[5], False):
+            twin = inst[:5] + (c,) + inst[6:]
+            if twin not in instances:
+                instances.append(twin)
+    ext = tt_mw_build(instances)
+    state['ext'] = ext
+    packs = {}
+    for (m, layer), (inst, split) in configs.items():
+        if layer not in weights:
+            continue
+        w = weights[layer]
+        for compressed in (inst[5], False):
+            actual = inst[:5] + (compressed,) + inst[6:]
+            idx = instances.index(actual)
+            if ext.info(idx) % 10000:
+                continue
+            key = (layer, inst[1], inst[2], split, compressed)
+            if key not in packs:
+                packs[key] = tt_mw_pack_weight(w, inst[1], inst[2], split, compressed)
+            pk = packs[key]
+            if pk is None or not tt_mw_verify_onehot(ext, idx, pk, w, m):
+                continue
+            if m == 32 and (not tt_mw_verify_onehot(ext, idx, pk, w, 33)):
+                continue
+            state['plans'][m, layer] = (idx, pk)
+            break
+    return state
+
+def tt_mw_run_m32w(x: torch.Tensor, layer: str, n: int, st: dict) -> torch.Tensor | None:
+    if x.ndim != 2 or x.dtype != torch.bfloat16 or (not x.is_cuda) or (x.device != st['device']):
+        return None
+    m = x.shape[0]
+    if not 16 <= m <= 33 or not x.is_contiguous() or x.data_ptr() % 16:
+        return None
+    key = (16 if m <= 16 else 32, layer)
+    plan = st['plans'].get(key)
+    if plan is None:
+        return None
+    idx, pk = plan
+    if n != pk['n'] or x.shape[1] != pk['k']:
+        return None
+    out = torch.empty((m, n), device=x.device, dtype=torch.bfloat16)
+    rc = tt_mw_launch_raw(st['ext'], idx, pk, x, out)
+    if rc:
+        raise RuntimeError(f'm32w launch failed: {rc}')
     return out
 
 
-def _build_ext(device: torch.device):
-    major, minor = torch.cuda.get_device_capability(device)
-    arch = f"sm_{major}{minor}"
-    gencode = f"-gencode=arch=compute_{major}{minor},code={arch}"
-    build_dir = Path.home() / ".cache" / "muse_bf16_impl_l" / arch
-    build_dir.mkdir(parents=True, exist_ok=True)
-    return load_inline(
-        name=f"muse_bf16_impl_l_{arch}",
-        cpp_sources=[_CPP_DECL],
-        cuda_sources=[_CUDA_SRC],
-        functions=[
-            "hopper_bf16_gemv",
-            "hopper_bf16_gemv_splitk",
-            "router_fp32_splitk",
-            "bf16_mm_pick_nosplit",
-            "bf16_mm_run_nosplit",
-        ],
-        extra_cuda_cflags=[
-            "-O3",
-            "--use_fast_math",
-            "-std=c++20",
-            "--expt-relaxed-constexpr",
-            gencode,
-        ],
-        extra_ldflags=["-lcublasLt"],
-        build_directory=str(build_dir),
-        verbose=False,
-    )
+def _fallback(x: torch.Tensor, layer: str, n: int, state: dict) -> torch.Tensor:
+    if layer != "router":
+        return _bf16_gemm_dispatch_impl(x, state[layer][:n], None)
+    if x.shape[0] <= 8:
+        return F.linear(x.float(), state["router_weight"])
+    out = torch.mm(x, state["router_hi_t"], out_dtype=torch.float32)
+    out += torch.mm(x, state["router_lo_t"], out_dtype=torch.float32)
+    return out
 
-
-def _probe_mm_bf16_backend(device: torch.device) -> str | None:
-    try:
-        from flashinfer.gemm import mm_bf16
-    except ImportError:
-        return None
-    x = torch.zeros(8, 1024, dtype=torch.bfloat16, device=device)
-    b = torch.zeros(1024, 1024, dtype=torch.bfloat16, device=device)
-    for backend in ("tgv", "cute-dsl", "cutlass", "cublaslt", "auto"):
-        try:
-            y = mm_bf16(x, b, backend=backend)
-            torch.cuda.synchronize(device)
-            if y.shape == (8, 1024):
-                return backend
-        except Exception:
-            continue
-    return None
-
-
-def _graph_median_ms(fn) -> float | None:
-    try:
-        side = torch.cuda.Stream()
-        side.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side):
-            fn()
-            fn()
-        torch.cuda.current_stream().wait_stream(side)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            fn()
-        start, end = torch.cuda.Event(True), torch.cuda.Event(True)
-        samples = []
-        for _ in range(7):
-            start.record()
-            graph.replay()
-            end.record()
-            end.synchronize()
-            samples.append(start.elapsed_time(end))
-        samples.sort()
-        return samples[len(samples) // 2]
-    except Exception:
-        return None
-
-
-def prepare(weights: Weights) -> dict[str, Any]:
-    state: dict[str, Any] = {
-        name: _align16(w.contiguous()) for name, w in weights.items()
-    }
-    for name in ("qkv_gate", "o", "pooler", "unpooler"):
-        state[f"{name}_t"] = state[name].t().contiguous()
-    router = state["router"]
-    hi = router.to(torch.bfloat16)
-    lo = (router - hi.float()).to(torch.bfloat16)
+def _base_state(weights: Weights) -> dict:
+    state = {name: w.contiguous() for name, w in weights.items()}
+    hi = weights["router"].to(torch.bfloat16)
     state["router_hi_t"] = hi.t().contiguous()
-    state["router_lo_t"] = lo.t().contiguous()
-
-    device = router.device
-    state["ext"] = None
-    state["use_pdl"] = False
-    state["mm_backend"] = None
-    state["mm_bf16"] = None
-    state["router_partial"] = None
-    state["gemv_partial"] = None
-    state["nosplit_qkv"] = set()
-    state["nosplit_ws"] = None
-    if device.type == "cuda":
-        major, _ = torch.cuda.get_device_capability(device)
-        state["use_pdl"] = major >= 9
-        try:
-            state["ext"] = _build_ext(device)
-        except Exception:
-            state["ext"] = None
-        state["mm_backend"] = _probe_mm_bf16_backend(device)
-        if state["mm_backend"] is not None:
-            from flashinfer.gemm import mm_bf16
-
-            state["mm_bf16"] = mm_bf16
-        ext = state["ext"]
-        if ext is not None:
-            state["router_partial"] = torch.empty(8 * 1024 * 256, dtype=torch.float32, device=device)
-            state["gemv_partial"] = torch.empty(4 * 1024, dtype=torch.float32, device=device)
-            Wt = state["qkv_gate_t"]
-            k, n = Wt.shape
-            picks = [(m, int(ext.bf16_mm_pick_nosplit(m, n, k))) for m in (16, 32)]
-            picks = [(m, ws) for m, ws in picks if ws >= 0]
-            if picks:
-                buf = torch.empty(max(ws for _, ws in picks), dtype=torch.uint8, device=device)
-                kept = set()
-                for m, _ws in picks:
-                    xw = torch.randn(m, k, dtype=torch.bfloat16, device=device)
-                    ref = torch.empty(m, n, dtype=torch.bfloat16, device=device)
-                    alt = torch.empty(m, n, dtype=torch.bfloat16, device=device)
-                    ref_us = _graph_median_ms(lambda: torch.mm(xw, Wt, out=ref))
-                    alt_us = _graph_median_ms(lambda: ext.bf16_mm_run_nosplit(xw, Wt, alt, buf))
-                    if ref_us is not None and alt_us is not None and alt_us < ref_us:
-                        kept.add(m)
-                if kept:
-                    state["nosplit_qkv"] = kept
-                    state["nosplit_ws"] = buf
+    state["router_lo_t"] = (weights["router"] - hi.float()).to(torch.bfloat16).t().contiguous()
+    state["router_weight"] = weights["router"]
     return state
 
+def prepare(weights: Weights) -> dict:
+    state = _base_state(weights)
+    state["new_lt"] = tt_lt_prepare_cublaslt(weights)
+    state["new_mw"] = tt_mw_prepare_m32w(weights)
+    torch.cuda.synchronize(weights["qkv_gate"].device)
+    return state
 
-def kernel_fn(data: Inputs, state: dict[str, Any]) -> torch.Tensor:
-    x, layer = data["x"], data["config"]["layer"]
-    if layer == "router":
-        m = x.numel() // x.shape[-1]
-        ext = state["ext"]
-        if ext is not None and state["router_partial"] is not None and (
-            1 <= m <= ROUTER_FP32_MAX_TOKENS or m == 16
-        ):
-            x2 = _align16(x.view(m, -1))
-            out = torch.empty((m, state["router"].shape[0]), dtype=torch.float32, device=x.device)
-            ext.router_fp32_splitk(x2, state["router"], state["router_partial"], out)
-            return out
-        if m <= ROUTER_FP32_MAX_TOKENS:
-            return F.linear(x.float(), state["router"])
-        acc = torch.mm(x, state["router_hi_t"], out_dtype=torch.float32)
-        acc += torch.mm(x, state["router_lo_t"], out_dtype=torch.float32)
-        return acc
+def kernel_fn(data: Inputs, state: dict) -> torch.Tensor:
+    x, layer, n = data["x"], data["config"]["layer"], data["config"]["n"]
+    m = x.shape[0]
+    out = None
+    if m == 32 and layer == "unpooler":
+        out = tt_mw_run_m32w(x, layer, n, state["new_mw"])
+    if out is None and (m, layer) in ((128, "pooler"), (128, "unpooler"), (256, "pooler"), (256, "qkv_gate")):
+        out = tt_lt_run_cublaslt(x, layer, n, state["new_lt"])
+    if out is None and m in (16, 32) and layer in ("pooler", "unpooler"):
+        out = tt_mw_run_m32w(x, layer, n, state["new_mw"])
+    return _fallback(x, layer, n, state) if out is None else out
 
-    n = data["config"]["n"]
-    W = state[layer][:n]
-    m = x.numel() // x.shape[-1]
-    ext = state["ext"]
-    if (
-        ext is not None
-        and _use_hopper_bf16_gemv(m, W.shape[0], W.shape[1])
-        and x.is_contiguous()
-        and W.is_contiguous()
-        and x.data_ptr() % 16 == 0
-        and W.data_ptr() % 16 == 0
-    ):
-        x1 = _align16(x.view(-1, x.shape[-1]))
-        out = torch.empty((1, W.shape[0]), dtype=x.dtype, device=x.device)
-        if W.shape[0] == 1024 and W.shape[1] == 4096 and state["gemv_partial"] is not None:
-            ext.hopper_bf16_gemv_splitk(x1, W, out, state["gemv_partial"])
-        else:
-            ext.hopper_bf16_gemv(x1, W, out, bool(state["use_pdl"]))
-        return out.view(*x.shape[:-1], -1)
-
-    if layer == "qkv_gate" and m in state["nosplit_qkv"]:
-        x2 = x.view(-1, x.shape[-1])
-        out = torch.empty(x2.shape[0], n, dtype=x.dtype, device=x.device)
-        state["ext"].bf16_mm_run_nosplit(x2, state["qkv_gate_t"][:, :n], out, state["nosplit_ws"])
-        return out.view(*x.shape[:-1], n)
-
-    if state["mm_bf16"] is not None and (layer, m) in _MM_BF16:
-        return state["mm_bf16"](
-            x.view(-1, x.shape[-1]), state[f"{layer}_t"][:, :n], backend=state["mm_backend"]
-        ).view(*x.shape[:-1], n)
-
-    return F.linear(x, W, None)
+SELECTED_ROUTES = [
+    {"m": 32, "layer": "unpooler", "name": "mw", "module": "mw"},
+    {"m": 128, "layer": "pooler", "name": "lt", "module": "lt"},
+    {"m": 128, "layer": "unpooler", "name": "lt", "module": "lt"},
+    {"m": 256, "layer": "pooler", "name": "lt", "module": "lt"},
+    {"m": 256, "layer": "qkv_gate", "name": "lt", "module": "lt"},
+]
