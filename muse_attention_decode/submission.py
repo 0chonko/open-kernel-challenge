@@ -23,6 +23,301 @@ from sgl_kernel.flash_attn import flash_attn_with_kvcache
 from sglang.kernels.ops.kvcache.kvcache import store_cache
 # baseline QK-norm[+RoPE] when we cannot use the unity-scale fused prep
 from sglang.kernels.ops.muse_spark_v12.fused_qk_norm import FusedQKNorm
+from torch.utils.cpp_extension import load_inline
+
+# Cluster split-KV decode: one cluster (<=16 CTAs) per (request, KV head), each warp a KV
+# slice on FP16 mma.sync; partials merge in smem, then across the cluster over DSMEM.
+_CLUSTER_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_fp8.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <cooperative_groups.h>
+namespace cg = cooperative_groups;
+
+constexpr int D = 64;
+constexpr int WARPS = 8;
+constexpr int KSTEP = 64;
+constexpr unsigned FULL = 0xffffffffu;
+
+__device__ __forceinline__ uint32_t cvt2(uint32_t x) {
+  __half2_raw h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(x & 0xffffu), __NV_E4M3);
+  return (uint32_t)h.x | ((uint32_t)h.y << 16);
+}
+
+__device__ __forceinline__ uint32_t pack_h2(float a, float b) {
+  __half2 h = __floats2half2_rn(a, b);
+  return *reinterpret_cast<uint32_t*>(&h);
+}
+
+__device__ __forceinline__ void mma(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// Head-dim permutations keep every fragment gather a single vector load:
+//   QK^T k-index (kk, 2*tig + {0,1,8,9}) -> d = tig*16 + kk*4 + {0,1,2,3}
+//   PV   n-index (nt, g)                -> d = g*8 + nt
+template <int NMT>
+__global__ void __launch_bounds__(WARPS * 32, 1) cluster_attn_kernel(
+    const uint8_t* __restrict__ q, const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
+    const int* __restrict__ pt, int pt_stride, const int* __restrict__ seqlens,
+    __nv_bfloat16* __restrict__ out, int L, int Hq, int Hkv, int ps, int window, float scale) {
+  constexpr int SLICES = WARPS / NMT;
+  __shared__ float s_o[WARPS][16][D];
+  __shared__ float s_m[WARPS][16], s_l[WARPS][16];
+  __shared__ float c_m[NMT * 16], c_l[NMT * 16];
+
+  cg::cluster_group cluster = cg::this_cluster();
+  const int C = cluster.num_blocks();
+  const int rank = cluster.block_rank();
+  const int kvh = blockIdx.y, b = blockIdx.z;
+  const int G = Hq / Hkv, M = L * G;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int g = lane >> 2, tig = lane & 3;
+  const int mt = warp % NMT, slice = rank * SLICES + warp / NMT;
+  const int nslices = C * SLICES;
+
+  const int kv_len = seqlens[b];
+  const int q0 = kv_len - L;
+  const int lo = window > 0 ? max(0, q0 - (window - 1)) : 0;
+  const int chunk = ((kv_len - lo + nslices - 1) / nslices + KSTEP - 1) / KSTEP * KSTEP;
+  const int beg = lo + slice * chunk, end = min(kv_len, beg + chunk);
+
+  const int r0 = mt * 16 + g, r1 = r0 + 8;
+  const int p0 = q0 + r0 / G, p1 = q0 + r1 / G;
+  uint32_t qa[4][4];
+  {
+    uint4 x0 = make_uint4(0, 0, 0, 0), x1 = x0;
+    if (r0 < M) x0 = *reinterpret_cast<const uint4*>(q + ((int64_t)(b * L + r0 / G) * Hq + kvh * G + r0 % G) * D + tig * 16);
+    if (r1 < M) x1 = *reinterpret_cast<const uint4*>(q + ((int64_t)(b * L + r1 / G) * Hq + kvh * G + r1 % G) * D + tig * 16);
+    const uint32_t w0[4] = {x0.x, x0.y, x0.z, x0.w}, w1[4] = {x1.x, x1.y, x1.z, x1.w};
+#pragma unroll
+    for (int kk = 0; kk < 4; ++kk) {
+      qa[kk][0] = cvt2(w0[kk]);
+      qa[kk][1] = cvt2(w1[kk]);
+      qa[kk][2] = cvt2(w0[kk] >> 16);
+      qa[kk][3] = cvt2(w1[kk] >> 16);
+    }
+  }
+
+  float o[8][4] = {};
+  float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
+  const int64_t row_stride = (int64_t)Hkv * D;
+  const uint8_t* kb = kc + kvh * D;
+  const uint8_t* vb = vc + kvh * D;
+  const int* ptb = pt + (int64_t)b * pt_stride;
+  auto rowof = [&](int j) -> int64_t {
+    j = min(j, kv_len - 1);
+    return ps == 1 ? (int64_t)ptb[j] : (int64_t)ptb[j / ps] * ps + j % ps;
+  };
+
+  for (int j0 = beg; j0 < end; j0 += KSTEP) {
+    const int64_t ra = rowof(j0 + lane), rb = rowof(j0 + 32 + lane);
+    uint4 kr[8];
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt) {
+      const int64_t r = __shfl_sync(FULL, nt < 4 ? ra : rb, (nt * 8 + g) & 31);
+      kr[nt] = *reinterpret_cast<const uint4*>(kb + r * row_stride + tig * 16);
+    }
+    uint2 vr[4][4];
+#pragma unroll
+    for (int s = 0; s < 4; ++s)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const int64_t r = __shfl_sync(FULL, s < 2 ? ra : rb, (s * 16 + 2 * tig + (e & 1) + (e >> 1) * 8) & 31);
+        vr[s][e] = *reinterpret_cast<const uint2*>(vb + r * row_stride + g * 8);
+      }
+
+    float sc[8][4];
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt) {
+      sc[nt][0] = sc[nt][1] = sc[nt][2] = sc[nt][3] = 0.f;
+      const uint32_t kw[4] = {kr[nt].x, kr[nt].y, kr[nt].z, kr[nt].w};
+#pragma unroll
+      for (int kk = 0; kk < 4; ++kk) mma(sc[nt], qa[kk], cvt2(kw[kk]), cvt2(kw[kk] >> 16));
+    }
+
+    float mx0 = -INFINITY, mx1 = -INFINITY;
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const int j = j0 + nt * 8 + 2 * tig + (e & 1);
+        const int p = e < 2 ? p0 : p1;
+        const bool ok = j < end && j <= p && (window <= 0 || j > p - window);
+        sc[nt][e] = ok ? sc[nt][e] * scale : -INFINITY;
+      }
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt) {
+      mx0 = fmaxf(mx0, fmaxf(sc[nt][0], sc[nt][1]));
+      mx1 = fmaxf(mx1, fmaxf(sc[nt][2], sc[nt][3]));
+    }
+    mx0 = fmaxf(mx0, __shfl_xor_sync(FULL, mx0, 1));
+    mx0 = fmaxf(mx0, __shfl_xor_sync(FULL, mx0, 2));
+    mx1 = fmaxf(mx1, __shfl_xor_sync(FULL, mx1, 1));
+    mx1 = fmaxf(mx1, __shfl_xor_sync(FULL, mx1, 2));
+    const float n0 = fmaxf(m0, mx0), n1 = fmaxf(m1, mx1);
+    const float ref0 = n0 == -INFINITY ? 0.f : n0, ref1 = n1 == -INFINITY ? 0.f : n1;
+    const float a0 = exp2f(m0 - ref0), a1 = exp2f(m1 - ref1);
+    m0 = n0;
+    m1 = n1;
+    l0 *= a0;
+    l1 *= a1;
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt) {
+      o[nt][0] *= a0; o[nt][1] *= a0; o[nt][2] *= a1; o[nt][3] *= a1;
+      sc[nt][0] = exp2f(sc[nt][0] - ref0);
+      sc[nt][1] = exp2f(sc[nt][1] - ref0);
+      sc[nt][2] = exp2f(sc[nt][2] - ref1);
+      sc[nt][3] = exp2f(sc[nt][3] - ref1);
+      l0 += sc[nt][0] + sc[nt][1];
+      l1 += sc[nt][2] + sc[nt][3];
+    }
+
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      const uint32_t pa[4] = {pack_h2(sc[2 * s][0], sc[2 * s][1]), pack_h2(sc[2 * s][2], sc[2 * s][3]),
+                              pack_h2(sc[2 * s + 1][0], sc[2 * s + 1][1]), pack_h2(sc[2 * s + 1][2], sc[2 * s + 1][3])};
+#pragma unroll
+      for (int nt = 0; nt < 8; ++nt) {
+        const int sel = (nt & 3) | (((nt & 3) + 4) << 4);
+        const uint32_t v0 = nt < 4 ? vr[s][0].x : vr[s][0].y, v1 = nt < 4 ? vr[s][1].x : vr[s][1].y;
+        const uint32_t v2 = nt < 4 ? vr[s][2].x : vr[s][2].y, v3 = nt < 4 ? vr[s][3].x : vr[s][3].y;
+        mma(o[nt], pa, cvt2(__byte_perm(v0, v1, sel)), cvt2(__byte_perm(v2, v3, sel)));
+      }
+    }
+  }
+
+  l0 += __shfl_xor_sync(FULL, l0, 1);
+  l0 += __shfl_xor_sync(FULL, l0, 2);
+  l1 += __shfl_xor_sync(FULL, l1, 1);
+  l1 += __shfl_xor_sync(FULL, l1, 2);
+#pragma unroll
+  for (int nt = 0; nt < 8; ++nt)
+#pragma unroll
+    for (int e = 0; e < 4; ++e) s_o[warp][e < 2 ? g : g + 8][(2 * tig + (e & 1)) * 8 + nt] = o[nt][e];
+  if (tig == 0) {
+    s_m[warp][g] = m0; s_m[warp][g + 8] = m1;
+    s_l[warp][g] = l0; s_l[warp][g + 8] = l1;
+  }
+  __syncthreads();
+
+  for (int i = threadIdx.x; i < NMT * 16 * D; i += WARPS * 32) {
+    const int t = i / (16 * D), row = (i / D) % 16, col = i % D;
+    float mm = -INFINITY;
+#pragma unroll
+    for (int s = 0; s < SLICES; ++s) mm = fmaxf(mm, s_m[s * NMT + t][row]);
+    float acc = 0.f, ll = 0.f;
+#pragma unroll
+    for (int s = 0; s < SLICES; ++s) {
+      const float ms = s_m[s * NMT + t][row];
+      const float w = ms == -INFINITY ? 0.f : exp2f(ms - mm);
+      acc += w * s_o[s * NMT + t][row][col];
+      ll += w * s_l[s * NMT + t][row];
+    }
+    s_o[t][row][col] = acc;
+    if (col == 0) { c_m[t * 16 + row] = mm; c_l[t * 16 + row] = ll; }
+  }
+  cluster.sync();
+
+  for (int i = rank * WARPS * 32 + threadIdx.x; i < M * D; i += C * WARPS * 32) {
+    const int r = i / D, col = i % D;
+    float mm = -INFINITY;
+    for (int c = 0; c < C; ++c) mm = fmaxf(mm, cluster.map_shared_rank(c_m, c)[r]);
+    float acc = 0.f, ll = 0.f;
+    for (int c = 0; c < C; ++c) {
+      const float mc = cluster.map_shared_rank(c_m, c)[r];
+      const float w = mc == -INFINITY ? 0.f : exp2f(mc - mm);
+      acc += w * cluster.map_shared_rank(&s_o[0][0][0], c)[r * D + col];
+      ll += w * cluster.map_shared_rank(c_l, c)[r];
+    }
+    out[((int64_t)(b * L + r / G) * Hq + kvh * G + r % G) * D + col] = __float2bfloat16(ll > 0.f ? acc / ll : 0.f);
+  }
+  cluster.sync();
+}
+
+template <int NMT>
+static void launch(const cudaLaunchConfig_t& cfg, torch::Tensor& q, torch::Tensor& kc, torch::Tensor& vc,
+                   torch::Tensor& pt, torch::Tensor& seqlens, torch::Tensor& out,
+                   int L, int Hq, int Hkv, int ps, int window, float scale) {
+  static bool init = false;
+  if (!init) {
+    cudaFuncSetAttribute(cluster_attn_kernel<NMT>, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+    init = true;
+  }
+  cudaLaunchKernelEx(&cfg, cluster_attn_kernel<NMT>,
+                     (const uint8_t*)q.data_ptr(), (const uint8_t*)kc.data_ptr(), (const uint8_t*)vc.data_ptr(),
+                     (const int*)pt.data_ptr(), (int)pt.stride(0), (const int*)seqlens.data_ptr(),
+                     (__nv_bfloat16*)out.data_ptr(), L, Hq, Hkv, ps, window, scale);
+}
+
+int64_t cluster_size() {
+  cudaFuncSetAttribute(cluster_attn_kernel<4>, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+  for (int c : {16, 8, 4}) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(c, 1, 1);
+    cfg.blockDim = dim3(WARPS * 32);
+    cudaLaunchAttribute attr;
+    attr.id = cudaLaunchAttributeClusterDimension;
+    attr.val.clusterDim.x = c; attr.val.clusterDim.y = 1; attr.val.clusterDim.z = 1;
+    cfg.attrs = &attr;
+    cfg.numAttrs = 1;
+    int n = 0;
+    if (cudaOccupancyMaxActiveClusters(&n, cluster_attn_kernel<4>, &cfg) == cudaSuccess && n > 0) return c;
+    cudaGetLastError();
+  }
+  return 0;
+}
+
+void cluster_attn(torch::Tensor q, torch::Tensor kc, torch::Tensor vc, torch::Tensor pt, torch::Tensor seqlens,
+                  torch::Tensor out, int64_t L, int64_t Hq, int64_t Hkv, int64_t ps, int64_t window,
+                  double scale, int64_t C) {
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(C, Hkv, seqlens.size(0));
+  cfg.blockDim = dim3(WARPS * 32);
+  cfg.stream = at::cuda::getCurrentCUDAStream();
+  cudaLaunchAttribute attr;
+  attr.id = cudaLaunchAttributeClusterDimension;
+  attr.val.clusterDim.x = C; attr.val.clusterDim.y = 1; attr.val.clusterDim.z = 1;
+  cfg.attrs = &attr;
+  cfg.numAttrs = 1;
+  const int M = L * (Hq / Hkv);
+  if (M <= 16) launch<1>(cfg, q, kc, vc, pt, seqlens, out, L, Hq, Hkv, ps, window, scale);
+  else if (M <= 32) launch<2>(cfg, q, kc, vc, pt, seqlens, out, L, Hq, Hkv, ps, window, scale);
+  else launch<4>(cfg, q, kc, vc, pt, seqlens, out, L, Hq, Hkv, ps, window, scale);
+}
+"""
+_CLUSTER_DECL = (
+    "void cluster_attn(torch::Tensor q, torch::Tensor kc, torch::Tensor vc, torch::Tensor pt, "
+    "torch::Tensor seqlens, torch::Tensor out, int64_t L, int64_t Hq, int64_t Hkv, int64_t ps, "
+    "int64_t window, double scale, int64_t C);\nint64_t cluster_size();"
+)
+
+
+def _build_cluster():
+    """Compile the cluster split-KV kernel; None (FA3 path) if the build or cluster query fails."""
+    try:
+        ext = load_inline(
+            name="muse_cluster_attn_sm90",
+            cpp_sources=[_CLUSTER_DECL],
+            cuda_sources=[_CLUSTER_SRC],
+            functions=["cluster_attn", "cluster_size"],
+            extra_cuda_cflags=["-O3", "-std=c++20", "-gencode=arch=compute_90a,code=sm_90a"],
+            verbose=False,
+        )
+        size = ext.cluster_size()
+        print(f"cluster_attn: cluster size {size}")
+        return (ext, size) if size else None
+    except Exception as e:
+        print(f"cluster_attn unavailable, FA3 fallback: {e}")
+        return None
+
+
+_CLUSTER = _build_cluster() if torch.cuda.is_available() else None
 
 
 class Config(TypedDict):
@@ -58,6 +353,7 @@ class Inputs(TypedDict):
 RMS_EPS = 1e-5  # Muse / SGLang RMSNorm epsilon (matches baseline + reference)
 FP8 = torch.float8_e4m3fn  # E4M3 cache + FA3 query dtype on the scored FP8 path
 FP8_E4M3_MAX = 448.0  # saturate before FP8 cast (same bound as FusedQKNorm)
+LOG2E = 1.4426950408889634
 _NORMS = {}  # cache FusedQKNorm modules keyed by (hq, hkv, d) — config-stable, not per-input
 _ROPE = {}  # cache float32 cos|sin tables keyed by rope_theta — built once per theta
 _Q_WORK = {}  # fixed-address FP8 Q buffers keyed by config shape (DScale graph-stable)
@@ -375,6 +671,16 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
             q = q.view(batch, length, hq, d)
 
     window = cfg["window"]  # 2048 or 0
+    if _CLUSTER is not None and not scaled and d == 64 and length * hq // hkv <= 64:
+        out = torch.empty(tokens, hq, d, dtype=torch.bfloat16, device=device)
+        _CLUSTER[0].cluster_attn(
+            q, k_cache, v_cache, data["page_table"], data["cache_seqlens"], out,
+            length, hq, hkv, cfg["page_size"], window,
+            cfg["sm_scale"] * cfg["qk_scale_factor"] * LOG2E, _CLUSTER[1],
+        )
+        gate = qkv[:, (hq + 2 * hkv) * d:]
+        return _fused_rms_norm_gate(out, gate, tokens, hq, d, length).view(batch, length, hq * d)
+
     descale = {}  # FA3 optional KV descale tensors
     if scaled:
         # broadcast scalar scales to [B, Hkv] as flash_attn_with_kvcache expects
