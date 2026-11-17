@@ -2137,10 +2137,6 @@ def run_wide2(x, layer, n, st):
         raise RuntimeError(f"wide2 launch failed: {rc}")
     return out
 
-"""Experimental lossless BF16 register-A WGMMA projections, one launch per call."""
-import hashlib
-import torch
-from torch.utils.cpp_extension import load_inline
 
 # ---- router/router_kernels.py ----
 
