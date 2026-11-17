@@ -1,6 +1,4 @@
-# Index by Muse challenge
-
-# Tracked subset: muse_bf16_proj + muse_attention_decode only.
+# Papers by Muse challenge
 
 ## muse_bf16_proj (8)
 - ThunderKittens: Simple, Fast, and Adorable AI Kernels [high]
