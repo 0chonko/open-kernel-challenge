@@ -1,8 +1,11 @@
 # okc: problem=muse_attention_decode
-"""FA3 gated decode + single-pass full-context GQA.
+"""FA3 gated decode with a hardware-aware Split-KV schedule.
 
-Sliding layers stay on FA3. Full context (window == 0) uses a Triton kernel that
-loads each KV byte once and dots it with all 8 query heads sharing that KV head.
+Attention is two skinny GEMMs (Q@K^T, P@V). Decode has tiny M (L=1), so FA3
+Split-KV partitions the long sequence axis — the same idea as GEMM SplitK —
+to fill Hopper SMs. Heuristic (num_splits=0) already does this well on full
+decode (~57@B1) and on verify (denser M); sliding windows have few N-blocks
+and underfill, so we force a config-keyed split count there.
 """
 
 from typing import TypedDict  # shape/dtype contracts for Inputs / Config
@@ -54,10 +57,9 @@ FP8 = torch.float8_e4m3fn  # E4M3 cache + FA3 query dtype on the scored FP8 path
 FP8_E4M3_MAX = 448.0  # saturate before FP8 cast (same bound as FusedQKNorm)
 _NORMS = {}  # cache FusedQKNorm modules keyed by (hq, hkv, d) — config-stable, not per-input
 _ROPE = {}  # cache float32 cos|sin tables keyed by rope_theta — built once per theta
-_Q_WORK = {}  # fixed-address FP8 Q buffers keyed by config shape (DScale graph-stable)
-_ATTN_WS = {}  # full-attn partials + merged out, keyed by config shape
+_Q_WORK = {}  # fixed-address FP8 Q buffers keyed by config shape (graph-stable)
 ROPE_POSITIONS = 1 << 21  # SGLang RotaryEmbedding table length (covers long contexts)
-# ThunderKittens / Hopper WGMMA-friendly strip height
+# ThunderKittens / Hopper WGMMA-friendly strip height for fused prep/epi
 TK_TILE_M = 16
 
 
@@ -92,14 +94,14 @@ def _q_workspace(tokens, hq, d, device):
 
 
 def _path_tile(q_len: int, n_rows: int) -> tuple[int, int]:
-    """DScale path-aware (BLOCK_M, num_warps): verify raises M; decode keeps TK-16."""
-    if q_len == 8:  # verify — Dissecting-Hopper: fill GMMA fragments, don't under-tile
+    """(BLOCK_M, num_warps) for fused prep/epi: verify raises M; decode keeps TK-16."""
+    if q_len == 8:  # verify — denser strip when many (token, head) rows
         if n_rows >= 4096:
-            return 32, 8  # B≥32 verify: wider strip + more warps
+            return 32, 8
         if n_rows >= TK_TILE_M:
             return TK_TILE_M, 4
         return 8, 4
-    # decode: tip TK tiles (16-row default); only shrink below one strip
+    # decode: TK-16 default; shrink only below one strip
     if n_rows >= 65536:
         return 32, 4
     if n_rows >= TK_TILE_M:
@@ -107,6 +109,20 @@ def _path_tile(q_len: int, n_rows: int) -> tuple[int, int]:
     if n_rows >= 8:
         return 8, 4
     return 4, 4
+
+
+def _fa3_num_splits(cfg) -> int:
+    """Config-only Split-KV count. 0 = FA3 heuristic. Graph-safe (no tensor reads).
+
+    PackGQA m_blocks ≈ ceil(B*L*(Hq/Hkv)/64)*Hkv is tiny on decode L=1, so SM
+    occupancy comes from sequence splits. H200≈132 SMs; full-ctx heuristic already
+    fills them (~57@B1). Sliding has ~window/BN N-blocks → underfill → force.
+    Forced num_splits=1 previously doubled sliding FA time; keep verify/full at 0.
+    """
+    if cfg["q_len"] != 1 or cfg["window"] == 0:
+        return 0
+    # scored sliding decode batches: bump splits to occupy idle SMs
+    return {1: 16, 16: 16, 32: 8}.get(cfg["batch"], 0)
 
 
 @triton.jit
@@ -235,7 +251,7 @@ def _fused_qk_rope_store(qkv, positions, cos_sin, k_cache, v_cache, cache_loc, h
     tokens = qkv.shape[0]  # B*L flattened token count
     heads = hq + 2 * hkv  # Q+K+V heads processed as rows
     n_rows = tokens * heads  # total (token, head) rows
-    block_m, n_warps = _path_tile(q_len, n_rows)  # DScale: verify vs decode tiles
+    block_m, n_warps = _path_tile(q_len, n_rows)
     q_out = _q_workspace(tokens, hq, d, qkv.device)  # fixed-address FP8 Q
     # flatten paged caches to [rows, Hkv*D] so the kernel can address by cache_loc
     k_flat = k_cache.view(-1, hkv * d)
@@ -314,229 +330,8 @@ def _fused_rms_norm_gate(attn_out, gate, tokens, hq, d, q_len):
     return out  # [T, Hq*D] bfloat16
 
 
-NEG = tl.constexpr(-1.0e20)
-
-
-def _custom_full(cfg) -> bool:
-    """Full-context shapes this kernel covers. Group is 8 for both tp8 and dp."""
-    hq, hkv, d = cfg["num_q_heads"], cfg["num_kv_heads"], cfg["head_dim"]
-    return (
-        cfg["window"] == 0
-        and d == 64
-        and cfg["q_len"] in (1, 8)
-        and hkv > 0
-        and hq % hkv == 0
-        and hq // hkv == 8
-    )
-
-
-def _attn_splits(batch: int, hkv: int) -> int:
-    """Enough CTAs to hide page_size=1 gather latency. Config-only, graph-stable."""
-    target = 132 * 4  # ~4 warps/SM at 4 warps per CTA
-    return max(1, min(64, target // max(batch * hkv, 1)))
-
-
-def _attn_ws(splits, batch, length, hq, d, device):
-    key = (splits, batch, length, hq, d, device.index if device.index is not None else 0)
-    buf = _ATTN_WS.get(key)
-    if buf is None or buf[0].device != device:
-        acc = torch.empty(splits, batch, length, hq, d, dtype=torch.float32, device=device)
-        lse = torch.empty(splits, batch, length, hq, dtype=torch.float32, device=device)
-        out = torch.empty(batch, length, hq, d, dtype=torch.bfloat16, device=device)
-        buf = _ATTN_WS[key] = (acc, lse, out)
-    return buf
-
-
-@triton.jit
-def _full_attn_kernel(
-    Q, K, V, Page, Seqlens, Acc, Lse, Kscale, Vscale,
-    softmax_scale,
-    stride_qb, stride_ql, stride_qh,
-    stride_pb, stride_pp,
-    stride_k0, stride_k1, stride_k2,
-    stride_v0, stride_v1, stride_v2,
-    stride_as, stride_ab, stride_al, stride_ah, stride_ad,
-    stride_ls, stride_lb, stride_ll, stride_lh,
-    n_splits,
-    GROUP: tl.constexpr,
-    D: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    SEQ_Q: tl.constexpr,
-    PAGE_SIZE: tl.constexpr,
-):
-    """One CTA: (batch, kv_head, seq split). All GROUP query heads share one KV load."""
-    pid_b = tl.program_id(0)
-    pid_h = tl.program_id(1)
-    pid_s = tl.program_id(2)
-    seq = tl.load(Seqlens + pid_b).to(tl.int32)
-    chunk = (seq + n_splits - 1) // n_splits
-    start = pid_s * chunk
-    end = tl.minimum(start + chunk, seq)
-
-    s_idx = tl.arange(0, SEQ_Q)
-    g_idx = tl.arange(0, GROUP)
-    d_idx = tl.arange(0, D)
-    heads = pid_h * GROUP + g_idx
-    q = tl.load(
-        Q + pid_b * stride_qb
-        + s_idx[:, None, None] * stride_ql
-        + heads[None, :, None] * stride_qh
-        + d_idx[None, None, :]
-    ).to(tl.float16)
-    # Pad M to 16 so tl.dot hits tensor cores; the extra 8 rows stay zero.
-    sel = (tl.arange(0, 16)[:, None] == g_idx[None, :]).to(tl.float32)
-    take16 = (g_idx[:, None] == tl.arange(0, 16)[None, :]).to(tl.float32)
-    q16 = tl.zeros([SEQ_Q, 16, D], tl.float16)
-    for s in tl.static_range(SEQ_Q):
-        row = (s_idx == s)[:, None, None]
-        qs = tl.sum(q.to(tl.float32) * row.to(tl.float32), axis=0)
-        padded = tl.sum(sel[:, :, None] * qs[None, :, :], axis=1).to(tl.float16)
-        q16 = tl.where(row, padded[None, :, :], q16)
-
-    ks = tl.load(Kscale).to(tl.float32)
-    vs = tl.load(Vscale).to(tl.float32)
-    scale = softmax_scale * ks
-    m_i = tl.full([SEQ_Q, GROUP], NEG, tl.float32)
-    l_i = tl.zeros([SEQ_Q, GROUP], tl.float32)
-    acc = tl.zeros([SEQ_Q, GROUP, D], tl.float32)
-
-    span = tl.maximum(end - start, 0)
-    n_tiles = (span + BLOCK_N - 1) // BLOCK_N
-    for t in tl.range(n_tiles):
-        tile = start + t * BLOCK_N
-        pos = tile + tl.arange(0, BLOCK_N)
-        inb = pos < end
-        page = pos // PAGE_SIZE
-        off = pos % PAGE_SIZE
-        phys = tl.load(Page + pid_b * stride_pb + page * stride_pp, mask=inb, other=0).to(tl.int64)
-        d64 = d_idx.to(tl.int64)
-        k_off = phys[:, None] * stride_k0 + off[:, None].to(tl.int64) * stride_k1 + pid_h * stride_k2 + d64[None, :]
-        v_off = phys[:, None] * stride_v0 + off[:, None].to(tl.int64) * stride_v1 + pid_h * stride_v2 + d64[None, :]
-        k_ptr = tl.max_contiguous(tl.multiple_of(K + k_off, [1, 16]), [1, 16])
-        v_ptr = tl.max_contiguous(tl.multiple_of(V + v_off, [1, 16]), [1, 16])
-        k = tl.load(k_ptr, mask=inb[:, None], other=0.0).to(tl.float16)
-        v = tl.load(v_ptr, mask=inb[:, None], other=0.0).to(tl.float16)
-        for s in tl.static_range(SEQ_Q):
-            last = seq - SEQ_Q + s  # query s attends positions 0..seq_lens+s
-            attend = inb & (pos <= last)
-            pick = (s_idx == s)
-            q_s = tl.sum(q16.to(tl.float32) * pick[:, None, None].to(tl.float32), axis=0).to(tl.float16)
-            scores16 = tl.dot(q_s, tl.trans(k))
-            scores = tl.sum(take16[:, :, None] * scores16[None, :, :], axis=1) * scale
-            scores = tl.where(attend[None, :], scores, NEG)
-            m_row = tl.sum(tl.where(pick[:, None], m_i, 0.0), axis=0)
-            l_row = tl.sum(tl.where(pick[:, None], l_i, 0.0), axis=0)
-            a_row = tl.sum(tl.where(pick[:, None, None], acc, 0.0), axis=0)
-            m_tile = tl.max(scores, axis=1)
-            tile_has = m_tile > -1.0e19
-            m_new = tl.where(tile_has, tl.maximum(m_row, m_tile), m_row)
-            safe_m = tl.where(tile_has, m_new, 0.0)
-            alpha = tl.exp(tl.where(tile_has, m_row - m_new, 0.0))
-            p = tl.where(attend[None, :], tl.exp(scores - safe_m[:, None]), 0.0)
-            p16 = tl.sum(sel[:, :, None] * p[None, :, :], axis=1).to(tl.float16)
-            pv16 = tl.dot(p16, v)
-            pv = tl.sum(take16[:, :, None] * pv16[None, :, :], axis=1).to(tl.float32) * vs
-            a_new = a_row * alpha[:, None] + pv
-            l_new = l_row * alpha + tl.sum(p, axis=1)
-            m_i = tl.where(pick[:, None], m_new[None, :], m_i)
-            l_i = tl.where(pick[:, None], l_new[None, :], l_i)
-            acc = tl.where(pick[:, None, None], a_new[None, :, :], acc)
-
-    lse = tl.where(l_i > 0, m_i + tl.log(l_i), NEG)
-    acc_n = tl.where((l_i > 0)[:, :, None], acc / l_i[:, :, None], 0.0)
-    acc_off = (
-        pid_s * stride_as + pid_b * stride_ab
-        + s_idx[:, None, None] * stride_al
-        + heads[None, :, None] * stride_ah
-        + d_idx[None, None, :] * stride_ad
-    )
-    lse_off = pid_s * stride_ls + pid_b * stride_lb + s_idx[:, None] * stride_ll + heads[None, :] * stride_lh
-    tl.store(Acc + acc_off, acc_n)
-    tl.store(Lse + lse_off, lse)
-
-
-@triton.jit
-def _merge_kernel(
-    Acc, Lse, Out, n_splits,
-    stride_as, stride_ab, stride_al, stride_ah, stride_ad,
-    stride_ls, stride_lb, stride_ll, stride_lh,
-    stride_ob, stride_ol, stride_oh, stride_od,
-    D: tl.constexpr,
-):
-    """Combine split partials. Stored rows are already normalized; weight by exp(lse)."""
-    pid_b = tl.program_id(0)
-    pid_l = tl.program_id(1)
-    pid_h = tl.program_id(2)
-    d_idx = tl.arange(0, D)
-    m = tl.full((), NEG, tl.float32)
-    wsum = tl.zeros((), tl.float32)
-    acc = tl.zeros([D], tl.float32)
-    for sp in tl.range(n_splits):
-        lse = tl.load(Lse + sp * stride_ls + pid_b * stride_lb + pid_l * stride_ll + pid_h * stride_lh)
-        a = tl.load(Acc + sp * stride_as + pid_b * stride_ab + pid_l * stride_al + pid_h * stride_ah + d_idx * stride_ad)
-        active = lse > -1.0e19
-        seen = m > -1.0e19
-        m_new = tl.where(active, tl.maximum(m, lse), m)
-        safe = tl.where(m_new > -1.0e19, m_new, 0.0)
-        alpha = tl.where(seen, tl.exp(m - safe), 0.0)
-        beta = tl.where(active, tl.exp(lse - safe), 0.0)
-        acc = acc * alpha + a * beta
-        wsum = wsum * alpha + beta
-        m = m_new
-    out = tl.where(wsum > 0, acc / wsum, 0.0)
-    tl.store(
-        Out + pid_b * stride_ob + pid_l * stride_ol + pid_h * stride_oh + d_idx * stride_od,
-        out.to(tl.bfloat16),
-    )
-
-
-def _full_context_attn(q, k_cache, v_cache, page_table, cache_seqlens, cfg, k_scale, v_scale):
-    """Paged GQA over the whole context. q is FP8 [B, L, Hq, D]. Returns bf16 [B, L, Hq, D]."""
-    batch, length, hq, d = q.shape
-    hkv = cfg["num_kv_heads"]
-    splits = _attn_splits(batch, hkv)
-    block_n = 64 if length == 1 else 32
-    acc, lse, out = _attn_ws(splits, batch, length, hq, d, q.device)
-    _full_attn_kernel[(batch, hkv, splits)](
-        q, k_cache, v_cache, page_table, cache_seqlens, acc, lse, k_scale, v_scale,
-        cfg["sm_scale"] * cfg["qk_scale_factor"],
-        q.stride(0), q.stride(1), q.stride(2),
-        page_table.stride(0), page_table.stride(1),
-        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
-        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
-        acc.stride(0), acc.stride(1), acc.stride(2), acc.stride(3), acc.stride(4),
-        lse.stride(0), lse.stride(1), lse.stride(2), lse.stride(3),
-        splits,
-        GROUP=8,
-        D=d,
-        BLOCK_N=block_n,
-        SEQ_Q=length,
-        PAGE_SIZE=cfg["page_size"],
-        num_warps=4,
-        num_stages=1,
-    )
-    _merge_kernel[(batch, length, hq)](
-        acc, lse, out, splits,
-        acc.stride(0), acc.stride(1), acc.stride(2), acc.stride(3), acc.stride(4),
-        lse.stride(0), lse.stride(1), lse.stride(2), lse.stride(3),
-        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-        D=d,
-        num_warps=2,
-    )
-    return out
-
-
-def _verify_fa3_knobs(cfg):
-    """L=8 FA3 specialization: pack GQA; keep heuristic splits (forced splits hurt verify)."""
-    if cfg["q_len"] != 8:
-        return 0, None  # decode: tip defaults
-    # pack heads into denser WGMMA tiles; num_splits=0 → FA3 heuristic (tip-stable)
-    pack = True if (cfg["num_q_heads"] > cfg["num_kv_heads"]) else None
-    return 0, pack
-
-
 def kernel_fn(data: Inputs) -> torch.Tensor:
-    """Timed entry: fused prep → full-context GQA or FA3 → fused gated RMS epilogue."""
+    """Timed entry: fused prep (or scaled fallback) → FA3 → fused gated RMS epilogue."""
     cfg = data["config"]  # static knobs for this captured graph
     batch, length = cfg["batch"], cfg["q_len"]  # B, L
     hq, hkv, d = cfg["num_q_heads"], cfg["num_kv_heads"], cfg["head_dim"]  # head geometry
@@ -546,11 +341,13 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
     scaled = cfg["kv_scale"] != 1.0  # non-unity scales need descales + divide-before-store
     has_rope = bool(cfg["rope_theta"])  # sliding layers only
     verify = length == 8  # config-stable branch (CUDA-graph OK)
-    num_splits, pack_gqa = _verify_fa3_knobs(cfg)
+    num_splits = _fa3_num_splits(cfg)
     # FA3 scheduler only on full-attn decode; drop if we force splits
     sched = data["scheduler_metadata"] if num_splits == 0 else None
     # L=8 always dense batch Q; decode uses batch when no fixed schedule (sliding)
     use_batch_q = verify or sched is None
+    # verify: PackGQA densifies WGMMA along heads; decode batch path always packs
+    pack_gqa = True if (verify and hq > hkv) else None
 
     k_cache, v_cache = data["k_cache"], data["v_cache"]  # in-place FP8 pools
 
@@ -582,45 +379,45 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
             q = q.view(batch, length, hq, d)
 
     window = cfg["window"]  # 2048 or 0
-    if _custom_full(cfg):
-        attn = _full_context_attn(
-            q.view(batch, length, hq, d), k_cache, v_cache,
-            data["page_table"], data["cache_seqlens"], cfg, data["k_scale"], data["v_scale"],
+    descale = {}  # FA3 optional KV descale tensors
+    if scaled:
+        # broadcast scalar scales to [B, Hkv] as flash_attn_with_kvcache expects
+        descale = dict(
+            k_descale=data["k_scale"].reshape(1, 1).expand(batch, hkv),
+            v_descale=data["v_scale"].reshape(1, 1).expand(batch, hkv),
         )
+
+    # FlashAttention-3: batch layout for verify/sliding; varlen+schedule for full decode
+    fa_kwargs = dict(
+        q=q,  # FP8 queries — [B,L,Hq,D] or [T,Hq,D]
+        k_cache=k_cache,  # FP8 paged K
+        v_cache=v_cache,  # FP8 paged V
+        page_table=data["page_table"],  # logical→physical pages
+        cache_seqlens=data["cache_seqlens"],  # KV lengths including this block
+        # fold Muse's 5.473 query gain into softmax scale (same as SGLang)
+        softmax_scale=cfg["sm_scale"] * cfg["qk_scale_factor"],
+        causal=True,  # decode/verify causality inside the block
+        # sliding: last `window` tokens → FA window (window-1, 0); full → (-1, -1)
+        window_size=(window - 1, 0) if window else (-1, -1),
+        scheduler_metadata=sched,  # only non-None on full decode with heuristic splits
+        num_splits=num_splits,  # 0 → FA3 heuristic; else forced Split-KV
+        **descale,  # empty on scored unity-scale loads
+    )
+    if use_batch_q:
+        # batch Q path: PackGQA densifies WGMMA along heads when verify requests it
+        fa_kwargs["pack_gqa"] = True if pack_gqa is None else pack_gqa
+        fa_kwargs["max_seqlen_q"] = length  # uniform_q_len hint for FA3
     else:
-        descale = {}  # FA3 optional KV descale tensors
-        if scaled:
-            # broadcast scalar scales to [B, Hkv] as flash_attn_with_kvcache expects
-            descale = dict(
-                k_descale=data["k_scale"].reshape(1, 1).expand(batch, hkv),
-                v_descale=data["v_scale"].reshape(1, 1).expand(batch, hkv),
-            )
-        # Sliding (and any shape the custom kernel does not cover): FA3.
-        fa_kwargs = dict(
-            q=q,  # FP8 queries — [B,L,Hq,D] or [T,Hq,D]
-            k_cache=k_cache,
-            v_cache=v_cache,
-            page_table=data["page_table"],
-            cache_seqlens=data["cache_seqlens"],
-            softmax_scale=cfg["sm_scale"] * cfg["qk_scale_factor"],
-            causal=True,
-            window_size=(window - 1, 0) if window else (-1, -1),
-            scheduler_metadata=sched,
-            num_splits=num_splits,
-            **descale,
-        )
-        if use_batch_q:
-            fa_kwargs["pack_gqa"] = True if pack_gqa is None else pack_gqa
-            fa_kwargs["max_seqlen_q"] = length
-        else:
-            fa_kwargs["cu_seqlens_q"] = data["cu_seqlens_q"]
-            fa_kwargs["max_seqlen_q"] = length
-            if pack_gqa is not None:
-                fa_kwargs["pack_gqa"] = pack_gqa
-        attn = flash_attn_with_kvcache(**fa_kwargs)
-        if isinstance(attn, tuple):
-            attn = attn[0]
+        fa_kwargs["cu_seqlens_q"] = data["cu_seqlens_q"]
+        fa_kwargs["max_seqlen_q"] = length
+        if pack_gqa is not None:
+            fa_kwargs["pack_gqa"] = pack_gqa
+
+    out = flash_attn_with_kvcache(**fa_kwargs)
+    if isinstance(out, tuple):  # some FA builds return (out, softmax_lse, ...)
+        out = out[0]
 
     gate = qkv[:, (hq + 2 * hkv) * d:]  # gate logits share the fused projection buffer
-    o = _fused_rms_norm_gate(attn, gate, tokens, hq, d, length)
+    # fused epilogue: avoid separate .to(bf16) materialization + rms_norm_gate launch
+    o = _fused_rms_norm_gate(out, gate, tokens, hq, d, length)
     return o.view(batch, length, hq * d)  # judge expects bf16 [B, L, Hq*D]
