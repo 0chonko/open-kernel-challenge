@@ -2,7 +2,6 @@
 """Assemble step 6/6: +cublasLt + m32w (full piece stack). Unclaimed → SGLang."""
 
 import hashlib
-import zlib
 from typing import TypedDict
 
 import torch
