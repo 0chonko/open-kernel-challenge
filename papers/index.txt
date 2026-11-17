@@ -1,0 +1,26 @@
+# Index by Muse challenge
+
+# Tracked subset: muse_bf16_proj + muse_attention_decode only.
+
+## muse_bf16_proj (8)
+- ThunderKittens: Simple, Fast, and Adorable AI Kernels [high]
+- Ladder: Enabling Efficient Low-Precision Deep Learning Computing through Hardware-aware Tensor Transformation [med]
+- FlashInfer: Efficient and Customizable Attention Engine for LLM Inference Serving [high]
+- FlashAttention-4: Algorithm and Kernel Pipelining Co-Design for Asymmetric Hardware Scaling [high]
+- TileLang: A Composable Tile-Level Programming System for Modern AI Kernels [med]
+- PipeThreader: Software-Defined Pipelining for Efficient DNN Execution [low]
+- Tilus: A Tile-Level GPGPU Programming Language for Low-Precision Computation [low]
+- Stream-K: Work-Centric Parallel Decomposition for Dense Matrix-Matrix Multiplication on the GPU [high]
+
+## muse_attention_decode (11)
+- FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision [high]
+- ThunderKittens: Simple, Fast, and Adorable AI Kernels [high]
+- QServe: W4A8KV4 Quantization and System Co-design for Efficient LLM Serving [med]
+- FlashInfer: Efficient and Customizable Attention Engine for LLM Inference Serving [high]
+- FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning [high]
+- POD-Attention: Unlocking Full Prefill-Decode Overlap for Faster LLM Inference [med]
+- Flex Attention: A Programming Model for Generating Optimized Attention Kernels [low]
+- FlashAttention-4: Algorithm and Kernel Pipelining Co-Design for Asymmetric Hardware Scaling [high]
+- TileLang: A Composable Tile-Level Programming System for Modern AI Kernels [med]
+- SageAttention3: Microscaling FP4 Attention for Inference and An Exploration of 8-Bit Training [high]
+- Efficient Memory Management for Large Language Model Serving with PagedAttention [med]
