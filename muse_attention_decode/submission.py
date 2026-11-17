@@ -1,101 +1,626 @@
 # okc: problem=muse_attention_decode
-"""Starter: the attention step in plain PyTorch, correct but slow. Each request attends over
-every position its page table can hold in the paged FP8 cache, with positions past its
-context or outside the window masked out.
+"""FA3 gated decode + single-pass full-context GQA.
 
-Implement kernel_fn."""
+Sliding layers stay on FA3. Full context (window == 0) uses a Triton kernel that
+loads each KV byte once and dots it with all 8 query heads sharing that KV head.
+"""
 
-from typing import TypedDict
+from typing import TypedDict  # shape/dtype contracts for Inputs / Config
 
-import torch
+import torch  # tensors, dtypes, device ops (CUDA-graph safe: no .item/.cpu/sync in kernel_fn)
+import triton  # JIT GPU compiler used for prep + epilogue fusion
+import triton.language as tl  # Triton DSL: loads, stores, math inside device kernels
+
+# FA3 paged decode entry (Hopper FP8 path used by SGLang Muse)
+from sgl_kernel.flash_attn import flash_attn_with_kvcache
+# separate store path when cache scales are not 1 (fused prep assumes unity scales)
+from sglang.kernels.ops.kvcache.kvcache import store_cache
+# baseline QK-norm[+RoPE] when we cannot use the unity-scale fused prep
+from sglang.kernels.ops.muse_spark_v12.fused_qk_norm import FusedQKNorm
 
 
 class Config(TypedDict):
-    batch: int            # B
-    q_len: int            # L: 1 for decode, 8 for a speculative verify block (causal inside it)
-    num_q_heads: int      # Hq: 16 per GPU under TP8
-    num_kv_heads: int     # Hkv: 2; each serves Hq / Hkv query heads
-    head_dim: int         # 64
-    page_size: int        # 1 in the scored cases (as SGLang serves Muse on H200), 64 in some tests
-    window: int           # 2048 on sliding-window layers (a token and the 2,047 before it); 0 = all
-    rope_theta: float     # 500000 on sliding-window layers; 0 = no RoPE
-    qk_scale_factor: float
-    sm_scale: float       # 1/8
-    kv_scale: float       # the cache scales' value: 1 in the scored cases (SGLang leaves them unset)
+    batch: int            # B — number of requests in the step
+    q_len: int            # L — 1 decode token, or 8 speculative verify tokens
+    num_q_heads: int      # Hq — 16 under TP8 on the scored shapes
+    num_kv_heads: int     # Hkv — 2; GQA groups share each KV head
+    head_dim: int         # D — 64 for Muse Spark
+    page_size: int        # 1 scored; 64 in some correctness tests
+    window: int           # 2048 sliding, or 0 = full-context attention
+    rope_theta: float     # 500000 on sliding; 0 disables RoPE (full layers)
+    qk_scale_factor: float  # 5.473 query gain; folded into FA softmax_scale
+    sm_scale: float       # 1/8 attention temperature
+    kv_scale: float       # cache dequant scale; 1 scored, 1/64 in some tests
 
 
 class Inputs(TypedDict):
-    qkv: torch.Tensor          # bfloat16 [B, L, (2*Hq + 2*Hkv)*64], 2304 under tp8: per token q (Hq*64),
-                               # then the block's keys before norm and RoPE (Hkv*64), values
-                               # (Hkv*64) and the output gate's logits (Hq*64)
-    positions: torch.Tensor    # int64 [B*L], each new token's position (seq_lens[b] + i)
-    cache_loc: torch.Tensor    # int64 [B*L], each new token's flat cache row (page * page_size + offset)
-    cache_seqlens: torch.Tensor  # int32 [B], seq_lens + L: what each request attends over
-    cu_seqlens_q: torch.Tensor   # int32 [B+1], 0, L, 2L, ...: the block's query offsets
-    scheduler_metadata: torch.Tensor | None  # int32, FA3's tile schedule (get_scheduler_metadata) on
-                                             # full-attention decode steps, else None
-    k_cache: torch.Tensor     # float8_e4m3fn [pages, page_size, Hkv, 64], written in place
-    v_cache: torch.Tensor     # float8_e4m3fn [pages, page_size, Hkv, 64], written in place
-    k_scale: torch.Tensor     # float32 [], key = e4m3 * k_scale
-    v_scale: torch.Tensor     # float32 [], value = e4m3 * v_scale
-    page_table: torch.Tensor  # int32 [B, max_pages], physical page of each logical page (-1 unused)
-    seq_lens: torch.Tensor    # int32 [B], cached tokens per request; the block starts at this position
-    config: Config
+    qkv: torch.Tensor          # bf16 [B,L,(2*Hq+2*Hkv)*D]: Q | K | V | gate logits
+    positions: torch.Tensor    # int64 [B*L] absolute positions for RoPE / causality
+    cache_loc: torch.Tensor    # int64 [B*L] flat FP8 cache rows to overwrite this step
+    cache_seqlens: torch.Tensor  # int32 [B] = seq_lens + L — FA3 KV length per request
+    cu_seqlens_q: torch.Tensor   # int32 [B+1] prefix sums of L — FA3 query packing
+    scheduler_metadata: torch.Tensor | None  # FA3 tile schedule on full-attn decode; else None
+    k_cache: torch.Tensor     # float8_e4m3fn [pages, page_size, Hkv, D], updated in place
+    v_cache: torch.Tensor     # float8_e4m3fn [pages, page_size, Hkv, D], updated in place
+    k_scale: torch.Tensor     # float32 [] — key = e4m3 * k_scale
+    v_scale: torch.Tensor     # float32 [] — value = e4m3 * v_scale
+    page_table: torch.Tensor  # int32 [B, max_pages] logical→physical page (-1 unused)
+    seq_lens: torch.Tensor    # int32 [B] cached tokens before this block
+    config: Config            # static shape knobs for this load (graph-capture safe to branch on)
 
 
-def rms(x, eps=1e-5):
-    x = x.float()
-    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+RMS_EPS = 1e-5  # Muse / SGLang RMSNorm epsilon (matches baseline + reference)
+FP8 = torch.float8_e4m3fn  # E4M3 cache + FA3 query dtype on the scored FP8 path
+FP8_E4M3_MAX = 448.0  # saturate before FP8 cast (same bound as FusedQKNorm)
+_NORMS = {}  # cache FusedQKNorm modules keyed by (hq, hkv, d) — config-stable, not per-input
+_ROPE = {}  # cache float32 cos|sin tables keyed by rope_theta — built once per theta
+_Q_WORK = {}  # fixed-address FP8 Q buffers keyed by config shape (DScale graph-stable)
+_ATTN_WS = {}  # full-attn partials + merged out, keyed by config shape
+ROPE_POSITIONS = 1 << 21  # SGLang RotaryEmbedding table length (covers long contexts)
+# ThunderKittens / Hopper WGMMA-friendly strip height
+TK_TILE_M = 16
 
 
-def rope(x, pos, theta):
-    """Interleaved (GPT-J) RoPE: pairs (2i, 2i+1) rotate by pos * theta^(-2i/d)."""
-    d = x.shape[-1]
-    inv_freq = 1.0 / (theta ** (torch.arange(0, d, 2, device=x.device).float() / d))
-    ang = pos.float()[..., None] * inv_freq
-    cos, sin = ang.cos().unsqueeze(-2), ang.sin().unsqueeze(-2)
-    even, odd = x[..., 0::2], x[..., 1::2]
-    return torch.stack([even * cos - odd * sin, even * sin + odd * cos], -1).flatten(-2)
+def _qk_norm(hq, hkv, d):
+    """Return a cached FusedQKNorm for this head layout (fallback / scaled-KV path)."""
+    key = (hq, hkv, d)  # module identity depends only on static head geometry
+    if key not in _NORMS:  # first use for this geometry: construct once
+        _NORMS[key] = FusedQKNorm(head_dim=d, num_q_heads=hq, num_kv_heads=hkv, eps=RMS_EPS)
+    return _NORMS[key]  # reuse across CUDA-graph captures of the same shape family
+
+
+def _cos_sin(theta, d, device):
+    """Build or reuse [2^21, D] float32 cos|sin (interleaved-half layout) for RoPE."""
+    cache = _ROPE.get(theta)  # theta is a config constant, safe to cache globally
+    if cache is None:  # cold theta: materialize the full position table on device
+        # inv_freq[i] = theta^(-2i/D) for pair index i — classic RoPE base frequencies
+        inv_freq = 1.0 / (theta ** (torch.arange(0, d, 2, dtype=torch.float, device=device) / d))
+        # freqs[p, i] = p * inv_freq[i] for every absolute position p in [0, 2^21)
+        freqs = torch.einsum("i,j -> ij", torch.arange(ROPE_POSITIONS, dtype=torch.float, device=device), inv_freq)
+        # SGLang layout: concat(cos, sin) along last dim → width D (D/2 + D/2)
+        cache = _ROPE[theta] = torch.cat((freqs.cos(), freqs.sin()), dim=-1)
+    return cache  # subsequent calls hit the module-level dict
+
+
+def _q_workspace(tokens, hq, d, device):
+    """Reuse a config-shaped FP8 Q buffer (address stable across CUDA-graph replays)."""
+    key = (tokens, hq, d, device.index if device.index is not None else 0)
+    buf = _Q_WORK.get(key)
+    if buf is None or buf.device != device:
+        buf = _Q_WORK[key] = torch.empty(tokens, hq * d, dtype=FP8, device=device)
+    return buf
+
+
+def _path_tile(q_len: int, n_rows: int) -> tuple[int, int]:
+    """DScale path-aware (BLOCK_M, num_warps): verify raises M; decode keeps TK-16."""
+    if q_len == 8:  # verify — Dissecting-Hopper: fill GMMA fragments, don't under-tile
+        if n_rows >= 4096:
+            return 32, 8  # B≥32 verify: wider strip + more warps
+        if n_rows >= TK_TILE_M:
+            return TK_TILE_M, 4
+        return 8, 4
+    # decode: tip TK tiles (16-row default); only shrink below one strip
+    if n_rows >= 65536:
+        return 32, 4
+    if n_rows >= TK_TILE_M:
+        return TK_TILE_M, 4
+    if n_rows >= 8:
+        return 8, 4
+    return 4, 4
+
+
+@triton.jit
+def _fused_qk_rope_store_kernel(
+    QKV,  # [T, qkv_width] fused projection: Q heads | K heads | V heads | gate
+    Q_OUT,  # [T, Hq*D] contiguous queries for FA3 (FP8 when FP8_KV_STORE)
+    POS,  # [T] positions; read only if HAS_ROPE
+    COS_SIN,  # [max_pos, D] fp32 cos then sin halves; read only if HAS_ROPE
+    K_CACHE,  # [N, Hkv*D] flat FP8/BF16 K pool rows
+    V_CACHE,  # [N, Hkv*D] flat FP8/BF16 V pool rows
+    CACHE_LOC,  # [T] destination row per token (slot 0 is LIVE here — do not skip)
+    eps,  # RMSNorm epsilon
+    stride_qkv,  # elements between successive tokens in QKV
+    n_rows,  # T * (Hq + 2*Hkv): one program row per (token, Q/K/V head)
+    NUM_Q_HEADS: tl.constexpr,  # Hq
+    NUM_KV_HEADS: tl.constexpr,  # Hkv
+    D: tl.constexpr,  # head_dim
+    BD: tl.constexpr,  # next_power_of_2(D) load width
+    BLOCK_M: tl.constexpr,  # rows per program — path-aware (16 verify / TK decode)
+    HAS_ROPE: tl.constexpr,  # 1 on sliding layers
+    FP8_KV_STORE: tl.constexpr,  # 1 → saturate + store E4M3, emit FP8 Q
+    FP8_MAX: tl.constexpr,  # 448.0
+):
+    """One launch: per-head RMSNorm Q/K, optional RoPE, FP8 KV store, FP8 Q out."""
+    pid = tl.program_id(0)  # which BLOCK_M-chunk of (token, head) rows we own
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)  # absolute row ids in this block
+    row_mask = rows < n_rows  # mask padded lanes past the last live row
+    cols = tl.arange(0, BD)  # column vector covering head_dim (possibly padded)
+    # D==BD (scored D=64): drop col mask so Triton can widen vector ld/st
+    mask = row_mask[:, None] if BD == D else (row_mask[:, None] & (cols < D)[None, :])
+
+    HEADS: tl.constexpr = NUM_Q_HEADS + 2 * NUM_KV_HEADS  # Q then K then V packing
+    INV_D: tl.constexpr = 1.0 / D  # mul instead of div.full in PTX
+    token = rows // HEADS  # which token this row belongs to
+    head = rows % HEADS  # which head index within Q|K|V
+    is_q = head < NUM_Q_HEADS  # query-head lanes
+    is_k = (head >= NUM_Q_HEADS) & (head < NUM_Q_HEADS + NUM_KV_HEADS)  # key-head lanes
+    is_v = head >= NUM_Q_HEADS + NUM_KV_HEADS  # value-head lanes (raw V, no RMSNorm)
+
+    src = token * stride_qkv + head * D  # base offset of this head's D elements in QKV
+    raw = tl.load(QKV + src[:, None] + cols[None, :], mask=mask, other=0.0)  # bf16/fp16 load
+    x = raw.to(tl.float32)  # RMS + RoPE math in fp32
+    var = tl.sum(tl.where(mask, x * x, 0.0), axis=1) * INV_D  # mean square over head_dim
+    rstd = tl.rsqrt(var + eps)  # reciprocal RMS
+    x = x * rstd[:, None]  # normalized Q/K (V overwritten later from raw)
+
+    if HAS_ROPE:  # sliding-window layers only
+        # match separate-RoPE numerics: rotate the bf16-rounded normalized row
+        x = x.to(QKV.dtype.element_ty).to(tl.float32)
+        # partner = cols^1 of x — register swap, no second QKV global load
+        even, odd = tl.split(tl.reshape(x, (BLOCK_M, BD // 2, 2)))
+        xp = tl.interleave(odd, even)
+        pos = tl.load(POS + token, mask=row_mask, other=0).to(tl.int64)  # absolute position
+        freq = cols // 2  # pair index into cos/sin half-tables
+        cos = tl.load(COS_SIN + pos[:, None] * D + freq[None, :], mask=mask, other=1.0)
+        sin = tl.load(COS_SIN + pos[:, None] * D + D // 2 + freq[None, :], mask=mask, other=0.0)
+        is_even = (cols % 2 == 0)[None, :]  # even idx = cos branch of the pair
+        x = tl.where(is_even, x * cos - xp * sin, xp * sin + x * cos)  # GPT-J interleaved RoPE
+
+    if FP8_KV_STORE:
+        x = x.to(QKV.dtype.element_ty).to(tl.float32)  # round-trip before FP8 saturate
+    # V stores the raw projection (no norm/RoPE); Q/K keep normalized[+rotated] x
+    x = tl.where(is_v[:, None], raw.to(tl.float32), x)
+    if FP8_KV_STORE:
+        x = tl.minimum(tl.maximum(x, -FP8_MAX), FP8_MAX)  # clamp to E4M3 dynamic range
+        x = x.to(tl.float8e4nv)  # pack path for wider FP8 stores
+
+    loc = tl.load(CACHE_LOC + token, mask=row_mask, other=0).to(tl.int64)  # dest row
+    # IMPORTANT vs SGLang FusedQKNorm: challenge marks slot 0 as a live cache row
+    # (baseline store_cache uses reserved_skip_index=-1), so we never skip loc==0.
+    kv_mask = mask  # every valid lane may write its cache slot
+    kv_head = tl.where(is_v, head - NUM_Q_HEADS - NUM_KV_HEADS, head - NUM_Q_HEADS)
+    kv_dst = loc * (NUM_KV_HEADS * D) + kv_head * D  # flat row-major KV address
+    tl.store(K_CACHE + kv_dst[:, None] + cols[None, :], x, mask=kv_mask & is_k[:, None])
+    tl.store(V_CACHE + kv_dst[:, None] + cols[None, :], x, mask=kv_mask & is_v[:, None])
+
+    q_dst = tl.where(is_q, (token * NUM_Q_HEADS + head) * D, 0)  # pack Q for FA3
+    tl.store(Q_OUT + q_dst[:, None] + cols[None, :], x, mask=mask & is_q[:, None])
+
+
+@triton.jit
+def _rms_norm_gate_epilogue_kernel(
+    X,  # FA3 output, logical [B, L, Hq, D] (any float dtype FA returned)
+    GATE,  # gate logits, logical [B, L, Hq, D], often a strided tail of qkv
+    OUT,  # [tokens*Hq, D] bf16 final gated normalized output
+    eps,  # RMSNorm epsilon
+    n_rows,  # tokens * Hq
+    stride_x_b,  # X batch stride (elements)
+    stride_x_l,  # X length stride
+    stride_x_h,  # X head stride
+    stride_g_b,  # GATE batch stride
+    stride_g_l,  # GATE length stride
+    stride_g_h,  # GATE head stride
+    stride_o,  # row stride of packed OUT
+    D: tl.constexpr,  # head_dim
+    BD: tl.constexpr,  # next_power_of_2(D)
+    BLOCK_M: tl.constexpr,  # path-aware multi-row tile
+    SEQ: tl.constexpr,  # L — 1 decode, 8 verify
+    NUM_Q_HEADS: tl.constexpr,  # Hq
+):
+    """Fuse FA→bf16 cast + per-head RMSNorm + sigmoid(gate); BLOCK_M rows/program."""
+    pid = tl.program_id(0)  # one program owns BLOCK_M (token, head) rows
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)  # absolute head-row ids
+    row_mask = rows < n_rows  # pad past the last live row
+    cols = tl.arange(0, BD)  # columns covering head_dim
+    INV_D: tl.constexpr = 1.0 / D  # mul instead of div.full in PTX
+    mask = row_mask[:, None] if BD == D else (row_mask[:, None] & (cols < D)[None, :])
+    tok = rows // NUM_Q_HEADS  # token in row-major [B, L]
+    head = rows % NUM_Q_HEADS
+    b = tok // SEQ
+    l = tok % SEQ
+    # last dim is contiguous on both inputs; strides cover the gate tail's token gap
+    x_off = b[:, None] * stride_x_b + l[:, None] * stride_x_l + head[:, None] * stride_x_h
+    g_off = b[:, None] * stride_g_b + l[:, None] * stride_g_l + head[:, None] * stride_g_h
+    x = tl.load(X + x_off + cols[None, :], mask=mask, other=0.0).to(tl.float32)
+    g = tl.load(GATE + g_off + cols[None, :], mask=mask, other=0.0).to(tl.float32)
+    var = tl.sum(tl.where(mask, x * x, 0.0), axis=1) * INV_D  # mean square per head-row
+    rstd = tl.rsqrt(var + eps)  # 1 / RMS
+    sig = tl.sigmoid(g)  # maps to ex2+rcp better than hand-rolled 1/(1+exp)
+    y = (x * rstd[:, None]) * sig  # rmsnorm(a) * sigmoid(gate)
+    tl.store(OUT + rows[:, None] * stride_o + cols[None, :], y.to(tl.bfloat16), mask=mask)
+
+
+def _fused_qk_rope_store(qkv, positions, cos_sin, k_cache, v_cache, cache_loc, hq, hkv, d, has_rope, q_len):
+    """Host wrapper: launch fused prep; returns FP8 Q ready for FA3 (unity kv_scale)."""
+    tokens = qkv.shape[0]  # B*L flattened token count
+    heads = hq + 2 * hkv  # Q+K+V heads processed as rows
+    n_rows = tokens * heads  # total (token, head) rows
+    block_m, n_warps = _path_tile(q_len, n_rows)  # DScale: verify vs decode tiles
+    q_out = _q_workspace(tokens, hq, d, qkv.device)  # fixed-address FP8 Q
+    # flatten paged caches to [rows, Hkv*D] so the kernel can address by cache_loc
+    k_flat = k_cache.view(-1, hkv * d)
+    v_flat = v_cache.view(-1, hkv * d)
+    _fused_qk_rope_store_kernel[(triton.cdiv(n_rows, block_m),)](
+        qkv,  # fused projection
+        q_out,  # FP8 Q destination
+        positions if has_rope else qkv,  # dummy ptr when no RoPE (not read)
+        cos_sin if has_rope else qkv,  # dummy ptr when no RoPE
+        k_flat,  # K cache rows
+        v_flat,  # V cache rows
+        cache_loc,  # per-token destinations
+        RMS_EPS,  # norm eps
+        qkv.stride(0),  # token stride
+        n_rows,  # grid bound
+        hq,  # NUM_Q_HEADS
+        hkv,  # NUM_KV_HEADS
+        d,  # D
+        triton.next_power_of_2(d),  # BD
+        block_m,  # BLOCK_M
+        HAS_ROPE=has_rope,  # compile-time RoPE switch
+        FP8_KV_STORE=True,  # always FP8 cache on this problem
+        FP8_MAX=FP8_E4M3_MAX,  # saturate bound
+        num_warps=n_warps,  # path-aware warp count
+    )
+    return q_out  # [T, Hq*D] float8_e4m3fn
+
+
+def _bhd_strides(t, length, hq, d):
+    """Logical [B, L, Hq, D] strides without copying. None if the layout isn't one we index."""
+    if t.ndim == 4 and t.shape[-1] == d and t.shape[-2] == hq:
+        return t, t.stride(0), t.stride(1), t.stride(2)
+    if t.ndim == 3 and t.shape[-1] == d and t.shape[-2] == hq:
+        st = t.stride(0)  # [T, Hq, D], T = B*L row-major
+        return t, st * length, st, t.stride(1)
+    if t.ndim == 2 and t.shape[-1] == hq * d and t.stride(-1) == 1:
+        st = t.stride(0)  # [T, Hq*D] including a strided gate tail
+        return t, st * length, st, d
+    if t.ndim == 2 and t.shape[-1] == d and t.stride(-1) == 1:
+        sd = t.stride(0)  # packed [T*Hq, D]
+        st = sd * hq
+        return t, st * length, st, sd
+    return None
+
+
+def _fused_rms_norm_gate(attn_out, gate, tokens, hq, d, q_len):
+    """Host wrapper: FA output + gate → bf16 [T, Hq*D] via one Triton epilogue."""
+    x = _bhd_strides(attn_out, q_len, hq, d)
+    if x is None:  # unexpected FA layout: one copy, then packed rows
+        flat = attn_out.reshape(tokens * hq, d).contiguous()
+        x = (flat, d * hq * q_len, d * hq, d)
+    g = _bhd_strides(gate, q_len, hq, d)
+    if g is None:
+        flat = gate.reshape(tokens * hq, d).contiguous()
+        g = (flat, d * hq * q_len, d * hq, d)
+    out = torch.empty(tokens, hq * d, dtype=torch.bfloat16, device=attn_out.device)
+    out_rows = out.view(tokens * hq, d)
+    n_rows = tokens * hq
+    block_m, n_warps = _path_tile(q_len, n_rows)
+    _rms_norm_gate_epilogue_kernel[(triton.cdiv(n_rows, block_m),)](
+        x[0],
+        g[0],
+        out_rows,
+        RMS_EPS,
+        n_rows,
+        x[1], x[2], x[3],
+        g[1], g[2], g[3],
+        out_rows.stride(0),
+        d,
+        triton.next_power_of_2(d),
+        block_m,
+        SEQ=q_len,
+        NUM_Q_HEADS=hq,
+        num_warps=n_warps,
+    )
+    return out  # [T, Hq*D] bfloat16
+
+
+NEG = tl.constexpr(-1.0e20)
+
+
+def _custom_full(cfg) -> bool:
+    """Full-context shapes this kernel covers. Group is 8 for both tp8 and dp."""
+    hq, hkv, d = cfg["num_q_heads"], cfg["num_kv_heads"], cfg["head_dim"]
+    return (
+        cfg["window"] == 0
+        and d == 64
+        and cfg["q_len"] in (1, 8)
+        and hkv > 0
+        and hq % hkv == 0
+        and hq // hkv == 8
+    )
+
+
+def _attn_splits(batch: int, hkv: int) -> int:
+    """Enough CTAs to hide page_size=1 gather latency. Config-only, graph-stable."""
+    target = 132 * 4  # ~4 warps/SM at 4 warps per CTA
+    return max(1, min(64, target // max(batch * hkv, 1)))
+
+
+def _attn_ws(splits, batch, length, hq, d, device):
+    key = (splits, batch, length, hq, d, device.index if device.index is not None else 0)
+    buf = _ATTN_WS.get(key)
+    if buf is None or buf[0].device != device:
+        acc = torch.empty(splits, batch, length, hq, d, dtype=torch.float32, device=device)
+        lse = torch.empty(splits, batch, length, hq, dtype=torch.float32, device=device)
+        out = torch.empty(batch, length, hq, d, dtype=torch.bfloat16, device=device)
+        buf = _ATTN_WS[key] = (acc, lse, out)
+    return buf
+
+
+@triton.jit
+def _full_attn_kernel(
+    Q, K, V, Page, Seqlens, Acc, Lse, Kscale, Vscale,
+    softmax_scale,
+    stride_qb, stride_ql, stride_qh,
+    stride_pb, stride_pp,
+    stride_k0, stride_k1, stride_k2,
+    stride_v0, stride_v1, stride_v2,
+    stride_as, stride_ab, stride_al, stride_ah, stride_ad,
+    stride_ls, stride_lb, stride_ll, stride_lh,
+    n_splits,
+    GROUP: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    SEQ_Q: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+):
+    """One CTA: (batch, kv_head, seq split). All GROUP query heads share one KV load."""
+    pid_b = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_s = tl.program_id(2)
+    seq = tl.load(Seqlens + pid_b).to(tl.int32)
+    chunk = (seq + n_splits - 1) // n_splits
+    start = pid_s * chunk
+    end = tl.minimum(start + chunk, seq)
+
+    s_idx = tl.arange(0, SEQ_Q)
+    g_idx = tl.arange(0, GROUP)
+    d_idx = tl.arange(0, D)
+    heads = pid_h * GROUP + g_idx
+    q = tl.load(
+        Q + pid_b * stride_qb
+        + s_idx[:, None, None] * stride_ql
+        + heads[None, :, None] * stride_qh
+        + d_idx[None, None, :]
+    ).to(tl.float16)
+    # Pad M to 16 so tl.dot hits tensor cores; the extra 8 rows stay zero.
+    sel = (tl.arange(0, 16)[:, None] == g_idx[None, :]).to(tl.float32)
+    take16 = (g_idx[:, None] == tl.arange(0, 16)[None, :]).to(tl.float32)
+    q16 = tl.zeros([SEQ_Q, 16, D], tl.float16)
+    for s in tl.static_range(SEQ_Q):
+        row = (s_idx == s)[:, None, None]
+        qs = tl.sum(q.to(tl.float32) * row.to(tl.float32), axis=0)
+        padded = tl.sum(sel[:, :, None] * qs[None, :, :], axis=1).to(tl.float16)
+        q16 = tl.where(row, padded[None, :, :], q16)
+
+    ks = tl.load(Kscale).to(tl.float32)
+    vs = tl.load(Vscale).to(tl.float32)
+    scale = softmax_scale * ks
+    m_i = tl.full([SEQ_Q, GROUP], NEG, tl.float32)
+    l_i = tl.zeros([SEQ_Q, GROUP], tl.float32)
+    acc = tl.zeros([SEQ_Q, GROUP, D], tl.float32)
+
+    span = tl.maximum(end - start, 0)
+    n_tiles = (span + BLOCK_N - 1) // BLOCK_N
+    for t in tl.range(n_tiles):
+        tile = start + t * BLOCK_N
+        pos = tile + tl.arange(0, BLOCK_N)
+        inb = pos < end
+        page = pos // PAGE_SIZE
+        off = pos % PAGE_SIZE
+        phys = tl.load(Page + pid_b * stride_pb + page * stride_pp, mask=inb, other=0).to(tl.int64)
+        d64 = d_idx.to(tl.int64)
+        k_off = phys[:, None] * stride_k0 + off[:, None].to(tl.int64) * stride_k1 + pid_h * stride_k2 + d64[None, :]
+        v_off = phys[:, None] * stride_v0 + off[:, None].to(tl.int64) * stride_v1 + pid_h * stride_v2 + d64[None, :]
+        k_ptr = tl.max_contiguous(tl.multiple_of(K + k_off, [1, 16]), [1, 16])
+        v_ptr = tl.max_contiguous(tl.multiple_of(V + v_off, [1, 16]), [1, 16])
+        k = tl.load(k_ptr, mask=inb[:, None], other=0.0).to(tl.float16)
+        v = tl.load(v_ptr, mask=inb[:, None], other=0.0).to(tl.float16)
+        for s in tl.static_range(SEQ_Q):
+            last = seq - SEQ_Q + s  # query s attends positions 0..seq_lens+s
+            attend = inb & (pos <= last)
+            pick = (s_idx == s)
+            q_s = tl.sum(q16.to(tl.float32) * pick[:, None, None].to(tl.float32), axis=0).to(tl.float16)
+            scores16 = tl.dot(q_s, tl.trans(k))
+            scores = tl.sum(take16[:, :, None] * scores16[None, :, :], axis=1) * scale
+            scores = tl.where(attend[None, :], scores, NEG)
+            m_row = tl.sum(tl.where(pick[:, None], m_i, 0.0), axis=0)
+            l_row = tl.sum(tl.where(pick[:, None], l_i, 0.0), axis=0)
+            a_row = tl.sum(tl.where(pick[:, None, None], acc, 0.0), axis=0)
+            m_tile = tl.max(scores, axis=1)
+            tile_has = m_tile > -1.0e19
+            m_new = tl.where(tile_has, tl.maximum(m_row, m_tile), m_row)
+            safe_m = tl.where(tile_has, m_new, 0.0)
+            alpha = tl.exp(tl.where(tile_has, m_row - m_new, 0.0))
+            p = tl.where(attend[None, :], tl.exp(scores - safe_m[:, None]), 0.0)
+            p16 = tl.sum(sel[:, :, None] * p[None, :, :], axis=1).to(tl.float16)
+            pv16 = tl.dot(p16, v)
+            pv = tl.sum(take16[:, :, None] * pv16[None, :, :], axis=1).to(tl.float32) * vs
+            a_new = a_row * alpha[:, None] + pv
+            l_new = l_row * alpha + tl.sum(p, axis=1)
+            m_i = tl.where(pick[:, None], m_new[None, :], m_i)
+            l_i = tl.where(pick[:, None], l_new[None, :], l_i)
+            acc = tl.where(pick[:, None, None], a_new[None, :, :], acc)
+
+    lse = tl.where(l_i > 0, m_i + tl.log(l_i), NEG)
+    acc_n = tl.where((l_i > 0)[:, :, None], acc / l_i[:, :, None], 0.0)
+    acc_off = (
+        pid_s * stride_as + pid_b * stride_ab
+        + s_idx[:, None, None] * stride_al
+        + heads[None, :, None] * stride_ah
+        + d_idx[None, None, :] * stride_ad
+    )
+    lse_off = pid_s * stride_ls + pid_b * stride_lb + s_idx[:, None] * stride_ll + heads[None, :] * stride_lh
+    tl.store(Acc + acc_off, acc_n)
+    tl.store(Lse + lse_off, lse)
+
+
+@triton.jit
+def _merge_kernel(
+    Acc, Lse, Out, n_splits,
+    stride_as, stride_ab, stride_al, stride_ah, stride_ad,
+    stride_ls, stride_lb, stride_ll, stride_lh,
+    stride_ob, stride_ol, stride_oh, stride_od,
+    D: tl.constexpr,
+):
+    """Combine split partials. Stored rows are already normalized; weight by exp(lse)."""
+    pid_b = tl.program_id(0)
+    pid_l = tl.program_id(1)
+    pid_h = tl.program_id(2)
+    d_idx = tl.arange(0, D)
+    m = tl.full((), NEG, tl.float32)
+    wsum = tl.zeros((), tl.float32)
+    acc = tl.zeros([D], tl.float32)
+    for sp in tl.range(n_splits):
+        lse = tl.load(Lse + sp * stride_ls + pid_b * stride_lb + pid_l * stride_ll + pid_h * stride_lh)
+        a = tl.load(Acc + sp * stride_as + pid_b * stride_ab + pid_l * stride_al + pid_h * stride_ah + d_idx * stride_ad)
+        active = lse > -1.0e19
+        seen = m > -1.0e19
+        m_new = tl.where(active, tl.maximum(m, lse), m)
+        safe = tl.where(m_new > -1.0e19, m_new, 0.0)
+        alpha = tl.where(seen, tl.exp(m - safe), 0.0)
+        beta = tl.where(active, tl.exp(lse - safe), 0.0)
+        acc = acc * alpha + a * beta
+        wsum = wsum * alpha + beta
+        m = m_new
+    out = tl.where(wsum > 0, acc / wsum, 0.0)
+    tl.store(
+        Out + pid_b * stride_ob + pid_l * stride_ol + pid_h * stride_oh + d_idx * stride_od,
+        out.to(tl.bfloat16),
+    )
+
+
+def _full_context_attn(q, k_cache, v_cache, page_table, cache_seqlens, cfg, k_scale, v_scale):
+    """Paged GQA over the whole context. q is FP8 [B, L, Hq, D]. Returns bf16 [B, L, Hq, D]."""
+    batch, length, hq, d = q.shape
+    hkv = cfg["num_kv_heads"]
+    splits = _attn_splits(batch, hkv)
+    block_n = 64 if length == 1 else 32
+    acc, lse, out = _attn_ws(splits, batch, length, hq, d, q.device)
+    _full_attn_kernel[(batch, hkv, splits)](
+        q, k_cache, v_cache, page_table, cache_seqlens, acc, lse, k_scale, v_scale,
+        cfg["sm_scale"] * cfg["qk_scale_factor"],
+        q.stride(0), q.stride(1), q.stride(2),
+        page_table.stride(0), page_table.stride(1),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+        acc.stride(0), acc.stride(1), acc.stride(2), acc.stride(3), acc.stride(4),
+        lse.stride(0), lse.stride(1), lse.stride(2), lse.stride(3),
+        splits,
+        GROUP=8,
+        D=d,
+        BLOCK_N=block_n,
+        SEQ_Q=length,
+        PAGE_SIZE=cfg["page_size"],
+        num_warps=4,
+        num_stages=1,
+    )
+    _merge_kernel[(batch, length, hq)](
+        acc, lse, out, splits,
+        acc.stride(0), acc.stride(1), acc.stride(2), acc.stride(3), acc.stride(4),
+        lse.stride(0), lse.stride(1), lse.stride(2), lse.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        D=d,
+        num_warps=2,
+    )
+    return out
+
+
+def _verify_fa3_knobs(cfg):
+    """L=8 FA3 specialization: pack GQA; keep heuristic splits (forced splits hurt verify)."""
+    if cfg["q_len"] != 8:
+        return 0, None  # decode: tip defaults
+    # pack heads into denser WGMMA tiles; num_splits=0 → FA3 heuristic (tip-stable)
+    pack = True if (cfg["num_q_heads"] > cfg["num_kv_heads"]) else None
+    return 0, pack
 
 
 def kernel_fn(data: Inputs) -> torch.Tensor:
-    """Normalize the queries and new keys (scaleless RMSNorm, queries also times
-    qk_scale_factor), apply RoPE on sliding-window layers, write the block's keys and values
-    into the FP8 cache at positions seq_lens[b] .. seq_lens[b] + L - 1, attend (each token sees
-    the cache and the block's tokens up to itself), then return rmsnorm(attention) *
-    sigmoid(gate) as bfloat16 [B, L, Hq*64]."""
-    cfg = data["config"]
-    batch, length = cfg["batch"], cfg["q_len"]
-    hq, hkv, d, page = cfg["num_q_heads"], cfg["num_kv_heads"], cfg["head_dim"], cfg["page_size"]
-    q_in, k_in, v_in, gate = data["qkv"].split([hq * d, hkv * d, hkv * d, hq * d], -1)
-    pos = data["positions"].view(batch, length)  # [B, L]
-    q = rms(q_in.reshape(batch, length, hq, d)) * cfg["qk_scale_factor"]
-    k = rms(k_in.reshape(batch, length, hkv, d))
-    if cfg["rope_theta"]:
-        q, k = rope(q, pos, cfg["rope_theta"]), rope(k, pos, cfg["rope_theta"])
-    q = q.to(torch.bfloat16)
+    """Timed entry: fused prep → full-context GQA or FA3 → fused gated RMS epilogue."""
+    cfg = data["config"]  # static knobs for this captured graph
+    batch, length = cfg["batch"], cfg["q_len"]  # B, L
+    hq, hkv, d = cfg["num_q_heads"], cfg["num_kv_heads"], cfg["head_dim"]  # head geometry
+    tokens = batch * length  # flatten decode/verify tokens for FA3 varlen API
+    qkv = data["qkv"].view(tokens, -1)  # [T, (2*Hq+2*Hkv)*D]
+    device = qkv.device  # stay on the capture device
+    scaled = cfg["kv_scale"] != 1.0  # non-unity scales need descales + divide-before-store
+    has_rope = bool(cfg["rope_theta"])  # sliding layers only
+    verify = length == 8  # config-stable branch (CUDA-graph OK)
+    num_splits, pack_gqa = _verify_fa3_knobs(cfg)
+    # FA3 scheduler only on full-attn decode; drop if we force splits
+    sched = data["scheduler_metadata"] if num_splits == 0 else None
+    # L=8 always dense batch Q; decode uses batch when no fixed schedule (sliding)
+    use_batch_q = verify or sched is None
 
-    table = data["page_table"].long()
-    slots = data["cache_loc"].view(batch, length)  # [B, L]
-    k_cache = data["k_cache"].view(-1, hkv, d)
-    v_cache = data["v_cache"].view(-1, hkv, d)
-    k_scale, v_scale = data["k_scale"], data["v_scale"]
-    k_cache[slots] = (k / k_scale).to(torch.float8_e4m3fn)
-    v_cache[slots] = (v_in.reshape(batch, length, hkv, d).float() / v_scale).to(torch.float8_e4m3fn)
+    k_cache, v_cache = data["k_cache"], data["v_cache"]  # in-place FP8 pools
 
-    # Every position a request's page table can hold; unused pages (-1) read page 0 and
-    # are masked out with everything else past the token's own position.
-    t = torch.arange(table.shape[1] * page, device=q.device)
-    out = torch.empty((batch, length, hq, d), dtype=torch.bfloat16, device=q.device)
-    for b in range(batch):
-        rows = table[b].clamp(min=0)[t // page] * page + t % page
-        keys = k_cache[rows].float() * k_scale  # [S, Hkv, d]
-        vals = v_cache[rows].float() * v_scale
-        visible = t[None, :] <= pos[b][:, None]  # [L, S]: causal, including the block's own tokens
-        if cfg["window"]:
-            visible &= t[None, :] > pos[b][:, None] - cfg["window"]
-        att = torch.einsum("lkgd,skd->lkgs", q[b].view(length, hkv, hq // hkv, d).float(), keys) * cfg["sm_scale"]
-        att = att.masked_fill(~visible[:, None, None, :], float("-inf")).softmax(-1)
-        out[b] = torch.einsum("lkgs,skd->lkgd", att, vals).reshape(length, hq, d)
-    out = rms(out) * torch.sigmoid(gate.float()).view(batch, length, hq, d)
-    return out.reshape(batch, length, hq * d).to(torch.bfloat16)
+    if not scaled:
+        # Unity scales: one Triton launch does QK-norm[+RoPE], FP8 KV write, FP8 Q.
+        cos_sin = _cos_sin(cfg["rope_theta"], d, device) if has_rope else None
+        q = _fused_qk_rope_store(
+            qkv, data["positions"], cos_sin, k_cache, v_cache, data["cache_loc"],
+            hq, hkv, d, has_rope, length,
+        )
+        q = q.view(batch, length, hq, d) if use_batch_q else q.view(tokens, hq, d)
+    else:
+        # Non-unity scales: keep SGLang FusedQKNorm + store_cache + FA descales.
+        if has_rope:
+            q, k = _qk_norm(hq, hkv, d)(qkv, data["positions"], _cos_sin(cfg["rope_theta"], d, device))
+        else:
+            q, k = _qk_norm(hq, hkv, d)(qkv)
+        v = qkv[:, (hq + hkv) * d:(hq + 2 * hkv) * d]  # raw V slice (no norm)
+        k = k.reshape(tokens, hkv * d)  # flat for store_cache
+        k, v = k / data["k_scale"], v / data["v_scale"]  # pre-divide so E4M3 stores dequant correctly
+        # reserved_skip_index=-1: slot 0 is a live row in this challenge harness
+        store_cache(
+            k.to(FP8).view(torch.uint8), v.to(FP8).view(torch.uint8),
+            k_cache.view(-1, hkv * d).view(torch.uint8), v_cache.view(-1, hkv * d).view(torch.uint8),
+            data["cache_loc"], reserved_skip_index=-1,
+        )
+        q = q.view(tokens, hq, d).to(FP8)
+        if use_batch_q:
+            q = q.view(batch, length, hq, d)
+
+    window = cfg["window"]  # 2048 or 0
+    if _custom_full(cfg):
+        attn = _full_context_attn(
+            q.view(batch, length, hq, d), k_cache, v_cache,
+            data["page_table"], data["cache_seqlens"], cfg, data["k_scale"], data["v_scale"],
+        )
+    else:
+        descale = {}  # FA3 optional KV descale tensors
+        if scaled:
+            # broadcast scalar scales to [B, Hkv] as flash_attn_with_kvcache expects
+            descale = dict(
+                k_descale=data["k_scale"].reshape(1, 1).expand(batch, hkv),
+                v_descale=data["v_scale"].reshape(1, 1).expand(batch, hkv),
+            )
+        # Sliding (and any shape the custom kernel does not cover): FA3.
+        fa_kwargs = dict(
+            q=q,  # FP8 queries — [B,L,Hq,D] or [T,Hq,D]
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=data["page_table"],
+            cache_seqlens=data["cache_seqlens"],
+            softmax_scale=cfg["sm_scale"] * cfg["qk_scale_factor"],
+            causal=True,
+            window_size=(window - 1, 0) if window else (-1, -1),
+            scheduler_metadata=sched,
+            num_splits=num_splits,
+            **descale,
+        )
+        if use_batch_q:
+            fa_kwargs["pack_gqa"] = True if pack_gqa is None else pack_gqa
+            fa_kwargs["max_seqlen_q"] = length
+        else:
+            fa_kwargs["cu_seqlens_q"] = data["cu_seqlens_q"]
+            fa_kwargs["max_seqlen_q"] = length
+            if pack_gqa is not None:
+                fa_kwargs["pack_gqa"] = pack_gqa
+        attn = flash_attn_with_kvcache(**fa_kwargs)
+        if isinstance(attn, tuple):
+            attn = attn[0]
+
+    gate = qkv[:, (hq + 2 * hkv) * d:]  # gate logits share the fused projection buffer
+    o = _fused_rms_norm_gate(attn, gate, tokens, hq, d, length)
+    return o.view(batch, length, hq * d)  # judge expects bf16 [B, L, Hq*D]
