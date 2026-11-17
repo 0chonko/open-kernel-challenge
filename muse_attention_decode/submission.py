@@ -1,14 +1,10 @@
 # okc: problem=muse_attention_decode
-"""FA3 gated decode + DScale / Dissecting-Hopper path-aware verify tiles.
+"""FA3 gated decode with locality-aware attention GEMM scheduling.
 
-Keeps the tip spine: FA3 + fused Triton prep/epilogue + TK 16-row tiles.
-Adds DScale (arXiv:2609.37532) + Dissecting Hopper util (arXiv:2609.12923) knobs:
-  (1) specialize prep/epilogue BLOCK_M + num_warps on cfg q_len==8 vs 1
-      (raise M/warps on large verify; decode keeps TK-16);
-  (2) L=8 verify: dense [B,L,Hq,D] + pack_gqa=True (GMMA fragment fill);
-      heuristic num_splits (num_splits=1 doubled sliding FA and lost the score);
-  (3) config-keyed fixed-address FP8 Q workspace (graph-stable, no value alloc);
-  (4) epilogue loads FA out and the qkv gate tail by stride — no .contiguous() copy.
+Skinny decode GEMMs: keep fat KV tiles hot (pack_gqa), prefer dense [B,L,Hq,D]
+Q so FA can sweep Q/GQA heads over reused KV; varlen+scheduler only when full
+decode needs it (large B). Prep/epi BLOCK_M owns one GQA group per CTA.
+num_splits stays 0 (heuristic); branch only on config (CUDA-graph safe).
 """
 
 from typing import TypedDict  # shape/dtype contracts for Inputs / Config
@@ -60,10 +56,11 @@ FP8 = torch.float8_e4m3fn  # E4M3 cache + FA3 query dtype on the scored FP8 path
 FP8_E4M3_MAX = 448.0  # saturate before FP8 cast (same bound as FusedQKNorm)
 _NORMS = {}  # cache FusedQKNorm modules keyed by (hq, hkv, d) — config-stable, not per-input
 _ROPE = {}  # cache float32 cos|sin tables keyed by rope_theta — built once per theta
-_Q_WORK = {}  # fixed-address FP8 Q buffers keyed by config shape (DScale graph-stable)
+_Q_WORK = {}  # fixed-address FP8 Q buffers keyed by config shape (graph-stable)
 ROPE_POSITIONS = 1 << 21  # SGLang RotaryEmbedding table length (covers long contexts)
-# ThunderKittens / Hopper WGMMA-friendly strip height
-TK_TILE_M = 16
+TK_TILE_M = 16  # Hopper WGMMA-friendly strip; prefer multiples of GQA group
+# Full-decode varlen+scheduler is for large B; below this, dense batch Q is fine
+_SMALL_B_BATCH_Q = 4
 
 
 def _qk_norm(hq, hkv, d):
@@ -96,19 +93,23 @@ def _q_workspace(tokens, hq, d, device):
     return buf
 
 
-def _path_tile(q_len: int, n_rows: int) -> tuple[int, int]:
-    """DScale path-aware (BLOCK_M, num_warps): verify raises M; decode keeps TK-16."""
-    if q_len == 8:  # verify — Dissecting-Hopper: fill GMMA fragments, don't under-tile
-        if n_rows >= 4096:
-            return 32, 8  # B≥32 verify: wider strip + more warps
-        if n_rows >= TK_TILE_M:
-            return TK_TILE_M, 4
-        return 8, 4
-    # decode: tip TK tiles (16-row default); only shrink below one strip
-    if n_rows >= 65536:
-        return 32, 4
-    if n_rows >= TK_TILE_M:
+def _gqa_group(hq: int, hkv: int) -> int:
+    """Q heads that share one KV head; 1 if layout is not a clean GQA multiple."""
+    if hkv > 0 and hq % hkv == 0:
+        return hq // hkv
+    return 1
+
+
+def _locality_tile(n_rows: int, group: int, q_len: int) -> tuple[int, int]:
+    """BLOCK_M so one CTA owns a full GQA group (same token's packed Q heads)."""
+    g = max(group, 1)
+    # Prefer TK strip when it is an integer number of GQA groups; else fall to `g`.
+    if n_rows >= 32 and q_len == 8 and n_rows >= 4096 and 32 % g == 0:
+        return 32, 8
+    if n_rows >= TK_TILE_M and TK_TILE_M % g == 0:
         return TK_TILE_M, 4
+    if n_rows >= g:
+        return g, 4
     if n_rows >= 8:
         return 8, 4
     return 4, 4
@@ -130,7 +131,7 @@ def _fused_qk_rope_store_kernel(
     NUM_KV_HEADS: tl.constexpr,  # Hkv
     D: tl.constexpr,  # head_dim
     BD: tl.constexpr,  # next_power_of_2(D) load width
-    BLOCK_M: tl.constexpr,  # rows per program — path-aware (16 verify / TK decode)
+    BLOCK_M: tl.constexpr,  # rows per program — GQA-aligned locality tile
     HAS_ROPE: tl.constexpr,  # 1 on sliding layers
     FP8_KV_STORE: tl.constexpr,  # 1 → saturate + store E4M3, emit FP8 Q
     FP8_MAX: tl.constexpr,  # 448.0
@@ -208,11 +209,11 @@ def _rms_norm_gate_epilogue_kernel(
     stride_o,  # row stride of packed OUT
     D: tl.constexpr,  # head_dim
     BD: tl.constexpr,  # next_power_of_2(D)
-    BLOCK_M: tl.constexpr,  # path-aware multi-row tile
+    BLOCK_M: tl.constexpr,  # GQA-aligned multi-row tile
     SEQ: tl.constexpr,  # L — 1 decode, 8 verify
     NUM_Q_HEADS: tl.constexpr,  # Hq
 ):
-    """Fuse FA→bf16 cast + per-head RMSNorm + sigmoid(gate); BLOCK_M rows/program."""
+    """Fuse FA→bf16 cast + per-head RMSNorm + sigmoid(gate); one GQA group/CTA when possible."""
     pid = tl.program_id(0)  # one program owns BLOCK_M (token, head) rows
     rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)  # absolute head-row ids
     row_mask = rows < n_rows  # pad past the last live row
@@ -240,7 +241,8 @@ def _fused_qk_rope_store(qkv, positions, cos_sin, k_cache, v_cache, cache_loc, h
     tokens = qkv.shape[0]  # B*L flattened token count
     heads = hq + 2 * hkv  # Q+K+V heads processed as rows
     n_rows = tokens * heads  # total (token, head) rows
-    block_m, n_warps = _path_tile(q_len, n_rows)  # DScale: verify vs decode tiles
+    # Align to GQA group so consecutive CTAs keep Q heads that share a KV head
+    block_m, n_warps = _locality_tile(n_rows, _gqa_group(hq, hkv), q_len)
     q_out = _q_workspace(tokens, hq, d, qkv.device)  # fixed-address FP8 Q
     # flatten paged caches to [rows, Hkv*D] so the kernel can address by cache_loc
     k_flat = k_cache.view(-1, hkv * d)
@@ -286,7 +288,7 @@ def _bhd_strides(t, length, hq, d):
     return None
 
 
-def _fused_rms_norm_gate(attn_out, gate, tokens, hq, d, q_len):
+def _fused_rms_norm_gate(attn_out, gate, tokens, hq, hkv, d, q_len):
     """Host wrapper: FA output + gate → bf16 [T, Hq*D] via one Triton epilogue."""
     x = _bhd_strides(attn_out, q_len, hq, d)
     if x is None:  # unexpected FA layout: one copy, then packed rows
@@ -299,7 +301,8 @@ def _fused_rms_norm_gate(attn_out, gate, tokens, hq, d, q_len):
     out = torch.empty(tokens, hq * d, dtype=torch.bfloat16, device=attn_out.device)
     out_rows = out.view(tokens * hq, d)
     n_rows = tokens * hq
-    block_m, n_warps = _path_tile(q_len, n_rows)
+    # Row layout is token-major over Hq: BLOCK_M=group ⇒ one CTA = one GQA group/token
+    block_m, n_warps = _locality_tile(n_rows, _gqa_group(hq, hkv), q_len)
     _rms_norm_gate_epilogue_kernel[(triton.cdiv(n_rows, block_m),)](
         x[0],
         g[0],
@@ -319,15 +322,6 @@ def _fused_rms_norm_gate(attn_out, gate, tokens, hq, d, q_len):
     return out  # [T, Hq*D] bfloat16
 
 
-def _verify_fa3_knobs(cfg):
-    """L=8 FA3 specialization: pack GQA; keep heuristic splits (forced splits hurt verify)."""
-    if cfg["q_len"] != 8:
-        return 0, None  # decode: tip defaults
-    # pack heads into denser WGMMA tiles; num_splits=0 → FA3 heuristic (tip-stable)
-    pack = True if (cfg["num_q_heads"] > cfg["num_kv_heads"]) else None
-    return 0, pack
-
-
 def kernel_fn(data: Inputs) -> torch.Tensor:
     """Timed entry: fused prep (or scaled fallback) → FA3 → fused gated RMS epilogue."""
     cfg = data["config"]  # static knobs for this captured graph
@@ -338,12 +332,15 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
     device = qkv.device  # stay on the capture device
     scaled = cfg["kv_scale"] != 1.0  # non-unity scales need descales + divide-before-store
     has_rope = bool(cfg["rope_theta"])  # sliding layers only
-    verify = length == 8  # config-stable branch (CUDA-graph OK)
-    num_splits, pack_gqa = _verify_fa3_knobs(cfg)
-    # FA3 scheduler only on full-attn decode; drop if we force splits
-    sched = data["scheduler_metadata"] if num_splits == 0 else None
-    # L=8 always dense batch Q; decode uses batch when no fixed schedule (sliding)
-    use_batch_q = verify or sched is None
+    # Locality: always pack GQA when Hq>Hkv (decode+verify, full+sliding). num_splits=0.
+    pack_gqa = hq > hkv
+    num_splits = 0
+    sched = data["scheduler_metadata"]  # FA3 tile schedule; set only on full-attn decode
+    # Dense batch Q for L>1 / sliding; also small-B full decode (no cu_seqlens needed).
+    # Large-B full decode keeps varlen + scheduler_metadata.
+    use_batch_q = length > 1 or sched is None or batch <= _SMALL_B_BATCH_Q
+    if use_batch_q:
+        sched = None  # batch layout; varlen schedule does not apply
 
     k_cache, v_cache = data["k_cache"], data["v_cache"]  # in-place FP8 pools
 
@@ -383,7 +380,7 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
             v_descale=data["v_scale"].reshape(1, 1).expand(batch, hkv),
         )
 
-    # FlashAttention-3: batch layout for verify/sliding; varlen+schedule for full decode
+    # FlashAttention-3: dense batch Q keeps fat KV hot while sweeping Q / packed GQA heads
     fa_kwargs = dict(
         q=q,  # FP8 queries — [B,L,Hq,D] or [T,Hq,D]
         k_cache=k_cache,  # FP8 paged K
@@ -395,19 +392,15 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
         causal=True,  # decode/verify causality inside the block
         # sliding: last `window` tokens → FA window (window-1, 0); full → (-1, -1)
         window_size=(window - 1, 0) if window else (-1, -1),
-        scheduler_metadata=sched,  # only non-None on full decode
-        num_splits=num_splits,  # 0 → FA3 heuristic
+        scheduler_metadata=sched,  # only non-None on large-B full decode
+        num_splits=num_splits,  # 0 → FA3 heuristic (Split-KV owned elsewhere)
+        max_seqlen_q=length,
         **descale,  # empty on scored unity-scale loads
     )
-    if use_batch_q:
-        # L=8 / sliding: pack GQA for denser WGMMA along heads (Hopper fragment fill)
-        fa_kwargs["pack_gqa"] = True if pack_gqa is None else pack_gqa
-        fa_kwargs["max_seqlen_q"] = length  # uniform_q_len hint for FA3
-    else:
+    if pack_gqa:
+        fa_kwargs["pack_gqa"] = True
+    if not use_batch_q:
         fa_kwargs["cu_seqlens_q"] = data["cu_seqlens_q"]
-        fa_kwargs["max_seqlen_q"] = length
-        if pack_gqa is not None:
-            fa_kwargs["pack_gqa"] = pack_gqa
 
     out = flash_attn_with_kvcache(**fa_kwargs)
     if isinstance(out, tuple):  # some FA builds return (out, softmax_lse, ...)
@@ -415,5 +408,5 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
 
     gate = qkv[:, (hq + 2 * hkv) * d:]  # gate logits share the fused projection buffer
     # fused epilogue: avoid separate .to(bf16) materialization + rms_norm_gate launch
-    o = _fused_rms_norm_gate(out, gate, tokens, hq, d, length)
+    o = _fused_rms_norm_gate(out, gate, tokens, hq, hkv, d, length)
     return o.view(batch, length, hq * d)  # judge expects bf16 [B, L, Hq*D]
